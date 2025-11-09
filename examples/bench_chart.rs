@@ -54,11 +54,11 @@ fn main() {
 fn run_benchmark(input: &str, name: &str, extra_args: &[&str]) -> Option<BenchResult> {
     // Check if input file exists
     if !std::path::Path::new(input).exists() {
-        eprintln!("Skipping {}: {} not found", name, input);
+        eprintln!("Skipping {name}: {input} not found");
         return None;
     }
 
-    println!("Running {}...", name);
+    println!("Running {name}...");
 
     // Create temp files
     let output_dir = std::env::temp_dir();
@@ -76,8 +76,7 @@ fn run_benchmark(input: &str, name: &str, extra_args: &[&str]) -> Option<BenchRe
         let fastp_args: Vec<String> = extra_args
             .iter()
             .map(|s| {
-                if s.starts_with("--") {
-                    let rest = &s[2..];
+                if let Some(rest) = s.strip_prefix("--") {
                     format!("--{}", rest.replace('-', "_"))
                 } else {
                     s.to_string()
@@ -105,7 +104,7 @@ fn run_benchmark(input: &str, name: &str, extra_args: &[&str]) -> Option<BenchRe
     }
 
     if fastp_times.is_empty() {
-        eprintln!("  Warning: Failed to run fastp for {}", name);
+        eprintln!("  Warning: Failed to run fastp for {name}");
         return None;
     }
     fastp_times.sort_by(|a, b| a.partial_cmp(b).unwrap());
@@ -138,7 +137,7 @@ fn run_benchmark(input: &str, name: &str, extra_args: &[&str]) -> Option<BenchRe
     }
 
     if fasterp_times.is_empty() {
-        eprintln!("  Warning: Failed to run fasterp for {}", name);
+        eprintln!("  Warning: Failed to run fasterp for {name}");
         return None;
     }
     fasterp_times.sort_by(|a, b| a.partial_cmp(b).unwrap());

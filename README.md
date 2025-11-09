@@ -15,6 +15,13 @@ Same interface and behavior, typically **3–10× faster**.
 | Rust safety          |   -   |    ✓    |
 | SIMD acceleration    |   -   |    ✓    |
 
+## Installation
+
+```bash
+cargo install --git https://github.com/drbh/fasterp.git
+fasterp --version
+```
+
 ## Usage
 
 ```bash
@@ -53,3 +60,5 @@ With quality trimming (10k reads):
 
 `fasterp` produces identical output to `fastp` and can replace it directly in existing workflows.
 Integration tests confirm equivalence across datasets (`cargo test`), and all checks run automatically in CI.
+
+See [integration tests](tests/integration_tests.rs) for ~40 examples comparing the inputs and outputs of both tools, these can be run locally via `cargo test` for verification. 
