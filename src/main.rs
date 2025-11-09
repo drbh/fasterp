@@ -18,9 +18,7 @@ use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::thread;
 
-// ============================================================================
 // LOOKUP TABLES for fast base/quality checks
-// ============================================================================
 
 /// Lookup table: is quality >= 20? (Phred+33 encoding)
 static LUT_Q20: [bool; 256] = {
@@ -136,9 +134,7 @@ fn kmer_to_string(code: usize) -> String {
     String::from_utf8(result).unwrap()
 }
 
-// ============================================================================
 // IO ABSTRACTION - Compression support (gzip) and stdin/stdout
-// ============================================================================
 
 /// Detect compression format from file extension or magic bytes
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -274,9 +270,7 @@ fn open_output(path: &str, compression_level: Option<u32>) -> Result<OutputWrite
     }
 }
 
-// ============================================================================
 // ROBUST FASTQ PARSER - State machine handles multiline and missing newlines
-// ============================================================================
 
 /// State machine for parsing FASTQ records
 /// Handles:
@@ -465,7 +459,6 @@ struct Args {
     #[arg(long)]
     no_kmer: bool,
 
-    // ============ TRIMMING OPTIONS ============
     /// Quality cutoff for sliding-window trimming (default: 0 = disabled)
     /// Trim when mean quality in window falls below this value
     #[arg(long, default_value = "0")]
@@ -512,9 +505,7 @@ struct Args {
     poly_g_min_len: usize,
 }
 
-// ============================================================================
 // TRIMMING DATA STRUCTURES AND ALGORITHMS
-// ============================================================================
 
 /// Configuration for trimming operations
 #[derive(Debug, Clone)]
@@ -847,9 +838,7 @@ fn trim_read(seq: &[u8], qual: &[u8], config: &TrimmingConfig) -> TrimmingResult
     result
 }
 
-// ============================================================================
 // MULTI-THREADED PIPELINE DATA STRUCTURES
-// ============================================================================
 
 /// A batch of FASTQ records parsed from a buffer
 ///
@@ -943,9 +932,7 @@ struct FastpReport {
     read1_before_filtering: DetailedReadStats,
 }
 
-// ============================================================================
 // STREAMING ACCUMULATOR for single-pass processing
-// ============================================================================
 
 /// Accumulator for per-position quality statistics
 struct PositionStats {
@@ -1246,9 +1233,7 @@ impl StreamAccumulator {
     }
 }
 
-// ============================================================================
 // MULTI-THREADED PIPELINE
-// ============================================================================
 
 /// Producer thread: read blocks and parse into batches
 ///
@@ -1624,9 +1609,7 @@ fn merger_thread(
     Ok(acc)
 }
 
-// ============================================================================
 // STREAMING PARSER - processes records without loading all into memory
-// ============================================================================
 
 /// Stream-process FASTQ records using the robust parser
 ///
@@ -1665,9 +1648,7 @@ fn process_fastq_stream<R: BufRead, W: Write>(
     Ok(acc)
 }
 
-// ============================================================================
 // MAIN FUNCTION
-// ============================================================================
 
 /// MULTI-THREADED MAIN FUNCTION:
 ///
@@ -1799,9 +1780,7 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-// ============================================================================
 // UNIT TESTS (see src/tests.rs)
-// ============================================================================
 
 #[cfg(test)]
 mod tests;

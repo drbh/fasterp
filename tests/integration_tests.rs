@@ -355,9 +355,7 @@ fn test_cli_missing_input_fails() {
     assert!(stderr.contains("required"));
 }
 
-// ============================================================================
 // COMPRESSION TESTS - gzip input/output
-// ============================================================================
 
 #[test]
 fn test_gzip_input_decompression() {
@@ -526,9 +524,7 @@ fn test_gzip_compression_levels() {
     assert_eq!(contents[1], contents[2], "Level 6 and 9 differ");
 }
 
-// ============================================================================
 // N-BASE FILTERING TESTS
-// ============================================================================
 
 #[test]
 fn test_n_base_filtering_matches_fastp() {
@@ -585,9 +581,7 @@ fn test_n_base_filtering_matches_fastp() {
     }
 }
 
-// ============================================================================
 // MULTI-THREADING TESTS
-// ============================================================================
 
 #[test]
 fn test_multithreading_consistency() {
@@ -723,9 +717,7 @@ fn test_multithreading_large_dataset() {
     compare_json_outputs(&output_1t_json, &output_8t_json);
 }
 
-// ============================================================================
 // STDIN/STDOUT TESTS
-// ============================================================================
 
 #[test]
 fn test_stdin_input() {
@@ -850,9 +842,7 @@ fn test_stdin_stdout_pipeline() {
     );
 }
 
-// ============================================================================
 // COMBINED FILTER TESTS
-// ============================================================================
 
 #[test]
 fn test_combined_filters_matches_fastp() {
@@ -970,9 +960,7 @@ fn test_strict_combined_filters() {
     compare_json_outputs(&fastp_json, &fasterp_json);
 }
 
-// ============================================================================
 // EDGE CASE TESTS
-// ============================================================================
 
 #[test]
 fn test_empty_output_all_filtered() {
@@ -1035,9 +1023,7 @@ fn test_invalid_quality_threshold() {
     assert!(status.success());
 }
 
-// ============================================================================
 // LARGE DATASET TESTS (stress testing)
-// ============================================================================
 
 #[test]
 #[ignore] // Run with --ignored flag for stress testing
@@ -1084,9 +1070,7 @@ fn test_xlarge_dataset_500k() {
     assert!(output_json.exists());
 }
 
-// ============================================================================
 // BATCH SIZE TESTS
-// ============================================================================
 
 #[test]
 fn test_different_batch_sizes_consistent() {
@@ -1130,9 +1114,7 @@ fn test_different_batch_sizes_consistent() {
     }
 }
 
-// ============================================================================
 // JSON REPORT VALIDATION TESTS
-// ============================================================================
 
 #[test]
 fn test_json_report_structure() {
@@ -1187,9 +1169,7 @@ fn test_json_report_structure() {
     assert!(detailed.get("kmer_count").is_some());
 }
 
-// ============================================================================
 // OUTPUT ORDERING TESTS
-// ============================================================================
 
 #[test]
 fn test_output_order_preserved_multithreading() {
@@ -1236,9 +1216,7 @@ fn test_output_order_preserved_multithreading() {
     );
 }
 
-// ============================================================================
 // Trimming Integration Tests
-// ============================================================================
 
 #[test]
 fn test_sliding_window_tail_trimming_matches_fastp() {

@@ -9,9 +9,7 @@
 
 use super::*;
 
-// ============================================================================
 // Sliding Window Trimming Tests
-// ============================================================================
 
 #[test]
 fn test_trim_tail_no_trimming_needed() {
@@ -92,9 +90,7 @@ fn test_trim_front_gradual_improvement() {
     assert_eq!(result, 2, "Should trim until quality improves");
 }
 
-// ============================================================================
 // PolyG Detection Tests
-// ============================================================================
 
 #[test]
 fn test_poly_g_detection_basic() {
@@ -145,9 +141,7 @@ fn test_poly_g_detection_mixed_case() {
     assert_eq!(result, 12, "Should detect mixed case G's");
 }
 
-// ============================================================================
 // PolyX Detection Tests
-// ============================================================================
 
 #[test]
 fn test_poly_x_detection_poly_a() {
@@ -198,9 +192,7 @@ fn test_poly_x_detection_interrupted() {
     assert_eq!(result, 0, "Should not detect polyX below threshold");
 }
 
-// ============================================================================
 // Full Trimming Integration Tests
-// ============================================================================
 
 #[test]
 fn test_trim_read_no_trimming() {
@@ -362,9 +354,7 @@ fn test_trim_read_trim_entire_read() {
     assert_eq!(result.trimmed_length(), 0, "Should trim entire read");
 }
 
-// ============================================================================
 // TrimmingStats Tests
-// ============================================================================
 
 #[test]
 fn test_trimming_stats_add() {
@@ -416,9 +406,7 @@ fn test_trimming_stats_merge() {
     assert_eq!(stats1.poly_g_trimmed_bases, 1800);
 }
 
-// ============================================================================
 // TrimmingConfig Tests
-// ============================================================================
 
 #[test]
 fn test_trimming_config_disabled() {

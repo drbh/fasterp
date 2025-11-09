@@ -11,3 +11,4 @@ test_data/xxlarge_*.fq
 test_data/xxxlarge_*.fq
 
 .todo
+fasterp.json
