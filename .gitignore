@@ -1,0 +1,10 @@
+/target
+*.fq
+!R1.fq
+!R2.fq
+fastp.json
+fastp.html
+test_data/*.fq
+test_data/bench_*.fq
+
+.todo
