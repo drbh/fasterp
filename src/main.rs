@@ -8,9 +8,9 @@
 use anyhow::{Context, Result};
 use clap::Parser;
 use crossbeam_channel::{Receiver, Sender, bounded};
+use flate2::Compression;
 use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
-use flate2::Compression;
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -1287,7 +1287,9 @@ fn main() -> Result<()> {
         // Spawn merger thread
         let output_path = args.output.clone();
         let compression_level = args.compression_level;
-        let merger = thread::spawn(move || merger_thread(result_rx, output_path, num_threads, compression_level));
+        let merger = thread::spawn(move || {
+            merger_thread(result_rx, output_path, num_threads, compression_level)
+        });
 
         // Wait for all threads
         producer.join().unwrap()?;

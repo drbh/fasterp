@@ -355,3 +355,890 @@ fn test_cli_missing_input_fails() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("required"));
 }
+
+// ============================================================================
+// COMPRESSION TESTS - gzip input/output
+// ============================================================================
+
+#[test]
+fn test_gzip_input_decompression() {
+    let temp_dir = TempDir::new().unwrap();
+
+    // Create a gzipped input file
+    let input_fq = test_data_path("small_1k.fq");
+    let input_gz = temp_dir.path().join("input.fq.gz");
+    let output_fq = temp_dir.path().join("output.fq");
+    let output_json = temp_dir.path().join("output.json");
+
+    // Gzip the input file
+    let status = Command::new("gzip")
+        .arg("-c")
+        .arg(&input_fq)
+        .stdout(std::fs::File::create(&input_gz).unwrap())
+        .status()
+        .expect("Failed to run gzip");
+    assert!(status.success());
+
+    // Run fasterp on gzipped input (single-threaded mode required for gzip input)
+    let status = Command::new(cargo_bin("fasterp"))
+        .arg("-i")
+        .arg(&input_gz)
+        .arg("-o")
+        .arg(&output_fq)
+        .arg("-j")
+        .arg(&output_json)
+        .arg("-t")
+        .arg("1")
+        .status()
+        .expect("Failed to run fasterp");
+    assert!(status.success());
+
+    // Compare with fastp on original file
+    let fastp_fq = temp_dir.path().join("fastp.fq");
+    let fastp_json = temp_dir.path().join("fastp.json");
+
+    let status = Command::new("fastp")
+        .arg("-i")
+        .arg(&input_fq)
+        .arg("-o")
+        .arg(&fastp_fq)
+        .arg("-j")
+        .arg(&fastp_json)
+        .stderr(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .status()
+        .expect("Failed to run fastp");
+    assert!(status.success());
+
+    // Outputs should match
+    let fasterp_content = fs::read_to_string(&output_fq).unwrap();
+    let fastp_content = fs::read_to_string(&fastp_fq).unwrap();
+    assert_eq!(
+        fasterp_content, fastp_content,
+        "Gzipped input processing differs"
+    );
+}
+
+#[test]
+fn test_gzip_output_compression() {
+    let temp_dir = TempDir::new().unwrap();
+
+    let input_fq = test_data_path("small_1k.fq");
+    let output_gz = temp_dir.path().join("output.fq.gz");
+    let output_json = temp_dir.path().join("output.json");
+
+    // Run fasterp with gzip output
+    let status = Command::new(cargo_bin("fasterp"))
+        .arg("-i")
+        .arg(&input_fq)
+        .arg("-o")
+        .arg(&output_gz)
+        .arg("-j")
+        .arg(&output_json)
+        .status()
+        .expect("Failed to run fasterp");
+    assert!(status.success());
+
+    // Verify output is actually gzipped
+    assert!(output_gz.exists());
+
+    // Decompress and compare with uncompressed output
+    let decompressed_fq = temp_dir.path().join("decompressed.fq");
+    let status = Command::new("gunzip")
+        .arg("-c")
+        .arg(&output_gz)
+        .stdout(std::fs::File::create(&decompressed_fq).unwrap())
+        .status()
+        .expect("Failed to run gunzip");
+    assert!(status.success());
+
+    // Run fasterp without compression
+    let uncompressed_fq = temp_dir.path().join("uncompressed.fq");
+    let uncompressed_json = temp_dir.path().join("uncompressed.json");
+
+    let status = Command::new(cargo_bin("fasterp"))
+        .arg("-i")
+        .arg(&input_fq)
+        .arg("-o")
+        .arg(&uncompressed_fq)
+        .arg("-j")
+        .arg(&uncompressed_json)
+        .status()
+        .expect("Failed to run fasterp");
+    assert!(status.success());
+
+    // Compare decompressed with uncompressed
+    let decompressed_content = fs::read_to_string(&decompressed_fq).unwrap();
+    let uncompressed_content = fs::read_to_string(&uncompressed_fq).unwrap();
+    assert_eq!(
+        decompressed_content, uncompressed_content,
+        "Gzipped output differs from uncompressed"
+    );
+}
+
+#[test]
+fn test_gzip_compression_levels() {
+    let temp_dir = TempDir::new().unwrap();
+
+    let input_fq = test_data_path("medium_10k.fq");
+
+    // Test different compression levels
+    for level in [1, 6, 9] {
+        let output_gz = temp_dir
+            .path()
+            .join(format!("output_level_{}.fq.gz", level));
+        let output_json = temp_dir.path().join(format!("output_level_{}.json", level));
+
+        let status = Command::new(cargo_bin("fasterp"))
+            .arg("-i")
+            .arg(&input_fq)
+            .arg("-o")
+            .arg(&output_gz)
+            .arg("-j")
+            .arg(&output_json)
+            .arg("-z")
+            .arg(level.to_string())
+            .status()
+            .expect("Failed to run fasterp");
+        assert!(status.success(), "Compression level {} failed", level);
+        assert!(
+            output_gz.exists(),
+            "Output file not created for level {}",
+            level
+        );
+    }
+
+    // Verify all produce same content when decompressed
+    let mut contents = Vec::new();
+    for level in [1, 6, 9] {
+        let output_gz = temp_dir
+            .path()
+            .join(format!("output_level_{}.fq.gz", level));
+        let decompressed_fq = temp_dir.path().join(format!("decompressed_{}.fq", level));
+
+        let status = Command::new("gunzip")
+            .arg("-c")
+            .arg(&output_gz)
+            .stdout(std::fs::File::create(&decompressed_fq).unwrap())
+            .status()
+            .expect("Failed to run gunzip");
+        assert!(status.success());
+
+        contents.push(fs::read_to_string(&decompressed_fq).unwrap());
+    }
+
+    // All should be identical
+    assert_eq!(contents[0], contents[1], "Level 1 and 6 differ");
+    assert_eq!(contents[1], contents[2], "Level 6 and 9 differ");
+}
+
+// ============================================================================
+// N-BASE FILTERING TESTS
+// ============================================================================
+
+#[test]
+fn test_n_base_filtering_matches_fastp() {
+    let temp_dir = TempDir::new().unwrap();
+
+    let input_fq = test_data_path("small_1k.fq");
+
+    for n_limit in [0, 3, 10] {
+        let fastp_fq = temp_dir.path().join(format!("fastp_n{}.fq", n_limit));
+        let fastp_json = temp_dir.path().join(format!("fastp_n{}.json", n_limit));
+        let fasterp_fq = temp_dir.path().join(format!("fasterp_n{}.fq", n_limit));
+        let fasterp_json = temp_dir.path().join(format!("fasterp_n{}.json", n_limit));
+
+        // Run fastp
+        let status = Command::new("fastp")
+            .arg("-i")
+            .arg(&input_fq)
+            .arg("-o")
+            .arg(&fastp_fq)
+            .arg("-j")
+            .arg(&fastp_json)
+            .arg("-n")
+            .arg(n_limit.to_string())
+            .stderr(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .status()
+            .expect("Failed to run fastp");
+        assert!(status.success());
+
+        // Run fasterp
+        let status = Command::new(cargo_bin("fasterp"))
+            .arg("-i")
+            .arg(&input_fq)
+            .arg("-o")
+            .arg(&fasterp_fq)
+            .arg("-j")
+            .arg(&fasterp_json)
+            .arg("-n")
+            .arg(n_limit.to_string())
+            .status()
+            .expect("Failed to run fasterp");
+        assert!(status.success());
+
+        // Compare outputs
+        let fastp_content = fs::read_to_string(&fastp_fq).unwrap();
+        let fasterp_content = fs::read_to_string(&fasterp_fq).unwrap();
+        assert_eq!(
+            fastp_content, fasterp_content,
+            "N-base filtering with limit {} differs",
+            n_limit
+        );
+
+        // Compare JSON
+        compare_json_outputs(&fastp_json, &fasterp_json);
+    }
+}
+
+// ============================================================================
+// MULTI-THREADING TESTS
+// ============================================================================
+
+#[test]
+fn test_multithreading_consistency() {
+    let temp_dir = TempDir::new().unwrap();
+
+    let input_fq = test_data_path("medium_10k.fq");
+
+    // Run with 1, 2, 4, and 8 threads
+    let thread_counts = [1, 2, 4, 8];
+    let mut outputs = Vec::new();
+
+    for threads in thread_counts.iter() {
+        let output_fq = temp_dir.path().join(format!("output_t{}.fq", threads));
+        let output_json = temp_dir.path().join(format!("output_t{}.json", threads));
+
+        let status = Command::new(cargo_bin("fasterp"))
+            .arg("-i")
+            .arg(&input_fq)
+            .arg("-o")
+            .arg(&output_fq)
+            .arg("-j")
+            .arg(&output_json)
+            .arg("-t")
+            .arg(threads.to_string())
+            .status()
+            .expect("Failed to run fasterp");
+        assert!(status.success(), "Failed with {} threads", threads);
+
+        let content = fs::read_to_string(&output_fq).unwrap();
+        outputs.push(content);
+    }
+
+    // All outputs should be identical regardless of thread count
+    for i in 1..outputs.len() {
+        assert_eq!(
+            outputs[0], outputs[i],
+            "Output differs between 1 thread and {} threads",
+            thread_counts[i]
+        );
+    }
+}
+
+#[test]
+fn test_multithreading_json_consistency() {
+    let temp_dir = TempDir::new().unwrap();
+
+    let input_fq = test_data_path("medium_10k.fq");
+
+    // Run with different thread counts
+    let output_1t_json = temp_dir.path().join("output_1t.json");
+    let output_4t_json = temp_dir.path().join("output_4t.json");
+
+    // 1 thread
+    let status = Command::new(cargo_bin("fasterp"))
+        .arg("-i")
+        .arg(&input_fq)
+        .arg("-o")
+        .arg(temp_dir.path().join("output_1t.fq"))
+        .arg("-j")
+        .arg(&output_1t_json)
+        .arg("-t")
+        .arg("1")
+        .status()
+        .expect("Failed to run fasterp");
+    assert!(status.success());
+
+    // 4 threads
+    let status = Command::new(cargo_bin("fasterp"))
+        .arg("-i")
+        .arg(&input_fq)
+        .arg("-o")
+        .arg(temp_dir.path().join("output_4t.fq"))
+        .arg("-j")
+        .arg(&output_4t_json)
+        .arg("-t")
+        .arg("4")
+        .status()
+        .expect("Failed to run fasterp");
+    assert!(status.success());
+
+    // Compare JSON outputs - should be identical
+    compare_json_outputs(&output_1t_json, &output_4t_json);
+}
+
+#[test]
+fn test_multithreading_large_dataset() {
+    let temp_dir = TempDir::new().unwrap();
+
+    let input_fq = test_data_path("large_100k.fq");
+
+    let output_1t_fq = temp_dir.path().join("output_1t.fq");
+    let output_8t_fq = temp_dir.path().join("output_8t.fq");
+    let output_1t_json = temp_dir.path().join("output_1t.json");
+    let output_8t_json = temp_dir.path().join("output_8t.json");
+
+    // 1 thread
+    let status = Command::new(cargo_bin("fasterp"))
+        .arg("-i")
+        .arg(&input_fq)
+        .arg("-o")
+        .arg(&output_1t_fq)
+        .arg("-j")
+        .arg(&output_1t_json)
+        .arg("-t")
+        .arg("1")
+        .status()
+        .expect("Failed to run fasterp");
+    assert!(status.success());
+
+    // 8 threads
+    let status = Command::new(cargo_bin("fasterp"))
+        .arg("-i")
+        .arg(&input_fq)
+        .arg("-o")
+        .arg(&output_8t_fq)
+        .arg("-j")
+        .arg(&output_8t_json)
+        .arg("-t")
+        .arg("8")
+        .status()
+        .expect("Failed to run fasterp");
+    assert!(status.success());
+
+    // Compare outputs
+    let output_1t = fs::read_to_string(&output_1t_fq).unwrap();
+    let output_8t = fs::read_to_string(&output_8t_fq).unwrap();
+    assert_eq!(
+        output_1t, output_8t,
+        "Multi-threading produces different output on large dataset"
+    );
+
+    // Compare JSON
+    compare_json_outputs(&output_1t_json, &output_8t_json);
+}
+
+// ============================================================================
+// STDIN/STDOUT TESTS
+// ============================================================================
+
+#[test]
+fn test_stdin_input() {
+    let temp_dir = TempDir::new().unwrap();
+
+    let input_fq = test_data_path("small_1k.fq");
+    let output_fq = temp_dir.path().join("output.fq");
+    let output_json = temp_dir.path().join("output.json");
+
+    // Run fasterp with stdin (single-threaded mode required for stdin)
+    let input_file = std::fs::File::open(&input_fq).unwrap();
+    let status = Command::new(cargo_bin("fasterp"))
+        .arg("-i")
+        .arg("-")
+        .arg("-o")
+        .arg(&output_fq)
+        .arg("-j")
+        .arg(&output_json)
+        .arg("-t")
+        .arg("1")
+        .stdin(input_file)
+        .status()
+        .expect("Failed to run fasterp");
+    assert!(status.success());
+
+    // Compare with normal file input
+    let expected_fq = temp_dir.path().join("expected.fq");
+    let expected_json = temp_dir.path().join("expected.json");
+
+    let status = Command::new(cargo_bin("fasterp"))
+        .arg("-i")
+        .arg(&input_fq)
+        .arg("-o")
+        .arg(&expected_fq)
+        .arg("-j")
+        .arg(&expected_json)
+        .arg("-t")
+        .arg("1")
+        .status()
+        .expect("Failed to run fasterp");
+    assert!(status.success());
+
+    let output_content = fs::read_to_string(&output_fq).unwrap();
+    let expected_content = fs::read_to_string(&expected_fq).unwrap();
+    assert_eq!(
+        output_content, expected_content,
+        "Stdin input produces different output"
+    );
+}
+
+#[test]
+fn test_stdout_output() {
+    let temp_dir = TempDir::new().unwrap();
+
+    let input_fq = test_data_path("small_1k.fq");
+    let output_json = temp_dir.path().join("output.json");
+
+    // Run fasterp with stdout (single-threaded mode required for stdout)
+    let output = Command::new(cargo_bin("fasterp"))
+        .arg("-i")
+        .arg(&input_fq)
+        .arg("-o")
+        .arg("-")
+        .arg("-j")
+        .arg(&output_json)
+        .arg("-t")
+        .arg("1")
+        .output()
+        .expect("Failed to run fasterp");
+    assert!(output.status.success());
+
+    let stdout_content = String::from_utf8(output.stdout).unwrap();
+
+    // Compare with normal file output
+    let expected_fq = temp_dir.path().join("expected.fq");
+    let expected_json = temp_dir.path().join("expected.json");
+
+    let status = Command::new(cargo_bin("fasterp"))
+        .arg("-i")
+        .arg(&input_fq)
+        .arg("-o")
+        .arg(&expected_fq)
+        .arg("-j")
+        .arg(&expected_json)
+        .arg("-t")
+        .arg("1")
+        .status()
+        .expect("Failed to run fasterp");
+    assert!(status.success());
+
+    let expected_content = fs::read_to_string(&expected_fq).unwrap();
+    assert_eq!(
+        stdout_content, expected_content,
+        "Stdout output produces different result"
+    );
+}
+
+#[test]
+fn test_stdin_stdout_pipeline() {
+    let input_fq = test_data_path("R1.fq");
+
+    // Run fasterp with stdin and stdout (single-threaded mode required)
+    let input_file = std::fs::File::open(&input_fq).unwrap();
+    let output = Command::new(cargo_bin("fasterp"))
+        .arg("-i")
+        .arg("-")
+        .arg("-o")
+        .arg("-")
+        .arg("-j")
+        .arg("/dev/null")
+        .arg("-t")
+        .arg("1")
+        .stdin(input_file)
+        .output()
+        .expect("Failed to run fasterp");
+    assert!(output.status.success());
+
+    let stdout_content = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        !stdout_content.is_empty(),
+        "No output from stdin/stdout pipeline"
+    );
+}
+
+// ============================================================================
+// COMBINED FILTER TESTS
+// ============================================================================
+
+#[test]
+fn test_combined_filters_matches_fastp() {
+    let temp_dir = TempDir::new().unwrap();
+
+    let input_fq = test_data_path("medium_10k.fq");
+    let fastp_fq = temp_dir.path().join("fastp.fq");
+    let fastp_json = temp_dir.path().join("fastp.json");
+    let fasterp_fq = temp_dir.path().join("fasterp.fq");
+    let fasterp_json = temp_dir.path().join("fasterp.json");
+
+    // Run fastp with multiple filters
+    let status = Command::new("fastp")
+        .arg("-i")
+        .arg(&input_fq)
+        .arg("-o")
+        .arg(&fastp_fq)
+        .arg("-j")
+        .arg(&fastp_json)
+        .arg("-l")
+        .arg("30")
+        .arg("-q")
+        .arg("15")
+        .arg("-n")
+        .arg("3")
+        .stderr(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .status()
+        .expect("Failed to run fastp");
+    assert!(status.success());
+
+    // Run fasterp with same filters
+    let status = Command::new(cargo_bin("fasterp"))
+        .arg("-i")
+        .arg(&input_fq)
+        .arg("-o")
+        .arg(&fasterp_fq)
+        .arg("-j")
+        .arg(&fasterp_json)
+        .arg("-l")
+        .arg("30")
+        .arg("-q")
+        .arg("15")
+        .arg("-n")
+        .arg("3")
+        .status()
+        .expect("Failed to run fasterp");
+    assert!(status.success());
+
+    // Compare outputs
+    let fastp_content = fs::read_to_string(&fastp_fq).unwrap();
+    let fasterp_content = fs::read_to_string(&fasterp_fq).unwrap();
+    assert_eq!(
+        fastp_content, fasterp_content,
+        "Combined filters produce different output"
+    );
+
+    compare_json_outputs(&fastp_json, &fasterp_json);
+}
+
+#[test]
+fn test_strict_combined_filters() {
+    let temp_dir = TempDir::new().unwrap();
+
+    let input_fq = test_data_path("medium_10k.fq");
+    let fastp_fq = temp_dir.path().join("fastp.fq");
+    let fastp_json = temp_dir.path().join("fastp.json");
+    let fasterp_fq = temp_dir.path().join("fasterp.fq");
+    let fasterp_json = temp_dir.path().join("fasterp.json");
+
+    // Very strict filtering
+    let status = Command::new("fastp")
+        .arg("-i")
+        .arg(&input_fq)
+        .arg("-o")
+        .arg(&fastp_fq)
+        .arg("-j")
+        .arg(&fastp_json)
+        .arg("-l")
+        .arg("100")
+        .arg("-q")
+        .arg("30")
+        .arg("-n")
+        .arg("0")
+        .stderr(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .status()
+        .expect("Failed to run fastp");
+    assert!(status.success());
+
+    let status = Command::new(cargo_bin("fasterp"))
+        .arg("-i")
+        .arg(&input_fq)
+        .arg("-o")
+        .arg(&fasterp_fq)
+        .arg("-j")
+        .arg(&fasterp_json)
+        .arg("-l")
+        .arg("100")
+        .arg("-q")
+        .arg("30")
+        .arg("-n")
+        .arg("0")
+        .status()
+        .expect("Failed to run fasterp");
+    assert!(status.success());
+
+    let fastp_content = fs::read_to_string(&fastp_fq).unwrap();
+    let fasterp_content = fs::read_to_string(&fasterp_fq).unwrap();
+    assert_eq!(
+        fastp_content, fasterp_content,
+        "Strict filters produce different output"
+    );
+
+    compare_json_outputs(&fastp_json, &fasterp_json);
+}
+
+// ============================================================================
+// EDGE CASE TESTS
+// ============================================================================
+
+#[test]
+fn test_empty_output_all_filtered() {
+    let temp_dir = TempDir::new().unwrap();
+
+    let input_fq = test_data_path("small_1k.fq");
+    let output_fq = temp_dir.path().join("output.fq");
+    let output_json = temp_dir.path().join("output.json");
+
+    // Use extreme filter that should filter everything
+    let status = Command::new(cargo_bin("fasterp"))
+        .arg("-i")
+        .arg(&input_fq)
+        .arg("-o")
+        .arg(&output_fq)
+        .arg("-j")
+        .arg(&output_json)
+        .arg("-l")
+        .arg("1000") // Extremely long length requirement
+        .status()
+        .expect("Failed to run fasterp");
+    assert!(status.success());
+
+    // Output file should exist but be empty (or very small)
+    let content = fs::read_to_string(&output_fq).unwrap();
+    assert!(
+        content.is_empty() || content.lines().count() < 4,
+        "Expected empty or nearly empty output"
+    );
+
+    // JSON should show 0 passed reads
+    let json_content = fs::read_to_string(&output_json).unwrap();
+    let json: Value = serde_json::from_str(&json_content).unwrap();
+    let passed = json["filtering_result"]["passed_filter_reads"]
+        .as_u64()
+        .unwrap();
+    assert_eq!(passed, 0, "Expected 0 passed reads");
+}
+
+#[test]
+fn test_invalid_quality_threshold() {
+    let temp_dir = TempDir::new().unwrap();
+
+    let input_fq = test_data_path("small_1k.fq");
+    let output_fq = temp_dir.path().join("output.fq");
+    let output_json = temp_dir.path().join("output.json");
+
+    // Quality threshold of 0 should be treated as disabled
+    let status = Command::new(cargo_bin("fasterp"))
+        .arg("-i")
+        .arg(&input_fq)
+        .arg("-o")
+        .arg(&output_fq)
+        .arg("-j")
+        .arg(&output_json)
+        .arg("-q")
+        .arg("0")
+        .status()
+        .expect("Failed to run fasterp");
+    assert!(status.success());
+}
+
+// ============================================================================
+// LARGE DATASET TESTS (stress testing)
+// ============================================================================
+
+#[test]
+#[ignore] // Run with --ignored flag for stress testing
+fn test_large_dataset_100k_matches_fastp() {
+    let temp_dir = TempDir::new().unwrap();
+
+    let (fastp_fq, fastp_json) = run_fastp("large_100k.fq", &temp_dir);
+    let (fasterp_fq, fasterp_json) = run_fasterp("large_100k.fq", &temp_dir);
+
+    let fastp_content = fs::read_to_string(fastp_fq).unwrap();
+    let fasterp_content = fs::read_to_string(fasterp_fq).unwrap();
+    assert_eq!(
+        fastp_content, fasterp_content,
+        "Large dataset output differs"
+    );
+
+    compare_json_outputs(&fastp_json, &fasterp_json);
+}
+
+#[test]
+#[ignore] // Run with --ignored flag for stress testing
+fn test_xlarge_dataset_500k() {
+    let temp_dir = TempDir::new().unwrap();
+
+    let input_fq = test_data_path("xlarge_500k.fq");
+    let output_fq = temp_dir.path().join("output.fq");
+    let output_json = temp_dir.path().join("output.json");
+
+    // Just verify it completes successfully
+    let status = Command::new(cargo_bin("fasterp"))
+        .arg("-i")
+        .arg(&input_fq)
+        .arg("-o")
+        .arg(&output_fq)
+        .arg("-j")
+        .arg(&output_json)
+        .arg("-t")
+        .arg("8")
+        .status()
+        .expect("Failed to run fasterp");
+    assert!(status.success());
+
+    assert!(output_fq.exists());
+    assert!(output_json.exists());
+}
+
+// ============================================================================
+// BATCH SIZE TESTS
+// ============================================================================
+
+#[test]
+fn test_different_batch_sizes_consistent() {
+    let temp_dir = TempDir::new().unwrap();
+
+    let input_fq = test_data_path("medium_10k.fq");
+
+    // Test different batch sizes
+    let batch_sizes = [1024 * 1024, 4 * 1024 * 1024, 16 * 1024 * 1024]; // 1MB, 4MB, 16MB
+    let mut outputs = Vec::new();
+
+    for (i, &batch_size) in batch_sizes.iter().enumerate() {
+        let output_fq = temp_dir.path().join(format!("output_batch_{}.fq", i));
+        let output_json = temp_dir.path().join(format!("output_batch_{}.json", i));
+
+        let status = Command::new(cargo_bin("fasterp"))
+            .arg("-i")
+            .arg(&input_fq)
+            .arg("-o")
+            .arg(&output_fq)
+            .arg("-j")
+            .arg(&output_json)
+            .arg("-t")
+            .arg("4")
+            .arg("--batch-bytes")
+            .arg(batch_size.to_string())
+            .status()
+            .expect("Failed to run fasterp");
+        assert!(status.success(), "Failed with batch size {}", batch_size);
+
+        let content = fs::read_to_string(&output_fq).unwrap();
+        outputs.push(content);
+    }
+
+    // All outputs should be identical
+    for i in 1..outputs.len() {
+        assert_eq!(
+            outputs[0], outputs[i],
+            "Output differs with different batch sizes"
+        );
+    }
+}
+
+// ============================================================================
+// JSON REPORT VALIDATION TESTS
+// ============================================================================
+
+#[test]
+fn test_json_report_structure() {
+    let temp_dir = TempDir::new().unwrap();
+
+    let input_fq = test_data_path("small_1k.fq");
+    let output_fq = temp_dir.path().join("output.fq");
+    let output_json = temp_dir.path().join("output.json");
+
+    let status = Command::new(cargo_bin("fasterp"))
+        .arg("-i")
+        .arg(&input_fq)
+        .arg("-o")
+        .arg(&output_fq)
+        .arg("-j")
+        .arg(&output_json)
+        .status()
+        .expect("Failed to run fasterp");
+    assert!(status.success());
+
+    // Validate JSON structure
+    let json_content = fs::read_to_string(&output_json).unwrap();
+    let json: Value = serde_json::from_str(&json_content).unwrap();
+
+    // Check required fields exist
+    assert!(json.get("summary").is_some(), "Missing 'summary' field");
+    assert!(
+        json.get("filtering_result").is_some(),
+        "Missing 'filtering_result' field"
+    );
+    assert!(
+        json.get("read1_before_filtering").is_some(),
+        "Missing 'read1_before_filtering' field"
+    );
+
+    // Check summary fields
+    let summary = &json["summary"];
+    assert!(summary.get("fastp_version").is_some());
+    assert!(summary.get("before_filtering").is_some());
+    assert!(summary.get("after_filtering").is_some());
+
+    // Check filtering result fields
+    let filtering = &json["filtering_result"];
+    assert!(filtering.get("passed_filter_reads").is_some());
+    assert!(filtering.get("low_quality_reads").is_some());
+    assert!(filtering.get("too_many_N_reads").is_some());
+    assert!(filtering.get("too_short_reads").is_some());
+
+    // Check detailed stats
+    let detailed = &json["read1_before_filtering"];
+    assert!(detailed.get("quality_curves").is_some());
+    assert!(detailed.get("kmer_count").is_some());
+}
+
+// ============================================================================
+// OUTPUT ORDERING TESTS
+// ============================================================================
+
+#[test]
+fn test_output_order_preserved_multithreading() {
+    let temp_dir = TempDir::new().unwrap();
+
+    let input_fq = test_data_path("medium_10k.fq");
+    let output_st = temp_dir.path().join("output_st.fq");
+    let output_mt = temp_dir.path().join("output_mt.fq");
+
+    // Single-threaded
+    let status = Command::new(cargo_bin("fasterp"))
+        .arg("-i")
+        .arg(&input_fq)
+        .arg("-o")
+        .arg(&output_st)
+        .arg("-j")
+        .arg("/dev/null")
+        .arg("-t")
+        .arg("1")
+        .status()
+        .expect("Failed to run fasterp");
+    assert!(status.success());
+
+    // Multi-threaded
+    let status = Command::new(cargo_bin("fasterp"))
+        .arg("-i")
+        .arg(&input_fq)
+        .arg("-o")
+        .arg(&output_mt)
+        .arg("-j")
+        .arg("/dev/null")
+        .arg("-t")
+        .arg("8")
+        .status()
+        .expect("Failed to run fasterp");
+    assert!(status.success());
+
+    // Outputs should be identical (order preserved)
+    let st_content = fs::read_to_string(&output_st).unwrap();
+    let mt_content = fs::read_to_string(&output_mt).unwrap();
+    assert_eq!(
+        st_content, mt_content,
+        "Multi-threading changes output order"
+    );
+}

@@ -11,6 +11,8 @@ serde_json = "1.0"
 indexmap = { version = "2.0", features = ["serde"] }
 crossbeam-channel = "0.5"
 num_cpus = "1.16"
+flate2 = "1.0"
+zstd = { version = "0.13", optional = true }
 
 [dev-dependencies]
 tempfile = "3.8"
