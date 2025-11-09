@@ -6,5 +6,8 @@ fastp.json
 fastp.html
 test_data/*.fq
 test_data/bench_*.fq
+test_data/xlarge_*.fq
+test_data/xxlarge_*.fq
+test_data/xxxlarge_*.fq
 
 .todo
