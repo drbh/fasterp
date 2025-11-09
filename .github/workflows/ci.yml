@@ -1,0 +1,71 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  test-and-benchmark:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@stable
+
+    - name: Cache cargo dependencies
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/.cargo/bin/
+          ~/.cargo/registry/index/
+          ~/.cargo/registry/cache/
+          ~/.cargo/git/db/
+          target/
+        key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+    - name: Install dependencies
+      run: |
+        # Install nucgen for test data generation
+        cargo install nucgen
+        nucgen --version
+
+        # Install fastp for comparison
+        wget http://opengene.org/fastp/fastp
+        chmod +x fastp
+        sudo mv fastp /usr/local/bin/
+        fastp --version
+
+    - name: Generate test data
+      run: |
+        cd test_data
+        bash getdata.sh
+
+    - name: Build fasterp (release)
+      run: cargo build --release
+
+    - name: Run tests
+      run: cargo test
+
+    - name: Run benchmarks
+      run: |
+        cargo run --release --example bench_chart 2>&1 | tee benchmark_output.txt
+
+    - name: Upload benchmark results
+      uses: actions/upload-artifact@v4
+      with:
+        name: benchmark-results
+        path: benchmark_output.txt
+
+    - name: Upload test results on failure
+      if: failure()
+      uses: actions/upload-artifact@v4
+      with:
+        name: test-results
+        path: |
+          test_data/*.fq
+          target/debug/deps/*.log
