@@ -18,3 +18,8 @@ zstd = { version = "0.13", optional = true }
 tempfile = "3.8"
 assert_cmd = "2.0"
 predicates = "3.0"
+criterion = "0.5"
+
+[[bench]]
+name = "comparison"
+harness = false
