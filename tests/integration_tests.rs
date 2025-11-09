@@ -960,15 +960,432 @@ fn test_strict_combined_filters() {
     compare_json_outputs(&fastp_json, &fasterp_json);
 }
 
-// EDGE CASE TESTS
+// EDGE CASE TESTS - Using Crafted Data
+
+/// Helper to create a FASTQ record with specific quality pattern
+fn create_fastq_record(name: &str, seq: &str, qual: &str) -> String {
+    format!("@{}\n{}\n+\n{}\n", name, seq, qual)
+}
+
+/// Helper to create quality string with specific phred scores
+fn quality_string_from_phred(phred_scores: &[u8]) -> String {
+    phred_scores.iter().map(|&p| (p + 33) as char).collect()
+}
+
+#[test]
+fn test_unqualified_percent_boundary_40_percent() {
+    // Test the integer division bug fix: 40.39% unqualified should be rejected
+    let temp_dir = TempDir::new().unwrap();
+    let input_fq = temp_dir.path().join("input.fq");
+    let output_fq = temp_dir.path().join("output.fq");
+    let output_json = temp_dir.path().join("output.json");
+
+    // Create a read with exactly 40.39% bases below Q9
+    // 1431 bases total, 578 bases with Q<9 = 40.39%
+    let mut qual_scores = vec![15u8; 853]; // 853 bases with Q15 (qualified)
+    qual_scores.extend(vec![5u8; 578]); // 578 bases with Q5 (unqualified)
+
+    let seq = "A".repeat(1431);
+    let qual = quality_string_from_phred(&qual_scores);
+    let record = create_fastq_record("test_read", &seq, &qual);
+
+    fs::write(&input_fq, record).unwrap();
+
+    // Run with -q 9 (default -u 40)
+    let status = Command::new(cargo_bin("fasterp"))
+        .arg("-i")
+        .arg(&input_fq)
+        .arg("-o")
+        .arg(&output_fq)
+        .arg("-j")
+        .arg(&output_json)
+        .arg("-q")
+        .arg("9")
+        .arg("-l")
+        .arg("1")
+        .status()
+        .expect("Failed to run fasterp");
+    assert!(status.success());
+
+    // Should filter out (40.39% > 40%)
+    let content = fs::read_to_string(&output_fq).unwrap();
+    assert!(
+        content.is_empty(),
+        "Read with 40.39% unqualified should be filtered"
+    );
+
+    // Verify JSON shows 1 low quality read
+    let json_content = fs::read_to_string(&output_json).unwrap();
+    let json: Value = serde_json::from_str(&json_content).unwrap();
+    assert_eq!(
+        json["filtering_result"]["low_quality_reads"]
+            .as_u64()
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        json["filtering_result"]["passed_filter_reads"]
+            .as_u64()
+            .unwrap(),
+        0
+    );
+}
+
+#[test]
+fn test_unqualified_percent_exact_40_percent() {
+    // Test exact boundary: 40.0% unqualified should PASS
+    let temp_dir = TempDir::new().unwrap();
+    let input_fq = temp_dir.path().join("input.fq");
+    let output_fq = temp_dir.path().join("output.fq");
+    let output_json = temp_dir.path().join("output.json");
+
+    // Create a read with exactly 40.0% bases below Q9
+    // 100 bases total, 40 bases with Q<9 = 40.0%
+    let mut qual_scores = vec![15u8; 60]; // 60 bases with Q15
+    qual_scores.extend(vec![5u8; 40]); // 40 bases with Q5
+
+    let seq = "A".repeat(100);
+    let qual = quality_string_from_phred(&qual_scores);
+    let record = create_fastq_record("test_read", &seq, &qual);
+
+    fs::write(&input_fq, record).unwrap();
+
+    // Run with -q 9 -u 40
+    let status = Command::new(cargo_bin("fasterp"))
+        .arg("-i")
+        .arg(&input_fq)
+        .arg("-o")
+        .arg(&output_fq)
+        .arg("-j")
+        .arg(&output_json)
+        .arg("-q")
+        .arg("9")
+        .arg("-u")
+        .arg("40")
+        .arg("-l")
+        .arg("1")
+        .status()
+        .expect("Failed to run fasterp");
+    assert!(status.success());
+
+    // Should PASS (40.0% is not > 40%)
+    let content = fs::read_to_string(&output_fq).unwrap();
+    assert!(
+        !content.is_empty(),
+        "Read with exactly 40.0% unqualified should pass"
+    );
+
+    let json_content = fs::read_to_string(&output_json).unwrap();
+    let json: Value = serde_json::from_str(&json_content).unwrap();
+    assert_eq!(
+        json["filtering_result"]["passed_filter_reads"]
+            .as_u64()
+            .unwrap(),
+        1
+    );
+}
+
+#[test]
+fn test_average_quality_filter() {
+    // Test -e parameter (average quality threshold)
+    let temp_dir = TempDir::new().unwrap();
+    let input_fq = temp_dir.path().join("input.fq");
+    let output_fq = temp_dir.path().join("output.fq");
+    let output_json = temp_dir.path().join("output.json");
+
+    // Create two reads: one with mean Q20, one with mean Q15
+    let seq = "A".repeat(100);
+    let qual_20 = quality_string_from_phred(&vec![20u8; 100]); // Mean = 20
+    let qual_15 = quality_string_from_phred(&vec![15u8; 100]); // Mean = 15
+
+    let mut input_data = String::new();
+    input_data.push_str(&create_fastq_record("read_q20", &seq, &qual_20));
+    input_data.push_str(&create_fastq_record("read_q15", &seq, &qual_15));
+
+    fs::write(&input_fq, input_data).unwrap();
+
+    // Run with -e 18 (require mean quality >= 18)
+    let status = Command::new(cargo_bin("fasterp"))
+        .arg("-i")
+        .arg(&input_fq)
+        .arg("-o")
+        .arg(&output_fq)
+        .arg("-j")
+        .arg(&output_json)
+        .arg("-e")
+        .arg("18")
+        .arg("-q")
+        .arg("0") // Disable -q/-u filtering
+        .arg("-l")
+        .arg("1")
+        .status()
+        .expect("Failed to run fasterp");
+    assert!(status.success());
+
+    // Only read_q20 should pass
+    let content = fs::read_to_string(&output_fq).unwrap();
+    assert_eq!(content.lines().count(), 4, "Should have 1 read (4 lines)");
+    assert!(content.contains("read_q20"), "read_q20 should pass");
+    assert!(!content.contains("read_q15"), "read_q15 should be filtered");
+
+    let json_content = fs::read_to_string(&output_json).unwrap();
+    let json: Value = serde_json::from_str(&json_content).unwrap();
+    assert_eq!(
+        json["filtering_result"]["passed_filter_reads"]
+            .as_u64()
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        json["filtering_result"]["low_quality_reads"]
+            .as_u64()
+            .unwrap(),
+        1
+    );
+}
+
+#[test]
+fn test_max_length_trimming() {
+    // Test -b parameter (max length trimming)
+    let temp_dir = TempDir::new().unwrap();
+    let input_fq = temp_dir.path().join("input.fq");
+    let output_fq = temp_dir.path().join("output.fq");
+    let output_json = temp_dir.path().join("output.json");
+
+    // Create a 150bp read
+    let seq = "ACGT".repeat(37) + "AC"; // 150 bases
+    let qual = quality_string_from_phred(&vec![30u8; 150]);
+    let record = create_fastq_record("long_read", &seq, &qual);
+
+    fs::write(&input_fq, record).unwrap();
+
+    // Run with -b 100 (trim to max 100bp)
+    let status = Command::new(cargo_bin("fasterp"))
+        .arg("-i")
+        .arg(&input_fq)
+        .arg("-o")
+        .arg(&output_fq)
+        .arg("-j")
+        .arg(&output_json)
+        .arg("-b")
+        .arg("100")
+        .arg("-l")
+        .arg("1")
+        .status()
+        .expect("Failed to run fasterp");
+    assert!(status.success());
+
+    // Output should be exactly 100bp
+    let content = fs::read_to_string(&output_fq).unwrap();
+    let lines: Vec<&str> = content.lines().collect();
+    assert_eq!(lines.len(), 4);
+    assert_eq!(lines[1].len(), 100, "Sequence should be trimmed to 100bp");
+    assert_eq!(lines[3].len(), 100, "Quality should be trimmed to 100bp");
+}
+
+#[test]
+fn test_combined_q_u_and_e_filters() {
+    // Test that -q/-u and -e work together correctly
+    let temp_dir = TempDir::new().unwrap();
+    let input_fq = temp_dir.path().join("input.fq");
+    let output_fq = temp_dir.path().join("output.fq");
+    let output_json = temp_dir.path().join("output.json");
+
+    // Create three reads:
+    // 1. High quality overall, but 50% unqualified at Q9 threshold
+    let mut qual1 = vec![25u8; 50]; // High quality bases
+    qual1.extend(vec![5u8; 50]); // Low quality bases, mean = 15
+
+    // 2. All Q12 (passes -q 9 -u 40 but mean < 15)
+    let qual2 = vec![12u8; 100]; // Mean = 12
+
+    // 3. All Q20 (passes both)
+    let qual3 = vec![20u8; 100]; // Mean = 20
+
+    let seq = "A".repeat(100);
+    let mut input_data = String::new();
+    input_data.push_str(&create_fastq_record(
+        "read1",
+        &seq,
+        &quality_string_from_phred(&qual1),
+    ));
+    input_data.push_str(&create_fastq_record(
+        "read2",
+        &seq,
+        &quality_string_from_phred(&qual2),
+    ));
+    input_data.push_str(&create_fastq_record(
+        "read3",
+        &seq,
+        &quality_string_from_phred(&qual3),
+    ));
+
+    fs::write(&input_fq, input_data).unwrap();
+
+    // Run with -q 9 -u 40 AND -e 15
+    let status = Command::new(cargo_bin("fasterp"))
+        .arg("-i")
+        .arg(&input_fq)
+        .arg("-o")
+        .arg(&output_fq)
+        .arg("-j")
+        .arg(&output_json)
+        .arg("-q")
+        .arg("9")
+        .arg("-u")
+        .arg("40")
+        .arg("-e")
+        .arg("15")
+        .arg("-l")
+        .arg("1")
+        .status()
+        .expect("Failed to run fasterp");
+    assert!(status.success());
+
+    // read1: fails -u (50% > 40%)
+    // read2: passes -q/-u but fails -e (12 < 15)
+    // read3: passes both
+    let content = fs::read_to_string(&output_fq).unwrap();
+    assert_eq!(content.lines().count(), 4, "Only 1 read should pass");
+    assert!(content.contains("read3"), "Only read3 should pass");
+
+    let json_content = fs::read_to_string(&output_json).unwrap();
+    let json: Value = serde_json::from_str(&json_content).unwrap();
+    assert_eq!(
+        json["filtering_result"]["passed_filter_reads"]
+            .as_u64()
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        json["filtering_result"]["low_quality_reads"]
+            .as_u64()
+            .unwrap(),
+        2
+    );
+}
+
+#[test]
+fn test_n_base_limit_exact_boundary() {
+    let temp_dir = TempDir::new().unwrap();
+    let input_fq = temp_dir.path().join("input.fq");
+    let output_fq = temp_dir.path().join("output.fq");
+    let output_json = temp_dir.path().join("output.json");
+
+    // Create reads with different N counts
+    let seq_5n = "ACGT".repeat(20) + "NNNNN"; // Exactly 5 Ns
+    let seq_6n = "ACGT".repeat(20) + "NNNNNN"; // 6 Ns
+    let qual = quality_string_from_phred(&vec![30u8; 85]);
+    let qual6 = quality_string_from_phred(&vec![30u8; 86]);
+
+    let mut input_data = String::new();
+    input_data.push_str(&create_fastq_record("read_5n", &seq_5n, &qual));
+    input_data.push_str(&create_fastq_record("read_6n", &seq_6n, &qual6));
+
+    fs::write(&input_fq, input_data).unwrap();
+
+    // Run with -n 5 (allow up to 5 Ns)
+    let status = Command::new(cargo_bin("fasterp"))
+        .arg("-i")
+        .arg(&input_fq)
+        .arg("-o")
+        .arg(&output_fq)
+        .arg("-j")
+        .arg(&output_json)
+        .arg("-n")
+        .arg("5")
+        .arg("-l")
+        .arg("1")
+        .status()
+        .expect("Failed to run fasterp");
+    assert!(status.success());
+
+    // read_5n should pass (5 <= 5), read_6n should fail (6 > 5)
+    let content = fs::read_to_string(&output_fq).unwrap();
+    assert_eq!(content.lines().count(), 4);
+    assert!(content.contains("read_5n"));
+    assert!(!content.contains("read_6n"));
+
+    let json_content = fs::read_to_string(&output_json).unwrap();
+    let json: Value = serde_json::from_str(&json_content).unwrap();
+    assert_eq!(
+        json["filtering_result"]["passed_filter_reads"]
+            .as_u64()
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        json["filtering_result"]["too_many_N_reads"]
+            .as_u64()
+            .unwrap(),
+        1
+    );
+}
+
+#[test]
+fn test_length_filter_after_trimming() {
+    // Test that length filter applies AFTER trimming
+    let temp_dir = TempDir::new().unwrap();
+    let input_fq = temp_dir.path().join("input.fq");
+    let output_fq = temp_dir.path().join("output.fq");
+    let output_json = temp_dir.path().join("output.json");
+
+    // Create a 100bp read
+    let seq = "A".repeat(100);
+    let qual = quality_string_from_phred(&vec![30u8; 100]);
+    let record = create_fastq_record("test_read", &seq, &qual);
+
+    fs::write(&input_fq, record).unwrap();
+
+    // Trim 10bp from front, 40bp from tail (leaves 50bp)
+    // Then require min length of 60bp
+    let status = Command::new(cargo_bin("fasterp"))
+        .arg("-i")
+        .arg(&input_fq)
+        .arg("-o")
+        .arg(&output_fq)
+        .arg("-j")
+        .arg(&output_json)
+        .arg("--trim-front")
+        .arg("10")
+        .arg("--trim-tail")
+        .arg("40")
+        .arg("-l")
+        .arg("60")
+        .status()
+        .expect("Failed to run fasterp");
+    assert!(status.success());
+
+    // Should be filtered (50bp after trimming < 60bp minimum)
+    let content = fs::read_to_string(&output_fq).unwrap();
+    assert!(content.is_empty(), "Read should be filtered after trimming");
+
+    let json_content = fs::read_to_string(&output_json).unwrap();
+    let json: Value = serde_json::from_str(&json_content).unwrap();
+    assert_eq!(
+        json["filtering_result"]["too_short_reads"]
+            .as_u64()
+            .unwrap(),
+        1
+    );
+}
 
 #[test]
 fn test_empty_output_all_filtered() {
     let temp_dir = TempDir::new().unwrap();
-
-    let input_fq = test_data_path("small_1k.fq");
+    let input_fq = temp_dir.path().join("input.fq");
     let output_fq = temp_dir.path().join("output.fq");
     let output_json = temp_dir.path().join("output.json");
+
+    // Create 10 reads that will all be filtered
+    let mut input_data = String::new();
+    for i in 0..10 {
+        let seq = "A".repeat(50); // All 50bp
+        let qual = quality_string_from_phred(&vec![30u8; 50]);
+        input_data.push_str(&create_fastq_record(&format!("read{}", i), &seq, &qual));
+    }
+
+    fs::write(&input_fq, input_data).unwrap();
 
     // Use extreme filter that should filter everything
     let status = Command::new(cargo_bin("fasterp"))
@@ -984,20 +1401,31 @@ fn test_empty_output_all_filtered() {
         .expect("Failed to run fasterp");
     assert!(status.success());
 
-    // Output file should exist but be empty (or very small)
+    // Output file should exist but be empty
     let content = fs::read_to_string(&output_fq).unwrap();
-    assert!(
-        content.is_empty() || content.lines().count() < 4,
-        "Expected empty or nearly empty output"
-    );
+    assert!(content.is_empty(), "All reads should be filtered");
 
-    // JSON should show 0 passed reads
+    // JSON should show 0 passed reads, 10 too_short
     let json_content = fs::read_to_string(&output_json).unwrap();
     let json: Value = serde_json::from_str(&json_content).unwrap();
-    let passed = json["filtering_result"]["passed_filter_reads"]
-        .as_u64()
-        .unwrap();
-    assert_eq!(passed, 0, "Expected 0 passed reads");
+    assert_eq!(
+        json["filtering_result"]["passed_filter_reads"]
+            .as_u64()
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        json["filtering_result"]["too_short_reads"]
+            .as_u64()
+            .unwrap(),
+        10
+    );
+    assert_eq!(
+        json["summary"]["before_filtering"]["total_reads"]
+            .as_u64()
+            .unwrap(),
+        10
+    );
 }
 
 #[test]

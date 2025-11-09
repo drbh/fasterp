@@ -179,7 +179,9 @@ pub(crate) fn worker_thread(
     sender: Sender<Option<WorkerResult>>,
     min_len: usize,
     n_limit: usize,
-    q_mean_phred: u8,
+    qualified_quality_phred: u8,
+    unqualified_percent_limit: usize,
+    average_qual: u8,
     no_kmer: bool,
     trimming_config: TrimmingConfig,
 ) {
@@ -320,12 +322,26 @@ pub(crate) fn worker_thread(
                 continue;
             }
 
-            if q_mean_phred > 0
-                && trimmed_len > 0
-                && (trimmed_qsum as f64 / trimmed_len as f64) < q_mean_phred as f64
-            {
-                low_quality += 1;
-                continue;
+            // Check unqualified percent (fastp -q/-u logic)
+            if qualified_quality_phred > 0 && trimmed_len > 0 {
+                let qual_threshold = qualified_quality_phred + 33; // Convert to ASCII
+                let unqualified_count =
+                    trimmed_qual.iter().filter(|&&q| q < qual_threshold).count();
+
+                // Avoid division to prevent rounding issues: check if 100*unqualified > limit*len
+                if 100 * unqualified_count > unqualified_percent_limit * trimmed_len {
+                    low_quality += 1;
+                    continue;
+                }
+            }
+
+            // Check average quality (fastp -e logic)
+            if average_qual > 0 && trimmed_len > 0 {
+                let mean_qual = trimmed_qsum as f64 / trimmed_len as f64;
+                if mean_qual < average_qual as f64 {
+                    low_quality += 1;
+                    continue;
+                }
             }
 
             // Passed - write TRIMMED read to output buffer

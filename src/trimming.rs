@@ -18,6 +18,9 @@ pub(crate) struct TrimmingConfig {
     pub trim_front_bases: usize,
     pub trim_tail_bases: usize,
 
+    // Length limits
+    pub max_len: usize, // Maximum read length (trim tail if longer, 0 = disabled)
+
     // PolyG/PolyX trimming
     pub enable_poly_g: bool,
     pub enable_poly_x: bool,
@@ -30,6 +33,7 @@ impl TrimmingConfig {
             || self.enable_trim_tail
             || self.trim_front_bases > 0
             || self.trim_tail_bases > 0
+            || self.max_len > 0
             || self.enable_poly_g
             || self.enable_poly_x
     }
@@ -269,6 +273,14 @@ pub(crate) fn trim_read(seq: &[u8], qual: &[u8], config: &TrimmingConfig) -> Tri
         result.end_pos = result.end_pos.saturating_sub(config.trim_tail_bases);
     }
 
+    // 3. Maximum length trimming (trim from tail if read is too long)
+    if config.max_len > 0 {
+        let current_len = result.end_pos - result.start_pos;
+        if current_len > config.max_len {
+            result.end_pos = result.start_pos + config.max_len;
+        }
+    }
+
     // Ensure we still have a valid range
     if result.start_pos >= result.end_pos {
         result.end_pos = result.start_pos;
@@ -277,7 +289,7 @@ pub(crate) fn trim_read(seq: &[u8], qual: &[u8], config: &TrimmingConfig) -> Tri
 
     let current_qual = &qual[result.start_pos..result.end_pos];
 
-    // 3. Sliding window front trimming
+    // 4. Sliding window front trimming
     if config.enable_trim_front {
         let trim_amount = trim_front_sliding_window(
             current_qual,
@@ -287,7 +299,7 @@ pub(crate) fn trim_read(seq: &[u8], qual: &[u8], config: &TrimmingConfig) -> Tri
         result.start_pos += trim_amount;
     }
 
-    // 4. Sliding window tail trimming
+    // 5. Sliding window tail trimming
     if config.enable_trim_tail {
         let new_len = trim_tail_sliding_window(
             &qual[result.start_pos..result.end_pos],
@@ -305,7 +317,7 @@ pub(crate) fn trim_read(seq: &[u8], qual: &[u8], config: &TrimmingConfig) -> Tri
 
     let current_seq = &seq[result.start_pos..result.end_pos];
 
-    // 5. PolyG tail trimming (check polyG first as it's more specific)
+    // 6. PolyG tail trimming (check polyG first as it's more specific)
     if config.enable_poly_g {
         let poly_g = detect_poly_g_tail(current_seq, config.poly_min_len);
         if poly_g > 0 {
@@ -314,7 +326,7 @@ pub(crate) fn trim_read(seq: &[u8], qual: &[u8], config: &TrimmingConfig) -> Tri
         }
     }
 
-    // 6. PolyX tail trimming (only if polyG didn't already trim)
+    // 7. PolyX tail trimming (only if polyG didn't already trim)
     if config.enable_poly_x && result.poly_g_trimmed == 0 {
         let current_seq = &seq[result.start_pos..result.end_pos];
         let poly_x = detect_poly_x_tail(current_seq, config.poly_min_len);

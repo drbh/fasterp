@@ -40,9 +40,21 @@ struct Args {
     #[arg(short = 'l', long, default_value = "15")]
     length_required: usize,
 
-    /// Mean quality score threshold (default: 0, disabled)
-    #[arg(short = 'q', long, default_value = "0")]
+    /// Maximum length limit - trim reads longer than this (default: 0 = disabled)
+    #[arg(short = 'b', long, default_value = "0")]
+    max_len: usize,
+
+    /// Quality value that a base is qualified (phred quality >= this value) (default: 15)
+    #[arg(short = 'q', long, default_value = "15")]
     qualified_quality_phred: u8,
+
+    /// Percent of bases allowed to be unqualified (0-100) (default: 40)
+    #[arg(short = 'u', long, default_value = "40")]
+    unqualified_percent_limit: usize,
+
+    /// Average quality threshold - discard if mean quality < this (default: 0 = disabled)
+    #[arg(short = 'e', long, default_value = "0")]
+    average_qual: u8,
 
     /// Max number of N bases allowed (default: 5)
     #[arg(short = 'n', long, default_value = "5")]
@@ -106,7 +118,7 @@ struct Args {
     trim_poly_g: bool,
 
     /// Disable polyG tail trimming (for backward compatibility)
-    #[arg(long)]
+    #[arg(short = 'G', long)]
     disable_trim_poly_g: bool,
 
     /// Enable generic polyX tail trimming (any homopolymer)
@@ -116,6 +128,10 @@ struct Args {
     /// Minimum length for polyG/polyX detection (default: 10)
     #[arg(long, default_value = "10")]
     poly_g_min_len: usize,
+
+    /// Disable adapter trimming (no-op for compatibility - adapters not implemented)
+    #[arg(short = 'A', long)]
+    disable_adapter_trimming: bool,
 }
 
 // Helper function to create TrimmingConfig from CLI args
@@ -127,6 +143,7 @@ fn create_trimming_config(args: &Args) -> TrimmingConfig {
         cut_window_size: args.cut_window_size,
         trim_front_bases: args.trim_front,
         trim_tail_bases: args.trim_tail,
+        max_len: args.max_len,
         enable_poly_g: args.trim_poly_g && !args.disable_trim_poly_g,
         enable_poly_x: args.trim_poly_x,
         poly_min_len: args.poly_g_min_len,
@@ -165,6 +182,8 @@ fn main() -> Result<()> {
             args.length_required,
             args.n_base_limit,
             args.qualified_quality_phred,
+            args.unqualified_percent_limit,
+            args.average_qual,
             &trimming_config,
         )?;
 
@@ -190,7 +209,9 @@ fn main() -> Result<()> {
             let result_tx_clone = result_tx.clone();
             let min_len = args.length_required;
             let n_limit = args.n_base_limit;
-            let q_mean_phred = args.qualified_quality_phred;
+            let qualified_qual = args.qualified_quality_phred;
+            let unqualified_pct = args.unqualified_percent_limit;
+            let avg_qual = args.average_qual;
             let no_kmer = args.no_kmer;
             let trimming_config_clone = trimming_config.clone();
 
@@ -200,7 +221,9 @@ fn main() -> Result<()> {
                     result_tx_clone,
                     min_len,
                     n_limit,
-                    q_mean_phred,
+                    qualified_qual,
+                    unqualified_pct,
+                    avg_qual,
                     no_kmer,
                     trimming_config_clone,
                 )

@@ -202,7 +202,9 @@ impl StreamAccumulator {
         qual: &[u8],
         min_len: usize,
         n_limit: usize,
-        q_mean_phred: u8,
+        qualified_quality_phred: u8,
+        unqualified_percent_limit: usize,
+        average_qual: u8,
         trimming_config: &TrimmingConfig,
         writer: &mut impl Write,
     ) -> Result<()> {
@@ -313,12 +315,25 @@ impl StreamAccumulator {
             return Ok(());
         }
 
-        if q_mean_phred > 0
-            && trimmed_len > 0
-            && (trimmed_qsum as f64 / trimmed_len as f64) < q_mean_phred as f64
-        {
-            self.low_quality += 1;
-            return Ok(());
+        // Check unqualified percent (fastp -q/-u logic)
+        if qualified_quality_phred > 0 && trimmed_len > 0 {
+            let qual_threshold = qualified_quality_phred + 33; // Convert to ASCII
+            let unqualified_count = trimmed_qual.iter().filter(|&&q| q < qual_threshold).count();
+
+            // Avoid division to prevent rounding issues: check if 100*unqualified > limit*len
+            if 100 * unqualified_count > unqualified_percent_limit * trimmed_len {
+                self.low_quality += 1;
+                return Ok(());
+            }
+        }
+
+        // Check average quality (fastp -e logic)
+        if average_qual > 0 && trimmed_len > 0 {
+            let mean_qual = trimmed_qsum as f64 / trimmed_len as f64;
+            if mean_qual < average_qual as f64 {
+                self.low_quality += 1;
+                return Ok(());
+            }
         }
 
         // Record passed - write trimmed version
@@ -355,7 +370,9 @@ pub(crate) fn process_fastq_stream<R: BufRead, W: Write>(
     writer: &mut W,
     min_len: usize,
     n_limit: usize,
-    q_mean_phred: u8,
+    qualified_quality_phred: u8,
+    unqualified_percent_limit: usize,
+    average_qual: u8,
     trimming_config: &TrimmingConfig,
 ) -> Result<StreamAccumulator> {
     let mut acc = StreamAccumulator::new();
@@ -370,7 +387,9 @@ pub(crate) fn process_fastq_stream<R: BufRead, W: Write>(
             &qual,
             min_len,
             n_limit,
-            q_mean_phred,
+            qualified_quality_phred,
+            unqualified_percent_limit,
+            average_qual,
             trimming_config,
             writer,
         )?;
