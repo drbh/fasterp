@@ -225,9 +225,9 @@ pub(crate) fn worker_thread(
             }
 
             // Compute stats - use SIMD when available, otherwise single-pass
-            let (qsum, q20, q30, ncnt, gc) = if simd::is_simd_available() {
+            let (_qsum, q20, q30, _ncnt, gc) = if simd::is_simd_available() {
                 // SIMD path: compute basic stats fast, then position-specific
-                let stats = simd::compute_stats(seq, qual);
+                let stats = simd::compute_stats(seq, qual, 0); // 0 = don't count unqualified for before stats
 
                 pos.ensure_capacity(seq.len());
                 for (i, (&b, &q)) in seq.iter().zip(qual).enumerate() {
@@ -304,12 +304,14 @@ pub(crate) fn worker_thread(
 
             // Recompute stats for trimmed read (used for filtering) - SIMD accelerated
             let trimmed_len = trimmed_seq.len();
-            let trimmed_stats = simd::compute_stats(trimmed_seq, trimmed_qual);
+            let trimmed_stats =
+                simd::compute_stats(trimmed_seq, trimmed_qual, qualified_quality_phred);
             let trimmed_qsum = trimmed_stats.qsum;
             let trimmed_q20 = trimmed_stats.q20;
             let trimmed_q30 = trimmed_stats.q30;
             let trimmed_ncnt = trimmed_stats.ncnt;
             let trimmed_gc = trimmed_stats.gc;
+            let unqualified_count = trimmed_stats.unqualified;
 
             // Apply filters on TRIMMED read
             if trimmed_len < min_len {
@@ -323,11 +325,8 @@ pub(crate) fn worker_thread(
             }
 
             // Check unqualified percent (fastp -q/-u logic)
+            // unqualified_count already computed by SIMD above
             if qualified_quality_phred > 0 && trimmed_len > 0 {
-                let qual_threshold = qualified_quality_phred + 33; // Convert to ASCII
-                let unqualified_count =
-                    trimmed_qual.iter().filter(|&&q| q < qual_threshold).count();
-
                 // Avoid division to prevent rounding issues: check if 100*unqualified > limit*len
                 if 100 * unqualified_count > unqualified_percent_limit * trimmed_len {
                     low_quality += 1;

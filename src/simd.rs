@@ -25,6 +25,7 @@ pub struct Stats {
     pub q30: usize,
     pub ncnt: usize,
     pub gc: usize,
+    pub unqualified: usize, // Count of bases below qual_threshold
 }
 
 /// Check if SIMD acceleration is available on this platform
@@ -46,32 +47,38 @@ pub fn is_simd_available() -> bool {
 }
 
 /// Compute all stats for a sequence/quality pair using SIMD when available
+///
+/// qual_threshold: Phred quality threshold (e.g., 15). Bases with quality < threshold are counted as unqualified.
+/// Set to 0 to disable unqualified counting.
 #[inline]
-pub fn compute_stats(seq: &[u8], qual: &[u8]) -> Stats {
+pub fn compute_stats(seq: &[u8], qual: &[u8], qual_threshold: u8) -> Stats {
     #[cfg(target_arch = "x86_64")]
     {
         if is_x86_feature_detected!("avx2") {
-            return unsafe { compute_stats_avx2(seq, qual) };
+            return unsafe { compute_stats_avx2(seq, qual, qual_threshold) };
         }
     }
 
     #[cfg(target_arch = "aarch64")]
     {
-        return unsafe { compute_stats_neon(seq, qual) };
+        return unsafe { compute_stats_neon(seq, qual, qual_threshold) };
     }
 
     // Scalar fallback
-    compute_stats_scalar(seq, qual)
+    compute_stats_scalar(seq, qual, qual_threshold)
 }
 
 /// Scalar implementation (fallback)
 #[inline]
-fn compute_stats_scalar(seq: &[u8], qual: &[u8]) -> Stats {
+fn compute_stats_scalar(seq: &[u8], qual: &[u8], qual_threshold: u8) -> Stats {
     let mut qsum = 0u32;
     let mut q20 = 0usize;
     let mut q30 = 0usize;
     let mut ncnt = 0usize;
     let mut gc = 0usize;
+    let mut unqualified = 0usize;
+
+    let qual_threshold_ascii = qual_threshold + 33; // Convert to ASCII
 
     for (&b, &q) in seq.iter().zip(qual) {
         let qval = (q - 33) as u32;
@@ -84,6 +91,11 @@ fn compute_stats_scalar(seq: &[u8], qual: &[u8]) -> Stats {
         if q >= 63 {
             q30 += 1;
         } // Phred 30 = ASCII 63
+
+        // Unqualified: below qual_threshold
+        if qual_threshold > 0 && q < qual_threshold_ascii {
+            unqualified += 1;
+        }
 
         // N counting
         if b == b'N' || b == b'n' {
@@ -102,22 +114,26 @@ fn compute_stats_scalar(seq: &[u8], qual: &[u8]) -> Stats {
         q30,
         ncnt,
         gc,
+        unqualified,
     }
 }
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
-unsafe fn compute_stats_avx2(seq: &[u8], qual: &[u8]) -> Stats {
+unsafe fn compute_stats_avx2(seq: &[u8], qual: &[u8], qual_threshold: u8) -> Stats {
     let len = seq.len().min(qual.len());
     let mut qsum = 0u32;
     let mut q20 = 0usize;
     let mut q30 = 0usize;
     let mut ncnt = 0usize;
     let mut gc = 0usize;
+    let mut unqualified = 0usize;
 
     let offset = _mm256_set1_epi8(33);
     let q20_thresh = _mm256_set1_epi8(53);
     let q30_thresh = _mm256_set1_epi8(63);
+    let qual_threshold_ascii = qual_threshold + 33;
+    let qual_thresh_vec = _mm256_set1_epi8(qual_threshold_ascii as i8);
 
     let n_upper = _mm256_set1_epi8(b'N' as i8);
     let n_lower = _mm256_set1_epi8(b'n' as i8);
@@ -143,6 +159,12 @@ unsafe fn compute_stats_avx2(seq: &[u8], qual: &[u8]) -> Stats {
         let q30_mask =
             _mm256_cmpgt_epi8(qual_vec, _mm256_sub_epi8(q30_thresh, _mm256_set1_epi8(1)));
         q30 += count_set_bits_avx2(q30_mask);
+
+        // Unqualified counting: compare qual < qual_threshold_ascii
+        if qual_threshold > 0 {
+            let unqual_mask = _mm256_cmpgt_epi8(qual_thresh_vec, qual_vec); // inverted: thresh > qual means qual < thresh
+            unqualified += count_set_bits_avx2(unqual_mask);
+        }
 
         // Quality sum: subtract 33 and accumulate
         let adjusted = _mm256_sub_epi8(qual_vec, offset);
@@ -184,6 +206,9 @@ unsafe fn compute_stats_avx2(seq: &[u8], qual: &[u8]) -> Stats {
         if q >= 63 {
             q30 += 1;
         }
+        if qual_threshold > 0 && q < qual_threshold_ascii {
+            unqualified += 1;
+        }
 
         if b == b'N' || b == b'n' {
             ncnt += 1;
@@ -199,6 +224,7 @@ unsafe fn compute_stats_avx2(seq: &[u8], qual: &[u8]) -> Stats {
         q30,
         ncnt,
         gc,
+        unqualified,
     }
 }
 
@@ -238,21 +264,24 @@ unsafe fn horizontal_sum_u8_to_u32(vec: __m256i) -> u32 {
 
 #[cfg(target_arch = "aarch64")]
 #[inline]
-unsafe fn compute_stats_neon(seq: &[u8], qual: &[u8]) -> Stats {
+unsafe fn compute_stats_neon(seq: &[u8], qual: &[u8], qual_threshold: u8) -> Stats {
     let len = seq.len().min(qual.len());
     let mut qsum = 0u32;
     let mut q20 = 0usize;
     let mut q30 = 0usize;
     let mut ncnt = 0usize;
     let mut gc = 0usize;
+    let mut unqualified = 0usize;
 
     let mut i = 0;
     let chunk_size = 16; // NEON processes 16 bytes (128-bit)
+    let qual_threshold_ascii = qual_threshold + 33;
 
     unsafe {
         let offset = vdupq_n_u8(33);
         let q20_thresh = vdupq_n_u8(53);
         let q30_thresh = vdupq_n_u8(63);
+        let qual_thresh_vec = vdupq_n_u8(qual_threshold_ascii);
 
         let n_upper = vdupq_n_u8(b'N');
         let n_lower = vdupq_n_u8(b'n');
@@ -273,6 +302,12 @@ unsafe fn compute_stats_neon(seq: &[u8], qual: &[u8]) -> Stats {
             // Q30 counting: compare qual >= 63
             let q30_mask = vcgeq_u8(qual_vec, q30_thresh);
             q30 += count_set_bits_neon(q30_mask);
+
+            // Unqualified counting: compare qual < qual_threshold_ascii
+            if qual_threshold > 0 {
+                let unqual_mask = vcltq_u8(qual_vec, qual_thresh_vec); // less than
+                unqualified += count_set_bits_neon(unqual_mask);
+            }
 
             // Quality sum: subtract 33 and accumulate
             let adjusted = vsubq_u8(qual_vec, offset);
@@ -312,6 +347,9 @@ unsafe fn compute_stats_neon(seq: &[u8], qual: &[u8]) -> Stats {
         if q >= 63 {
             q30 += 1;
         }
+        if qual_threshold > 0 && q < qual_threshold_ascii {
+            unqualified += 1;
+        }
 
         if b == b'N' || b == b'n' {
             ncnt += 1;
@@ -327,6 +365,7 @@ unsafe fn compute_stats_neon(seq: &[u8], qual: &[u8]) -> Stats {
         q30,
         ncnt,
         gc,
+        unqualified,
     }
 }
 
@@ -363,7 +402,7 @@ mod tests {
     fn test_quality_sum() {
         let qual = b"IIIIIIIIII"; // All quality 40 (ASCII 73, Phred 40)
         let seq = b"AAAAAAAAAA";
-        let stats = compute_stats(seq, qual);
+        let stats = compute_stats(seq, qual, 0);
         assert_eq!(stats.qsum, 400); // 10 * 40
     }
 
@@ -373,7 +412,7 @@ mod tests {
         // Q30 = Phred 30 = ASCII 63 = '?'
         let qual = b"!!!!555555????????"; // 4 low, 6 Q20, 8 Q30
         let seq = b"AAAAAAAAAAAAAAAAAA";
-        let stats = compute_stats(seq, qual);
+        let stats = compute_stats(seq, qual, 0);
         assert!(stats.q20 >= 14); // 6 Q20 + 8 Q30
         assert_eq!(stats.q30, 8);
     }
@@ -382,7 +421,7 @@ mod tests {
     fn test_n_counting() {
         let seq = b"AAANNNAAANNAAA";
         let qual = b"IIIIIIIIIIIIII";
-        let stats = compute_stats(seq, qual);
+        let stats = compute_stats(seq, qual, 0);
         assert_eq!(stats.ncnt, 5);
     }
 
@@ -390,7 +429,7 @@ mod tests {
     fn test_gc_counting() {
         let seq = b"ATCGATCGATCGAT"; // 3 G, 3 C = 6 GC
         let qual = b"IIIIIIIIIIIIII";
-        let stats = compute_stats(seq, qual);
+        let stats = compute_stats(seq, qual, 0);
         assert_eq!(stats.gc, 6);
     }
 
@@ -398,9 +437,19 @@ mod tests {
     fn test_mixed_case() {
         let seq = b"AtCgNnGgCc";
         let qual = b"IIIIIIIIII";
-        let stats = compute_stats(seq, qual);
+        let stats = compute_stats(seq, qual, 0);
         assert_eq!(stats.ncnt, 2); // N and n
         assert_eq!(stats.gc, 6); // C, g, G, g, C, c
+    }
+
+    #[test]
+    fn test_unqualified_counting() {
+        // Quality threshold 15 = ASCII 48 = '0'
+        // Qualities below Q15: ! through / (ASCII 33-47)
+        let qual = b"!!!!000000IIIIIIII"; // 4 below Q15, 6 at Q15, 8 above Q15
+        let seq = b"AAAAAAAAAAAAAAAAAA";
+        let stats = compute_stats(seq, qual, 15);
+        assert_eq!(stats.unqualified, 4);
     }
 
     #[test]
@@ -408,18 +457,30 @@ mod tests {
         let seq = b"ATCGATCGATCGATNNATCGATCGATCGATCGATCG";
         let qual = b"IIII555555????????IIII555555????????II";
 
-        let scalar = compute_stats_scalar(seq, qual);
+        let scalar = compute_stats_scalar(seq, qual, 0);
 
         #[cfg(target_arch = "x86_64")]
         {
             if is_x86_feature_detected!("avx2") {
-                let simd = unsafe { compute_stats_avx2(seq, qual) };
+                let simd = unsafe { compute_stats_avx2(seq, qual, 0) };
                 assert_eq!(scalar.qsum, simd.qsum, "qsum mismatch");
                 assert_eq!(scalar.q20, simd.q20, "q20 mismatch");
                 assert_eq!(scalar.q30, simd.q30, "q30 mismatch");
                 assert_eq!(scalar.ncnt, simd.ncnt, "ncnt mismatch");
                 assert_eq!(scalar.gc, simd.gc, "gc mismatch");
+                assert_eq!(scalar.unqualified, simd.unqualified, "unqualified mismatch");
             }
+        }
+
+        #[cfg(target_arch = "aarch64")]
+        {
+            let simd = unsafe { compute_stats_neon(seq, qual, 0) };
+            assert_eq!(scalar.qsum, simd.qsum, "qsum mismatch");
+            assert_eq!(scalar.q20, simd.q20, "q20 mismatch");
+            assert_eq!(scalar.q30, simd.q30, "q30 mismatch");
+            assert_eq!(scalar.ncnt, simd.ncnt, "ncnt mismatch");
+            assert_eq!(scalar.gc, simd.gc, "gc mismatch");
+            assert_eq!(scalar.unqualified, simd.unqualified, "unqualified mismatch");
         }
     }
 }
