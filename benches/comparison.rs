@@ -1,4 +1,4 @@
-use criterion::{criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, criterion_group, criterion_main};
 use std::process::Command;
 use tempfile::NamedTempFile;
 
@@ -67,17 +67,21 @@ fn bench_quality_trimming(c: &mut Criterion) {
     let mut group = c.benchmark_group("quality_trimming");
 
     group.bench_function("fasterp", |b| {
-        b.iter(|| run_fasterp("test_data/medium_10k.fq", &[
-            "--cut-tail",
-            "--cut-mean-quality", "20"
-        ]))
+        b.iter(|| {
+            run_fasterp(
+                "test_data/medium_10k.fq",
+                &["--cut-tail", "--cut-mean-quality", "20"],
+            )
+        })
     });
 
     group.bench_function("fastp", |b| {
-        b.iter(|| run_fastp("test_data/medium_10k.fq", &[
-            "--cut_tail",
-            "--cut_mean_quality", "20"
-        ]))
+        b.iter(|| {
+            run_fastp(
+                "test_data/medium_10k.fq",
+                &["--cut_tail", "--cut_mean_quality", "20"],
+            )
+        })
     });
 
     group.finish();
@@ -87,25 +91,41 @@ fn bench_aggressive_trimming(c: &mut Criterion) {
     let mut group = c.benchmark_group("aggressive_trimming");
 
     group.bench_function("fasterp", |b| {
-        b.iter(|| run_fasterp("test_data/medium_10k.fq", &[
-            "--trim-front", "5",
-            "--trim-tail", "5",
-            "--cut-front",
-            "--cut-tail",
-            "--cut-mean-quality", "20",
-            "--trim-poly-g"
-        ]))
+        b.iter(|| {
+            run_fasterp(
+                "test_data/medium_10k.fq",
+                &[
+                    "--trim-front",
+                    "5",
+                    "--trim-tail",
+                    "5",
+                    "--cut-front",
+                    "--cut-tail",
+                    "--cut-mean-quality",
+                    "20",
+                    "--trim-poly-g",
+                ],
+            )
+        })
     });
 
     group.bench_function("fastp", |b| {
-        b.iter(|| run_fastp("test_data/medium_10k.fq", &[
-            "--trim_front1", "5",
-            "--trim_tail1", "5",
-            "--cut_front",
-            "--cut_tail",
-            "--cut_mean_quality", "20",
-            "--trim_poly_g"
-        ]))
+        b.iter(|| {
+            run_fastp(
+                "test_data/medium_10k.fq",
+                &[
+                    "--trim_front1",
+                    "5",
+                    "--trim_tail1",
+                    "5",
+                    "--cut_front",
+                    "--cut_tail",
+                    "--cut_mean_quality",
+                    "20",
+                    "--trim_poly_g",
+                ],
+            )
+        })
     });
 
     group.finish();

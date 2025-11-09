@@ -1,7 +1,6 @@
 /// Example: Generate ASCII bar charts comparing fasterp vs fastp performance
 ///
 /// Usage: cargo run --release --example bench_chart
-
 use std::process::Command;
 use std::time::Instant;
 
@@ -29,7 +28,9 @@ fn main() {
     }
 
     // Benchmark 2: Medium dataset (10k reads)
-    if let Some(result) = run_benchmark("test_data/medium_10k.fq", "Medium dataset (10k reads)", &[]) {
+    if let Some(result) =
+        run_benchmark("test_data/medium_10k.fq", "Medium dataset (10k reads)", &[])
+    {
         results.push(result);
     }
 
@@ -72,7 +73,8 @@ fn run_benchmark(input: &str, name: &str, extra_args: &[&str]) -> Option<BenchRe
         let start = Instant::now();
 
         // Convert args for fastp (all dashes to underscores after --)
-        let fastp_args: Vec<String> = extra_args.iter()
+        let fastp_args: Vec<String> = extra_args
+            .iter()
             .map(|s| {
                 if s.starts_with("--") {
                     let rest = &s[2..];
@@ -84,9 +86,12 @@ fn run_benchmark(input: &str, name: &str, extra_args: &[&str]) -> Option<BenchRe
             .collect();
 
         let status = Command::new("fastp")
-            .arg("-i").arg(input)
-            .arg("-o").arg(&fastp_out)
-            .arg("-j").arg(&fastp_json)
+            .arg("-i")
+            .arg(input)
+            .arg("-o")
+            .arg(&fastp_out)
+            .arg("-j")
+            .arg(&fastp_json)
             .args(&fastp_args)
             .stderr(std::process::Stdio::null())
             .status();
@@ -115,9 +120,12 @@ fn run_benchmark(input: &str, name: &str, extra_args: &[&str]) -> Option<BenchRe
     for _ in 0..3 {
         let start = Instant::now();
         let status = Command::new("./target/release/fasterp")
-            .arg("-i").arg(input)
-            .arg("-o").arg(&fasterp_out)
-            .arg("-j").arg(&fasterp_json)
+            .arg("-i")
+            .arg(input)
+            .arg("-o")
+            .arg(&fasterp_out)
+            .arg("-j")
+            .arg(&fasterp_json)
             .args(extra_args)
             .status();
 

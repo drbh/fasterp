@@ -18,6 +18,8 @@ use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::thread;
 
+mod simd;
+
 // LOOKUP TABLES for fast base/quality checks
 
 /// Lookup table: is quality >= 20? (Phred+33 encoding)
@@ -1120,36 +1122,59 @@ impl StreamAccumulator {
             self.max_cycle = seq.len();
         }
 
-        // SINGLE PASS: compute all "before" stats in one loop
-        let mut qsum = 0u32;
-        let mut q20 = 0usize;
-        let mut q30 = 0usize;
-        let mut ncnt = 0usize;
-        let mut gc = 0usize;
+        // Compute stats - use SIMD when available, otherwise single-pass
+        let (qsum, q20, q30, ncnt, gc) = if simd::is_simd_available() {
+            // SIMD path: compute basic stats fast, then position-specific
+            let stats = simd::compute_stats(seq, qual);
 
-        self.pos.ensure_capacity(seq.len());
+            self.pos.ensure_capacity(seq.len());
+            for (i, (&b, &q)) in seq.iter().zip(qual).enumerate() {
+                self.pos.total_sum[i] += (q - 33) as u64;
+                self.pos.total_cnt[i] += 1;
 
-        for (i, (&b, &q)) in seq.iter().zip(qual).enumerate() {
-            let qu = q as usize;
-
-            // Quality stats
-            qsum += (q - 33) as u32;
-            q20 += LUT_Q20[qu] as usize;
-            q30 += LUT_Q30[qu] as usize;
-
-            // Base stats
-            ncnt += LUT_IS_N[b as usize] as usize;
-            gc += LUT_IS_GC[b as usize] as usize;
-
-            // Position-specific quality stats
-            self.pos.total_sum[i] += (q - 33) as u64;
-            self.pos.total_cnt[i] += 1;
-
-            if let Some(bi) = base_idx(b) {
-                self.pos.base_sum[bi][i] += (q - 33) as u64;
-                self.pos.base_cnt[bi][i] += 1;
+                if let Some(bi) = base_idx(b) {
+                    self.pos.base_sum[bi][i] += (q - 33) as u64;
+                    self.pos.base_cnt[bi][i] += 1;
+                }
             }
-        }
+
+            (stats.qsum, stats.q20, stats.q30, stats.ncnt, stats.gc)
+        } else {
+            // Non-SIMD path: single pass for both basic and position stats
+            let mut qsum = 0u32;
+            let mut q20 = 0usize;
+            let mut q30 = 0usize;
+            let mut ncnt = 0usize;
+            let mut gc = 0usize;
+
+            self.pos.ensure_capacity(seq.len());
+            for (i, (&b, &q)) in seq.iter().zip(qual).enumerate() {
+                let qval = (q - 33) as u32;
+                qsum += qval;
+                if q >= 53 {
+                    q20 += 1;
+                }
+                if q >= 63 {
+                    q30 += 1;
+                }
+                if b == b'N' || b == b'n' {
+                    ncnt += 1;
+                }
+                if b == b'G' || b == b'g' || b == b'C' || b == b'c' {
+                    gc += 1;
+                }
+
+                self.pos.total_sum[i] += qval as u64;
+                self.pos.total_cnt[i] += 1;
+
+                if let Some(bi) = base_idx(b) {
+                    self.pos.base_sum[bi][i] += qval as u64;
+                    self.pos.base_cnt[bi][i] += 1;
+                }
+            }
+
+            (qsum, q20, q30, ncnt, gc)
+        };
 
         // K-mer counting (also in the same pass conceptually, but separate loop for clarity)
         count_k5_2bit(seq, &mut self.kmer_table);
@@ -1173,22 +1198,14 @@ impl StreamAccumulator {
         let trimmed_seq = &seq[trimming_result.start_pos..trimming_result.end_pos];
         let trimmed_qual = &qual[trimming_result.start_pos..trimming_result.end_pos];
 
-        // Recompute stats for trimmed read (used for filtering)
+        // Recompute stats for trimmed read (used for filtering) - SIMD accelerated
         let trimmed_len = trimmed_seq.len();
-        let mut trimmed_qsum = 0u32;
-        let mut trimmed_q20 = 0usize;
-        let mut trimmed_q30 = 0usize;
-        let mut trimmed_ncnt = 0usize;
-        let mut trimmed_gc = 0usize;
-
-        for (&b, &q) in trimmed_seq.iter().zip(trimmed_qual) {
-            let qu = q as usize;
-            trimmed_qsum += (q - 33) as u32;
-            trimmed_q20 += LUT_Q20[qu] as usize;
-            trimmed_q30 += LUT_Q30[qu] as usize;
-            trimmed_ncnt += LUT_IS_N[b as usize] as usize;
-            trimmed_gc += LUT_IS_GC[b as usize] as usize;
-        }
+        let trimmed_stats = simd::compute_stats(trimmed_seq, trimmed_qual);
+        let trimmed_qsum = trimmed_stats.qsum;
+        let trimmed_q20 = trimmed_stats.q20;
+        let trimmed_q30 = trimmed_stats.q30;
+        let trimmed_ncnt = trimmed_stats.ncnt;
+        let trimmed_gc = trimmed_stats.gc;
 
         // Apply filters on TRIMMED read
         if trimmed_len < min_len {
@@ -1408,32 +1425,59 @@ fn worker_thread(
                 continue;
             }
 
-            // SINGLE PASS: compute all stats
-            let mut qsum = 0u32;
-            let mut q20 = 0usize;
-            let mut q30 = 0usize;
-            let mut ncnt = 0usize;
-            let mut gc = 0usize;
+            // Compute stats - use SIMD when available, otherwise single-pass
+            let (qsum, q20, q30, ncnt, gc) = if simd::is_simd_available() {
+                // SIMD path: compute basic stats fast, then position-specific
+                let stats = simd::compute_stats(seq, qual);
 
-            pos.ensure_capacity(seq.len());
+                pos.ensure_capacity(seq.len());
+                for (i, (&b, &q)) in seq.iter().zip(qual).enumerate() {
+                    pos.total_sum[i] += (q - 33) as u64;
+                    pos.total_cnt[i] += 1;
 
-            for (i, (&b, &q)) in seq.iter().zip(qual).enumerate() {
-                let qu = q as usize;
-
-                qsum += (q - 33) as u32;
-                q20 += LUT_Q20[qu] as usize;
-                q30 += LUT_Q30[qu] as usize;
-                ncnt += LUT_IS_N[b as usize] as usize;
-                gc += LUT_IS_GC[b as usize] as usize;
-
-                pos.total_sum[i] += (q - 33) as u64;
-                pos.total_cnt[i] += 1;
-
-                if let Some(bi) = base_idx(b) {
-                    pos.base_sum[bi][i] += (q - 33) as u64;
-                    pos.base_cnt[bi][i] += 1;
+                    if let Some(bi) = base_idx(b) {
+                        pos.base_sum[bi][i] += (q - 33) as u64;
+                        pos.base_cnt[bi][i] += 1;
+                    }
                 }
-            }
+
+                (stats.qsum, stats.q20, stats.q30, stats.ncnt, stats.gc)
+            } else {
+                // Non-SIMD path: single pass for both basic and position stats
+                let mut qsum = 0u32;
+                let mut q20 = 0usize;
+                let mut q30 = 0usize;
+                let mut ncnt = 0usize;
+                let mut gc = 0usize;
+
+                pos.ensure_capacity(seq.len());
+                for (i, (&b, &q)) in seq.iter().zip(qual).enumerate() {
+                    let qval = (q - 33) as u32;
+                    qsum += qval;
+                    if q >= 53 {
+                        q20 += 1;
+                    }
+                    if q >= 63 {
+                        q30 += 1;
+                    }
+                    if b == b'N' || b == b'n' {
+                        ncnt += 1;
+                    }
+                    if b == b'G' || b == b'g' || b == b'C' || b == b'c' {
+                        gc += 1;
+                    }
+
+                    pos.total_sum[i] += qval as u64;
+                    pos.total_cnt[i] += 1;
+
+                    if let Some(bi) = base_idx(b) {
+                        pos.base_sum[bi][i] += qval as u64;
+                        pos.base_cnt[bi][i] += 1;
+                    }
+                }
+
+                (qsum, q20, q30, ncnt, gc)
+            };
 
             // K-mer counting
             if !no_kmer {
@@ -1459,22 +1503,14 @@ fn worker_thread(
             let trimmed_seq = &seq[trimming_result.start_pos..trimming_result.end_pos];
             let trimmed_qual = &qual[trimming_result.start_pos..trimming_result.end_pos];
 
-            // Recompute stats for trimmed read (used for filtering)
+            // Recompute stats for trimmed read (used for filtering) - SIMD accelerated
             let trimmed_len = trimmed_seq.len();
-            let mut trimmed_qsum = 0u32;
-            let mut trimmed_q20 = 0usize;
-            let mut trimmed_q30 = 0usize;
-            let mut trimmed_ncnt = 0usize;
-            let mut trimmed_gc = 0usize;
-
-            for (&b, &q) in trimmed_seq.iter().zip(trimmed_qual) {
-                let qu = q as usize;
-                trimmed_qsum += (q - 33) as u32;
-                trimmed_q20 += LUT_Q20[qu] as usize;
-                trimmed_q30 += LUT_Q30[qu] as usize;
-                trimmed_ncnt += LUT_IS_N[b as usize] as usize;
-                trimmed_gc += LUT_IS_GC[b as usize] as usize;
-            }
+            let trimmed_stats = simd::compute_stats(trimmed_seq, trimmed_qual);
+            let trimmed_qsum = trimmed_stats.qsum;
+            let trimmed_q20 = trimmed_stats.q20;
+            let trimmed_q30 = trimmed_stats.q30;
+            let trimmed_ncnt = trimmed_stats.ncnt;
+            let trimmed_gc = trimmed_stats.gc;
 
             // Apply filters on TRIMMED read
             if trimmed_len < min_len {
