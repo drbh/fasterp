@@ -125,8 +125,7 @@ fn compare_json_outputs(fastp_json: &PathBuf, fasterp_json: &PathBuf) {
         assert_eq!(
             fastp_kmer_obj.get(*kmer),
             fasterp_kmer_obj.get(*kmer),
-            "Kmer {} counts don't match",
-            kmer
+            "Kmer {kmer} counts don't match"
         );
     }
 }
@@ -484,10 +483,8 @@ fn test_gzip_compression_levels() {
 
     // Test different compression levels
     for level in [1, 6, 9] {
-        let output_gz = temp_dir
-            .path()
-            .join(format!("output_level_{}.fq.gz", level));
-        let output_json = temp_dir.path().join(format!("output_level_{}.json", level));
+        let output_gz = temp_dir.path().join(format!("output_level_{level}.fq.gz"));
+        let output_json = temp_dir.path().join(format!("output_level_{level}.json"));
 
         let status = Command::new(cargo_bin("fasterp"))
             .arg("-i")
@@ -500,21 +497,18 @@ fn test_gzip_compression_levels() {
             .arg(level.to_string())
             .status()
             .expect("Failed to run fasterp");
-        assert!(status.success(), "Compression level {} failed", level);
+        assert!(status.success(), "Compression level {level} failed");
         assert!(
             output_gz.exists(),
-            "Output file not created for level {}",
-            level
+            "Output file not created for level {level}"
         );
     }
 
     // Verify all produce same content when decompressed
     let mut contents = Vec::new();
     for level in [1, 6, 9] {
-        let output_gz = temp_dir
-            .path()
-            .join(format!("output_level_{}.fq.gz", level));
-        let decompressed_fq = temp_dir.path().join(format!("decompressed_{}.fq", level));
+        let output_gz = temp_dir.path().join(format!("output_level_{level}.fq.gz"));
+        let decompressed_fq = temp_dir.path().join(format!("decompressed_{level}.fq"));
 
         let status = Command::new("gunzip")
             .arg("-c")
@@ -543,10 +537,10 @@ fn test_n_base_filtering_matches_fastp() {
     let input_fq = test_data_path("small_1k.fq");
 
     for n_limit in [0, 3, 10] {
-        let fastp_fq = temp_dir.path().join(format!("fastp_n{}.fq", n_limit));
-        let fastp_json = temp_dir.path().join(format!("fastp_n{}.json", n_limit));
-        let fasterp_fq = temp_dir.path().join(format!("fasterp_n{}.fq", n_limit));
-        let fasterp_json = temp_dir.path().join(format!("fasterp_n{}.json", n_limit));
+        let fastp_fq = temp_dir.path().join(format!("fastp_n{n_limit}.fq"));
+        let fastp_json = temp_dir.path().join(format!("fastp_n{n_limit}.json"));
+        let fasterp_fq = temp_dir.path().join(format!("fasterp_n{n_limit}.fq"));
+        let fasterp_json = temp_dir.path().join(format!("fasterp_n{n_limit}.json"));
 
         // Run fastp
         let status = Command::new("fastp")
@@ -583,8 +577,7 @@ fn test_n_base_filtering_matches_fastp() {
         let fasterp_content = fs::read_to_string(&fasterp_fq).unwrap();
         assert_eq!(
             fastp_content, fasterp_content,
-            "N-base filtering with limit {} differs",
-            n_limit
+            "N-base filtering with limit {n_limit} differs"
         );
 
         // Compare JSON
@@ -607,8 +600,8 @@ fn test_multithreading_consistency() {
     let mut outputs = Vec::new();
 
     for threads in thread_counts.iter() {
-        let output_fq = temp_dir.path().join(format!("output_t{}.fq", threads));
-        let output_json = temp_dir.path().join(format!("output_t{}.json", threads));
+        let output_fq = temp_dir.path().join(format!("output_t{threads}.fq"));
+        let output_json = temp_dir.path().join(format!("output_t{threads}.json"));
 
         let status = Command::new(cargo_bin("fasterp"))
             .arg("-i")
@@ -621,7 +614,7 @@ fn test_multithreading_consistency() {
             .arg(threads.to_string())
             .status()
             .expect("Failed to run fasterp");
-        assert!(status.success(), "Failed with {} threads", threads);
+        assert!(status.success(), "Failed with {threads} threads");
 
         let content = fs::read_to_string(&output_fq).unwrap();
         outputs.push(content);
@@ -1106,8 +1099,8 @@ fn test_different_batch_sizes_consistent() {
     let mut outputs = Vec::new();
 
     for (i, &batch_size) in batch_sizes.iter().enumerate() {
-        let output_fq = temp_dir.path().join(format!("output_batch_{}.fq", i));
-        let output_json = temp_dir.path().join(format!("output_batch_{}.json", i));
+        let output_fq = temp_dir.path().join(format!("output_batch_{i}.fq"));
+        let output_json = temp_dir.path().join(format!("output_batch_{i}.json"));
 
         let status = Command::new(cargo_bin("fasterp"))
             .arg("-i")
@@ -1122,7 +1115,7 @@ fn test_different_batch_sizes_consistent() {
             .arg(batch_size.to_string())
             .status()
             .expect("Failed to run fasterp");
-        assert!(status.success(), "Failed with batch size {}", batch_size);
+        assert!(status.success(), "Failed with batch size {batch_size}");
 
         let content = fs::read_to_string(&output_fq).unwrap();
         outputs.push(content);
@@ -1241,4 +1234,600 @@ fn test_output_order_preserved_multithreading() {
         st_content, mt_content,
         "Multi-threading changes output order"
     );
+}
+
+// ============================================================================
+// Trimming Integration Tests
+// ============================================================================
+
+#[test]
+fn test_sliding_window_tail_trimming_matches_fastp() {
+    let temp_dir = TempDir::new().unwrap();
+    let input_path = test_data_path("small_1k.fq");
+
+    // Test with default sliding window tail trimming (cut_mean_quality=20, window_size=4)
+    let fastp_fq = temp_dir.path().join("fastp.fq");
+    let fastp_json = temp_dir.path().join("fastp.json");
+    let fasterp_fq = temp_dir.path().join("fasterp.fq");
+    let fasterp_json = temp_dir.path().join("fasterp.json");
+
+    // Run fastp with sliding window tail trimming
+    let status = Command::new("fastp")
+        .arg("-i")
+        .arg(&input_path)
+        .arg("-o")
+        .arg(&fastp_fq)
+        .arg("-j")
+        .arg(&fastp_json)
+        .arg("--cut_tail")
+        .arg("--cut_mean_quality")
+        .arg("20")
+        .arg("--cut_window_size")
+        .arg("4")
+        .stderr(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .status()
+        .expect("Failed to run fastp");
+    assert!(status.success());
+
+    // Run fasterp with same settings
+    let status = Command::new(cargo_bin("fasterp"))
+        .arg("-i")
+        .arg(&input_path)
+        .arg("-o")
+        .arg(&fasterp_fq)
+        .arg("-j")
+        .arg(&fasterp_json)
+        .arg("--cut-tail")
+        .arg("--cut-mean-quality")
+        .arg("20")
+        .arg("--cut-window-size")
+        .arg("4")
+        .status()
+        .expect("Failed to run fasterp");
+    assert!(status.success());
+
+    // Compare outputs
+    compare_json_outputs(&fastp_json, &fasterp_json);
+}
+
+#[test]
+fn test_sliding_window_front_trimming_matches_fastp() {
+    let temp_dir = TempDir::new().unwrap();
+    let input_path = test_data_path("small_1k.fq");
+
+    let fastp_fq = temp_dir.path().join("fastp.fq");
+    let fastp_json = temp_dir.path().join("fastp.json");
+    let fasterp_fq = temp_dir.path().join("fasterp.fq");
+    let fasterp_json = temp_dir.path().join("fasterp.json");
+
+    // Run fastp with front trimming enabled
+    let status = Command::new("fastp")
+        .arg("-i")
+        .arg(&input_path)
+        .arg("-o")
+        .arg(&fastp_fq)
+        .arg("-j")
+        .arg(&fastp_json)
+        .arg("--cut_front")
+        .arg("--cut_mean_quality")
+        .arg("25")
+        .stderr(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .status()
+        .expect("Failed to run fastp");
+    assert!(status.success());
+
+    // Run fasterp with same settings
+    let status = Command::new(cargo_bin("fasterp"))
+        .arg("-i")
+        .arg(&input_path)
+        .arg("-o")
+        .arg(&fasterp_fq)
+        .arg("-j")
+        .arg(&fasterp_json)
+        .arg("--cut-front")
+        .arg("--cut-mean-quality")
+        .arg("25")
+        .status()
+        .expect("Failed to run fasterp");
+    assert!(status.success());
+
+    compare_json_outputs(&fastp_json, &fasterp_json);
+}
+
+#[test]
+fn test_sliding_window_both_ends_matches_fastp() {
+    let temp_dir = TempDir::new().unwrap();
+    let input_path = test_data_path("medium_10k.fq");
+
+    let fastp_fq = temp_dir.path().join("fastp.fq");
+    let fastp_json = temp_dir.path().join("fastp.json");
+    let fasterp_fq = temp_dir.path().join("fasterp.fq");
+    let fasterp_json = temp_dir.path().join("fasterp.json");
+
+    // Run fastp with trimming on both ends
+    let status = Command::new("fastp")
+        .arg("-i")
+        .arg(&input_path)
+        .arg("-o")
+        .arg(&fastp_fq)
+        .arg("-j")
+        .arg(&fastp_json)
+        .arg("--cut_front")
+        .arg("--cut_tail")
+        .arg("--cut_mean_quality")
+        .arg("20")
+        .arg("--cut_window_size")
+        .arg("5")
+        .stderr(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .status()
+        .expect("Failed to run fastp");
+    assert!(status.success());
+
+    // Run fasterp with same settings
+    let status = Command::new(cargo_bin("fasterp"))
+        .arg("-i")
+        .arg(&input_path)
+        .arg("-o")
+        .arg(&fasterp_fq)
+        .arg("-j")
+        .arg(&fasterp_json)
+        .arg("--cut-front")
+        .arg("--cut-tail")
+        .arg("--cut-mean-quality")
+        .arg("20")
+        .arg("--cut-window-size")
+        .arg("5")
+        .status()
+        .expect("Failed to run fasterp");
+    assert!(status.success());
+
+    compare_json_outputs(&fastp_json, &fasterp_json);
+}
+
+#[test]
+fn test_fixed_front_trimming_matches_fastp() {
+    let temp_dir = TempDir::new().unwrap();
+    let input_path = test_data_path("small_1k.fq");
+
+    let fastp_fq = temp_dir.path().join("fastp.fq");
+    let fastp_json = temp_dir.path().join("fastp.json");
+    let fasterp_fq = temp_dir.path().join("fasterp.fq");
+    let fasterp_json = temp_dir.path().join("fasterp.json");
+
+    // Run fastp with fixed front trimming
+    let status = Command::new("fastp")
+        .arg("-i")
+        .arg(&input_path)
+        .arg("-o")
+        .arg(&fastp_fq)
+        .arg("-j")
+        .arg(&fastp_json)
+        .arg("--trim_front1")
+        .arg("5")
+        .stderr(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .status()
+        .expect("Failed to run fastp");
+    assert!(status.success());
+
+    // Run fasterp with same settings
+    let status = Command::new(cargo_bin("fasterp"))
+        .arg("-i")
+        .arg(&input_path)
+        .arg("-o")
+        .arg(&fasterp_fq)
+        .arg("-j")
+        .arg(&fasterp_json)
+        .arg("--trim-front")
+        .arg("5")
+        .status()
+        .expect("Failed to run fasterp");
+    assert!(status.success());
+
+    compare_json_outputs(&fastp_json, &fasterp_json);
+}
+
+#[test]
+fn test_fixed_tail_trimming_matches_fastp() {
+    let temp_dir = TempDir::new().unwrap();
+    let input_path = test_data_path("small_1k.fq");
+
+    let fastp_fq = temp_dir.path().join("fastp.fq");
+    let fastp_json = temp_dir.path().join("fastp.json");
+    let fasterp_fq = temp_dir.path().join("fasterp.fq");
+    let fasterp_json = temp_dir.path().join("fasterp.json");
+
+    // Run fastp with fixed tail trimming
+    let status = Command::new("fastp")
+        .arg("-i")
+        .arg(&input_path)
+        .arg("-o")
+        .arg(&fastp_fq)
+        .arg("-j")
+        .arg(&fastp_json)
+        .arg("--trim_tail1")
+        .arg("10")
+        .stderr(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .status()
+        .expect("Failed to run fastp");
+    assert!(status.success());
+
+    // Run fasterp with same settings
+    let status = Command::new(cargo_bin("fasterp"))
+        .arg("-i")
+        .arg(&input_path)
+        .arg("-o")
+        .arg(&fasterp_fq)
+        .arg("-j")
+        .arg(&fasterp_json)
+        .arg("--trim-tail")
+        .arg("10")
+        .status()
+        .expect("Failed to run fasterp");
+    assert!(status.success());
+
+    compare_json_outputs(&fastp_json, &fasterp_json);
+}
+
+#[test]
+fn test_fixed_both_ends_trimming_matches_fastp() {
+    let temp_dir = TempDir::new().unwrap();
+    let input_path = test_data_path("medium_10k.fq");
+
+    let fastp_fq = temp_dir.path().join("fastp.fq");
+    let fastp_json = temp_dir.path().join("fastp.json");
+    let fasterp_fq = temp_dir.path().join("fasterp.fq");
+    let fasterp_json = temp_dir.path().join("fasterp.json");
+
+    // Run fastp with fixed trimming on both ends
+    let status = Command::new("fastp")
+        .arg("-i")
+        .arg(&input_path)
+        .arg("-o")
+        .arg(&fastp_fq)
+        .arg("-j")
+        .arg(&fastp_json)
+        .arg("--trim_front1")
+        .arg("3")
+        .arg("--trim_tail1")
+        .arg("7")
+        .stderr(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .status()
+        .expect("Failed to run fastp");
+    assert!(status.success());
+
+    // Run fasterp with same settings
+    let status = Command::new(cargo_bin("fasterp"))
+        .arg("-i")
+        .arg(&input_path)
+        .arg("-o")
+        .arg(&fasterp_fq)
+        .arg("-j")
+        .arg(&fasterp_json)
+        .arg("--trim-front")
+        .arg("3")
+        .arg("--trim-tail")
+        .arg("7")
+        .status()
+        .expect("Failed to run fasterp");
+    assert!(status.success());
+
+    compare_json_outputs(&fastp_json, &fasterp_json);
+}
+
+#[test]
+fn test_poly_g_trimming_matches_fastp() {
+    let temp_dir = TempDir::new().unwrap();
+    let input_path = test_data_path("small_1k.fq");
+
+    let fastp_fq = temp_dir.path().join("fastp.fq");
+    let fastp_json = temp_dir.path().join("fastp.json");
+    let fasterp_fq = temp_dir.path().join("fasterp.fq");
+    let fasterp_json = temp_dir.path().join("fasterp.json");
+
+    // Run fastp with polyG trimming (default enabled for 2-color Illumina)
+    let status = Command::new("fastp")
+        .arg("-i")
+        .arg(&input_path)
+        .arg("-o")
+        .arg(&fastp_fq)
+        .arg("-j")
+        .arg(&fastp_json)
+        .arg("--trim_poly_g")
+        .arg("--poly_g_min_len")
+        .arg("10")
+        .stderr(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .status()
+        .expect("Failed to run fastp");
+    assert!(status.success());
+
+    // Run fasterp with same settings
+    let status = Command::new(cargo_bin("fasterp"))
+        .arg("-i")
+        .arg(&input_path)
+        .arg("-o")
+        .arg(&fasterp_fq)
+        .arg("-j")
+        .arg(&fasterp_json)
+        .arg("--trim-poly-g")
+        .arg("--poly-g-min-len")
+        .arg("10")
+        .status()
+        .expect("Failed to run fasterp");
+    assert!(status.success());
+
+    compare_json_outputs(&fastp_json, &fasterp_json);
+}
+
+#[test]
+fn test_poly_x_trimming_matches_fastp() {
+    let temp_dir = TempDir::new().unwrap();
+    let input_path = test_data_path("small_1k.fq");
+
+    let fastp_fq = temp_dir.path().join("fastp.fq");
+    let fastp_json = temp_dir.path().join("fastp.json");
+    let fasterp_fq = temp_dir.path().join("fasterp.fq");
+    let fasterp_json = temp_dir.path().join("fasterp.json");
+
+    // Run fastp with polyX trimming
+    let status = Command::new("fastp")
+        .arg("-i")
+        .arg(&input_path)
+        .arg("-o")
+        .arg(&fastp_fq)
+        .arg("-j")
+        .arg(&fastp_json)
+        .arg("--trim_poly_x")
+        .arg("--poly_x_min_len")
+        .arg("12")
+        .stderr(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .status()
+        .expect("Failed to run fastp");
+    assert!(status.success());
+
+    // Run fasterp with same settings
+    let status = Command::new(cargo_bin("fasterp"))
+        .arg("-i")
+        .arg(&input_path)
+        .arg("-o")
+        .arg(&fasterp_fq)
+        .arg("-j")
+        .arg(&fasterp_json)
+        .arg("--trim-poly-x")
+        .arg("--poly-g-min-len")
+        .arg("12")
+        .status()
+        .expect("Failed to run fasterp");
+    assert!(status.success());
+
+    compare_json_outputs(&fastp_json, &fasterp_json);
+}
+
+#[test]
+fn test_combined_trimming_and_filtering_matches_fastp() {
+    let temp_dir = TempDir::new().unwrap();
+    let input_path = test_data_path("medium_10k.fq");
+
+    let fastp_fq = temp_dir.path().join("fastp.fq");
+    let fastp_json = temp_dir.path().join("fastp.json");
+    let fasterp_fq = temp_dir.path().join("fasterp.fq");
+    let fasterp_json = temp_dir.path().join("fasterp.json");
+
+    // Run fastp with combined trimming and filtering
+    let status = Command::new("fastp")
+        .arg("-i")
+        .arg(&input_path)
+        .arg("-o")
+        .arg(&fastp_fq)
+        .arg("-j")
+        .arg(&fastp_json)
+        .arg("--trim_front1")
+        .arg("2")
+        .arg("--cut_tail")
+        .arg("--cut_mean_quality")
+        .arg("20")
+        .arg("--trim_poly_g")
+        .arg("-l")
+        .arg("50")
+        .arg("-n")
+        .arg("5")
+        .stderr(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .status()
+        .expect("Failed to run fastp");
+    assert!(status.success());
+
+    // Run fasterp with same settings
+    let status = Command::new(cargo_bin("fasterp"))
+        .arg("-i")
+        .arg(&input_path)
+        .arg("-o")
+        .arg(&fasterp_fq)
+        .arg("-j")
+        .arg(&fasterp_json)
+        .arg("--trim-front")
+        .arg("2")
+        .arg("--cut-tail")
+        .arg("--cut-mean-quality")
+        .arg("20")
+        .arg("--trim-poly-g")
+        .arg("-l")
+        .arg("50")
+        .arg("-n")
+        .arg("5")
+        .status()
+        .expect("Failed to run fasterp");
+    assert!(status.success());
+
+    compare_json_outputs(&fastp_json, &fasterp_json);
+}
+
+#[test]
+fn test_disable_tail_trimming_matches_fastp() {
+    let temp_dir = TempDir::new().unwrap();
+    let input_path = test_data_path("small_1k.fq");
+
+    let fastp_fq = temp_dir.path().join("fastp.fq");
+    let fastp_json = temp_dir.path().join("fastp.json");
+    let fasterp_fq = temp_dir.path().join("fasterp.fq");
+    let fasterp_json = temp_dir.path().join("fasterp.json");
+
+    // Run fastp with tail trimming disabled
+    let status = Command::new("fastp")
+        .arg("-i")
+        .arg(&input_path)
+        .arg("-o")
+        .arg(&fastp_fq)
+        .arg("-j")
+        .arg(&fastp_json)
+        .arg("--disable_trim_poly_g")
+        .arg("--cut_mean_quality")
+        .arg("0")
+        .stderr(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .status()
+        .expect("Failed to run fastp");
+    assert!(status.success());
+
+    // Run fasterp with same settings
+    let status = Command::new(cargo_bin("fasterp"))
+        .arg("-i")
+        .arg(&input_path)
+        .arg("-o")
+        .arg(&fasterp_fq)
+        .arg("-j")
+        .arg(&fasterp_json)
+        .arg("--disable-trim-poly-g")
+        .arg("--disable-trim-tail")
+        .status()
+        .expect("Failed to run fasterp");
+    assert!(status.success());
+
+    compare_json_outputs(&fastp_json, &fasterp_json);
+}
+
+#[test]
+fn test_aggressive_trimming_matches_fastp() {
+    let temp_dir = TempDir::new().unwrap();
+    let input_path = test_data_path("medium_10k.fq");
+
+    let fastp_fq = temp_dir.path().join("fastp.fq");
+    let fastp_json = temp_dir.path().join("fastp.json");
+    let fasterp_fq = temp_dir.path().join("fasterp.fq");
+    let fasterp_json = temp_dir.path().join("fasterp.json");
+
+    // Run fastp with aggressive trimming settings
+    let status = Command::new("fastp")
+        .arg("-i")
+        .arg(&input_path)
+        .arg("-o")
+        .arg(&fastp_fq)
+        .arg("-j")
+        .arg(&fastp_json)
+        .arg("--trim_front1")
+        .arg("5")
+        .arg("--trim_tail1")
+        .arg("5")
+        .arg("--cut_front")
+        .arg("--cut_tail")
+        .arg("--cut_mean_quality")
+        .arg("30")
+        .arg("--cut_window_size")
+        .arg("3")
+        .arg("--trim_poly_g")
+        .arg("--poly_g_min_len")
+        .arg("8")
+        .stderr(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .status()
+        .expect("Failed to run fastp");
+    assert!(status.success());
+
+    // Run fasterp with same settings
+    let status = Command::new(cargo_bin("fasterp"))
+        .arg("-i")
+        .arg(&input_path)
+        .arg("-o")
+        .arg(&fasterp_fq)
+        .arg("-j")
+        .arg(&fasterp_json)
+        .arg("--trim-front")
+        .arg("5")
+        .arg("--trim-tail")
+        .arg("5")
+        .arg("--cut-front")
+        .arg("--cut-tail")
+        .arg("--cut-mean-quality")
+        .arg("30")
+        .arg("--cut-window-size")
+        .arg("3")
+        .arg("--trim-poly-g")
+        .arg("--poly-g-min-len")
+        .arg("8")
+        .status()
+        .expect("Failed to run fasterp");
+    assert!(status.success());
+
+    compare_json_outputs(&fastp_json, &fasterp_json);
+}
+
+#[test]
+fn test_trimming_with_multithreading_consistency() {
+    let temp_dir = TempDir::new().unwrap();
+    let input_path = test_data_path("large_100k.fq");
+
+    let output_st = temp_dir.path().join("output_st.fq");
+    let output_mt = temp_dir.path().join("output_mt.fq");
+    let json_st = temp_dir.path().join("output_st.json");
+    let json_mt = temp_dir.path().join("output_mt.json");
+
+    // Single-threaded with trimming
+    let status = Command::new(cargo_bin("fasterp"))
+        .arg("-i")
+        .arg(&input_path)
+        .arg("-o")
+        .arg(&output_st)
+        .arg("-j")
+        .arg(&json_st)
+        .arg("-t")
+        .arg("1")
+        .arg("--cut-mean-quality")
+        .arg("20")
+        .arg("--trim-front")
+        .arg("3")
+        .arg("--poly-g-min-len")
+        .arg("10")
+        .status()
+        .expect("Failed to run fasterp single-threaded");
+    assert!(status.success());
+
+    // Multi-threaded with trimming
+    let status = Command::new(cargo_bin("fasterp"))
+        .arg("-i")
+        .arg(&input_path)
+        .arg("-o")
+        .arg(&output_mt)
+        .arg("-j")
+        .arg(&json_mt)
+        .arg("-t")
+        .arg("4")
+        .arg("--cut-mean-quality")
+        .arg("20")
+        .arg("--trim-front")
+        .arg("3")
+        .arg("--poly-g-min-len")
+        .arg("10")
+        .status()
+        .expect("Failed to run fasterp multi-threaded");
+    assert!(status.success());
+
+    // Compare JSON outputs
+    compare_json_outputs(&json_st, &json_mt);
 }

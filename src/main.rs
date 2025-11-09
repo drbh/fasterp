@@ -182,7 +182,7 @@ fn open_input(path: &str) -> Result<Box<dyn BufRead + Send>> {
         Ok(Box::new(reader))
     } else {
         // Open file and detect compression
-        let file = File::open(path).context(format!("Failed to open input file: {}", path))?;
+        let file = File::open(path).context(format!("Failed to open input file: {path}"))?;
         let format = CompressionFormat::from_path(path);
 
         match format {
@@ -255,7 +255,7 @@ fn open_output(path: &str, compression_level: Option<u32>) -> Result<OutputWrite
         Ok(OutputWriter::Stdout(writer))
     } else {
         // Create file and detect compression
-        let file = File::create(path).context(format!("Failed to create output file: {}", path))?;
+        let file = File::create(path).context(format!("Failed to create output file: {path}"))?;
         let format = CompressionFormat::from_path(path);
 
         match format {
@@ -464,6 +464,387 @@ struct Args {
     /// Skip k-mer counting for ceiling performance tests
     #[arg(long)]
     no_kmer: bool,
+
+    // ============ TRIMMING OPTIONS ============
+    /// Quality cutoff for sliding-window trimming (default: 0 = disabled)
+    /// Trim when mean quality in window falls below this value
+    #[arg(long, default_value = "0")]
+    cut_mean_quality: u8,
+
+    /// Sliding window size for quality trimming (default: 4)
+    #[arg(long, default_value = "4")]
+    cut_window_size: usize,
+
+    /// Enable quality trimming at 5' end (front)
+    #[arg(long)]
+    cut_front: bool,
+
+    /// Enable quality trimming at 3' end (tail)
+    #[arg(long)]
+    cut_tail: bool,
+
+    /// Disable polyG/quality tail trimming (for backward compatibility)
+    #[arg(long)]
+    disable_trim_tail: bool,
+
+    /// Trim N bases from 5' (front) end
+    #[arg(long, default_value = "0")]
+    trim_front: usize,
+
+    /// Trim N bases from 3' (tail) end
+    #[arg(long, default_value = "0")]
+    trim_tail: usize,
+
+    /// Enable polyG tail trimming
+    #[arg(long)]
+    trim_poly_g: bool,
+
+    /// Disable polyG tail trimming (for backward compatibility)
+    #[arg(long)]
+    disable_trim_poly_g: bool,
+
+    /// Enable generic polyX tail trimming (any homopolymer)
+    #[arg(long)]
+    trim_poly_x: bool,
+
+    /// Minimum length for polyG/polyX detection (default: 10)
+    #[arg(long, default_value = "10")]
+    poly_g_min_len: usize,
+}
+
+// ============================================================================
+// TRIMMING DATA STRUCTURES AND ALGORITHMS
+// ============================================================================
+
+/// Configuration for trimming operations
+#[derive(Debug, Clone)]
+struct TrimmingConfig {
+    // Sliding window trimming
+    enable_trim_front: bool,
+    enable_trim_tail: bool,
+    cut_mean_quality: u8,
+    cut_window_size: usize,
+
+    // Fixed position trimming
+    trim_front_bases: usize,
+    trim_tail_bases: usize,
+
+    // PolyG/PolyX trimming
+    enable_poly_g: bool,
+    enable_poly_x: bool,
+    poly_min_len: usize,
+}
+
+impl TrimmingConfig {
+    fn from_args(args: &Args) -> Self {
+        Self {
+            enable_trim_front: args.cut_front && args.cut_mean_quality > 0,
+            enable_trim_tail: args.cut_tail && args.cut_mean_quality > 0 && !args.disable_trim_tail,
+            cut_mean_quality: args.cut_mean_quality,
+            cut_window_size: args.cut_window_size,
+            trim_front_bases: args.trim_front,
+            trim_tail_bases: args.trim_tail,
+            enable_poly_g: args.trim_poly_g && !args.disable_trim_poly_g,
+            enable_poly_x: args.trim_poly_x,
+            poly_min_len: args.poly_g_min_len,
+        }
+    }
+
+    fn is_enabled(&self) -> bool {
+        self.enable_trim_front
+            || self.enable_trim_tail
+            || self.trim_front_bases > 0
+            || self.trim_tail_bases > 0
+            || self.enable_poly_g
+            || self.enable_poly_x
+    }
+}
+
+/// Result of trimming a single read
+#[derive(Debug, Clone, Default)]
+struct TrimmingResult {
+    start_pos: usize, // Starting position after 5' trimming
+    end_pos: usize,   // Ending position after 3' trimming
+    poly_g_trimmed: usize,
+    poly_x_trimmed: usize,
+}
+
+impl TrimmingResult {
+    fn trimmed_length(&self) -> usize {
+        self.end_pos.saturating_sub(self.start_pos)
+    }
+
+    fn bases_trimmed_5(&self) -> usize {
+        self.start_pos
+    }
+
+    fn bases_trimmed_3(&self) -> usize {
+        self.poly_g_trimmed + self.poly_x_trimmed
+    }
+}
+
+/// Accumulated trimming statistics
+#[derive(Debug, Default, Clone)]
+struct TrimmingStats {
+    reads_trimmed: usize,
+    bases_trimmed_5: u64,
+    bases_trimmed_3: u64,
+    poly_g_trimmed_reads: usize,
+    poly_g_trimmed_bases: u64,
+    poly_x_trimmed_reads: usize,
+    poly_x_trimmed_bases: u64,
+}
+
+impl TrimmingStats {
+    fn add(&mut self, result: &TrimmingResult) {
+        if result.start_pos > 0 || result.poly_g_trimmed > 0 || result.poly_x_trimmed > 0 {
+            self.reads_trimmed += 1;
+        }
+
+        self.bases_trimmed_5 += result.start_pos as u64;
+
+        if result.poly_g_trimmed > 0 {
+            self.poly_g_trimmed_reads += 1;
+            self.poly_g_trimmed_bases += result.poly_g_trimmed as u64;
+            self.bases_trimmed_3 += result.poly_g_trimmed as u64;
+        }
+
+        if result.poly_x_trimmed > 0 {
+            self.poly_x_trimmed_reads += 1;
+            self.poly_x_trimmed_bases += result.poly_x_trimmed as u64;
+            self.bases_trimmed_3 += result.poly_x_trimmed as u64;
+        }
+    }
+
+    fn merge(&mut self, other: &TrimmingStats) {
+        self.reads_trimmed += other.reads_trimmed;
+        self.bases_trimmed_5 += other.bases_trimmed_5;
+        self.bases_trimmed_3 += other.bases_trimmed_3;
+        self.poly_g_trimmed_reads += other.poly_g_trimmed_reads;
+        self.poly_g_trimmed_bases += other.poly_g_trimmed_bases;
+        self.poly_x_trimmed_reads += other.poly_x_trimmed_reads;
+        self.poly_x_trimmed_bases += other.poly_x_trimmed_bases;
+    }
+}
+
+/// Trim 3' end using sliding window quality check
+///
+/// Scans from the 3' end towards the 5' end with a sliding window.
+/// Returns the end position where quality is acceptable.
+///
+/// # Arguments
+/// * `qual` - Quality scores (Phred+33 encoded)
+/// * `window_size` - Size of the sliding window
+/// * `cutoff` - Minimum mean quality threshold
+///
+/// # Returns
+/// End position (exclusive) for trimmed sequence
+fn trim_tail_sliding_window(qual: &[u8], window_size: usize, cutoff: u8) -> usize {
+    let len = qual.len();
+
+    if len <= window_size {
+        return len; // Don't trim if shorter than window
+    }
+
+    // Scan from 3' end towards 5' end
+    for end_pos in (window_size..=len).rev() {
+        let start = end_pos - window_size;
+        let window_qual = &qual[start..end_pos];
+
+        // Calculate mean quality of window (Phred+33)
+        let sum: u32 = window_qual.iter().map(|&q| (q - 33) as u32).sum();
+        let mean_qual = sum as f64 / window_size as f64;
+
+        if mean_qual >= cutoff as f64 {
+            return end_pos; // Found acceptable window
+        }
+    }
+
+    0 // Entire read below threshold
+}
+
+/// Trim 5' end using sliding window quality check
+///
+/// Scans from the 5' end towards the 3' end with a sliding window.
+/// Returns the start position where quality is acceptable.
+///
+/// # Arguments
+/// * `qual` - Quality scores (Phred+33 encoded)
+/// * `window_size` - Size of the sliding window
+/// * `cutoff` - Minimum mean quality threshold
+///
+/// # Returns
+/// Start position (inclusive) for trimmed sequence
+fn trim_front_sliding_window(qual: &[u8], window_size: usize, cutoff: u8) -> usize {
+    let len = qual.len();
+
+    if len <= window_size {
+        return 0; // Don't trim if shorter than window
+    }
+
+    // Scan from 5' end towards 3' end
+    for start_pos in 0..=(len - window_size) {
+        let end = start_pos + window_size;
+        let window_qual = &qual[start_pos..end];
+
+        let sum: u32 = window_qual.iter().map(|&q| (q - 33) as u32).sum();
+        let mean_qual = sum as f64 / window_size as f64;
+
+        if mean_qual >= cutoff as f64 {
+            return start_pos; // Found acceptable window
+        }
+    }
+
+    len // Entire read below threshold
+}
+
+/// Detect polyG tail (common Illumina NovaSeq/NextSeq artifact)
+///
+/// Scans backwards from the 3' end to find consecutive G bases.
+///
+/// # Arguments
+/// * `seq` - Nucleotide sequence
+/// * `min_len` - Minimum length to consider as polyG
+///
+/// # Returns
+/// Number of G bases at the tail (0 if below threshold)
+fn detect_poly_g_tail(seq: &[u8], min_len: usize) -> usize {
+    let len = seq.len();
+    let mut g_count = 0;
+
+    // Scan backwards from 3' end
+    for i in (0..len).rev() {
+        if seq[i] == b'G' || seq[i] == b'g' {
+            g_count += 1;
+        } else {
+            break;
+        }
+    }
+
+    if g_count >= min_len { g_count } else { 0 }
+}
+
+/// Detect generic homopolymer tail (polyA, polyT, polyC, polyG, polyN)
+///
+/// Scans backwards from the 3' end to find consecutive identical bases.
+///
+/// # Arguments
+/// * `seq` - Nucleotide sequence
+/// * `min_len` - Minimum length to consider as polyX
+///
+/// # Returns
+/// Number of bases in the homopolymer tail (0 if below threshold)
+fn detect_poly_x_tail(seq: &[u8], min_len: usize) -> usize {
+    let len = seq.len();
+    if len == 0 {
+        return 0;
+    }
+
+    let tail_base = seq[len - 1];
+    let mut count = 0;
+
+    // Scan backwards from 3' end
+    for i in (0..len).rev() {
+        if seq[i] == tail_base {
+            count += 1;
+        } else {
+            break;
+        }
+    }
+
+    if count >= min_len { count } else { 0 }
+}
+
+/// Apply all trimming operations to a read
+///
+/// Trimming order:
+/// 1. Fixed front trimming
+/// 2. Fixed tail trimming
+/// 3. Sliding window front trimming (if enabled)
+/// 4. Sliding window tail trimming (if enabled)
+/// 5. PolyG/PolyX tail trimming
+///
+/// # Arguments
+/// * `seq` - Nucleotide sequence
+/// * `qual` - Quality scores
+/// * `config` - Trimming configuration
+///
+/// # Returns
+/// TrimmingResult with start/end positions and statistics
+fn trim_read(seq: &[u8], qual: &[u8], config: &TrimmingConfig) -> TrimmingResult {
+    let mut result = TrimmingResult {
+        start_pos: 0,
+        end_pos: seq.len(),
+        poly_g_trimmed: 0,
+        poly_x_trimmed: 0,
+    };
+
+    // 1. Fixed front trimming
+    if config.trim_front_bases > 0 {
+        result.start_pos = config.trim_front_bases.min(seq.len());
+    }
+
+    // 2. Fixed tail trimming
+    if config.trim_tail_bases > 0 {
+        result.end_pos = result.end_pos.saturating_sub(config.trim_tail_bases);
+    }
+
+    // Ensure we still have a valid range
+    if result.start_pos >= result.end_pos {
+        result.end_pos = result.start_pos;
+        return result;
+    }
+
+    let current_qual = &qual[result.start_pos..result.end_pos];
+
+    // 3. Sliding window front trimming
+    if config.enable_trim_front {
+        let trim_amount = trim_front_sliding_window(
+            current_qual,
+            config.cut_window_size,
+            config.cut_mean_quality,
+        );
+        result.start_pos += trim_amount;
+    }
+
+    // 4. Sliding window tail trimming
+    if config.enable_trim_tail {
+        let new_len = trim_tail_sliding_window(
+            &qual[result.start_pos..result.end_pos],
+            config.cut_window_size,
+            config.cut_mean_quality,
+        );
+        result.end_pos = result.start_pos + new_len;
+    }
+
+    // Ensure we still have sequence left
+    if result.start_pos >= result.end_pos {
+        result.end_pos = result.start_pos;
+        return result;
+    }
+
+    let current_seq = &seq[result.start_pos..result.end_pos];
+
+    // 5. PolyG tail trimming (check polyG first as it's more specific)
+    if config.enable_poly_g {
+        let poly_g = detect_poly_g_tail(current_seq, config.poly_min_len);
+        if poly_g > 0 {
+            result.poly_g_trimmed = poly_g;
+            result.end_pos = result.end_pos.saturating_sub(poly_g);
+        }
+    }
+
+    // 6. PolyX tail trimming (only if polyG didn't already trim)
+    if config.enable_poly_x && result.poly_g_trimmed == 0 {
+        let current_seq = &seq[result.start_pos..result.end_pos];
+        let poly_x = detect_poly_x_tail(current_seq, config.poly_min_len);
+        if poly_x > 0 {
+            result.poly_x_trimmed = poly_x;
+            result.end_pos = result.end_pos.saturating_sub(poly_x);
+        }
+    }
+
+    result
 }
 
 // ============================================================================
@@ -738,6 +1119,7 @@ impl StreamAccumulator {
         min_len: usize,
         n_limit: usize,
         q_mean_phred: u8,
+        trimming_config: &TrimmingConfig,
         writer: &mut impl Write,
     ) -> Result<()> {
         // Validate record
@@ -788,30 +1170,67 @@ impl StreamAccumulator {
         // Update "before" stats
         self.before.add(seq.len(), q20, q30, gc);
 
-        // Apply filters
-        if seq.len() < min_len {
+        // Apply trimming if enabled
+        let trimming_result = if trimming_config.is_enabled() {
+            trim_read(seq, qual, trimming_config)
+        } else {
+            TrimmingResult {
+                start_pos: 0,
+                end_pos: seq.len(),
+                poly_g_trimmed: 0,
+                poly_x_trimmed: 0,
+            }
+        };
+
+        // Get trimmed sequences
+        let trimmed_seq = &seq[trimming_result.start_pos..trimming_result.end_pos];
+        let trimmed_qual = &qual[trimming_result.start_pos..trimming_result.end_pos];
+
+        // Recompute stats for trimmed read (used for filtering)
+        let trimmed_len = trimmed_seq.len();
+        let mut trimmed_qsum = 0u32;
+        let mut trimmed_q20 = 0usize;
+        let mut trimmed_q30 = 0usize;
+        let mut trimmed_ncnt = 0usize;
+        let mut trimmed_gc = 0usize;
+
+        for (&b, &q) in trimmed_seq.iter().zip(trimmed_qual) {
+            let qu = q as usize;
+            trimmed_qsum += (q - 33) as u32;
+            trimmed_q20 += LUT_Q20[qu] as usize;
+            trimmed_q30 += LUT_Q30[qu] as usize;
+            trimmed_ncnt += LUT_IS_N[b as usize] as usize;
+            trimmed_gc += LUT_IS_GC[b as usize] as usize;
+        }
+
+        // Apply filters on TRIMMED read
+        if trimmed_len < min_len {
             self.too_short += 1;
             return Ok(());
         }
 
-        if ncnt > n_limit {
+        if trimmed_ncnt > n_limit {
             self.too_many_n += 1;
             return Ok(());
         }
 
-        if q_mean_phred > 0 && (qsum as f64 / seq.len() as f64) < q_mean_phred as f64 {
+        if q_mean_phred > 0
+            && trimmed_len > 0
+            && (trimmed_qsum as f64 / trimmed_len as f64) < q_mean_phred as f64
+        {
             self.low_quality += 1;
             return Ok(());
         }
 
-        // Record passed - write it out
+        // Record passed - write trimmed version
         writeln!(writer, "{}", std::str::from_utf8(header)?)?;
-        writeln!(writer, "{}", std::str::from_utf8(seq)?)?;
+        writeln!(writer, "{}", std::str::from_utf8(trimmed_seq)?)?;
         writeln!(writer, "{}", std::str::from_utf8(plus)?)?;
-        writeln!(writer, "{}", std::str::from_utf8(qual)?)?;
+        writeln!(writer, "{}", std::str::from_utf8(trimmed_qual)?)?;
 
-        // Update "after" stats
-        self.after.add(seq.len(), q20, q30, gc);
+        // Update "after" stats with trimmed read stats
+        self.after
+            .add(trimmed_len, trimmed_q20, trimmed_q30, trimmed_gc);
 
         Ok(())
     }
@@ -843,7 +1262,7 @@ fn producer_thread(
     sender: Sender<Option<Batch>>,
 ) -> Result<()> {
     let file =
-        File::open(&input_path).context(format!("Failed to open input file: {}", input_path))?;
+        File::open(&input_path).context(format!("Failed to open input file: {input_path}"))?;
     let mut reader = BufReader::with_capacity(16 * 1024 * 1024, file); // 16 MiB buffer
 
     let mut batch_id = 0u64;
@@ -913,10 +1332,8 @@ fn producer_thread(
 
             // Find all line starts
             for i in 0..complete_part.len() {
-                if complete_part[i] == b'\n' {
-                    if i + 1 < complete_part.len() {
-                        line_starts.push(i + 1);
-                    }
+                if complete_part[i] == b'\n' && i + 1 < complete_part.len() {
+                    line_starts.push(i + 1);
                 }
             }
 
@@ -965,6 +1382,7 @@ fn worker_thread(
     n_limit: usize,
     q_mean_phred: u8,
     no_kmer: bool,
+    trimming_config: TrimmingConfig,
 ) {
     while let Ok(Some(batch)) = receiver.recv() {
         let mut before = SimpleStats::default();
@@ -1040,34 +1458,70 @@ fn worker_thread(
             // Update before stats
             before.add(seq.len(), q20, q30, gc);
 
-            // Apply filters
-            if seq.len() < min_len {
+            // Apply trimming if enabled
+            let trimming_result = if trimming_config.is_enabled() {
+                trim_read(seq, qual, &trimming_config)
+            } else {
+                TrimmingResult {
+                    start_pos: 0,
+                    end_pos: seq.len(),
+                    poly_g_trimmed: 0,
+                    poly_x_trimmed: 0,
+                }
+            };
+
+            // Get trimmed sequences
+            let trimmed_seq = &seq[trimming_result.start_pos..trimming_result.end_pos];
+            let trimmed_qual = &qual[trimming_result.start_pos..trimming_result.end_pos];
+
+            // Recompute stats for trimmed read (used for filtering)
+            let trimmed_len = trimmed_seq.len();
+            let mut trimmed_qsum = 0u32;
+            let mut trimmed_q20 = 0usize;
+            let mut trimmed_q30 = 0usize;
+            let mut trimmed_ncnt = 0usize;
+            let mut trimmed_gc = 0usize;
+
+            for (&b, &q) in trimmed_seq.iter().zip(trimmed_qual) {
+                let qu = q as usize;
+                trimmed_qsum += (q - 33) as u32;
+                trimmed_q20 += LUT_Q20[qu] as usize;
+                trimmed_q30 += LUT_Q30[qu] as usize;
+                trimmed_ncnt += LUT_IS_N[b as usize] as usize;
+                trimmed_gc += LUT_IS_GC[b as usize] as usize;
+            }
+
+            // Apply filters on TRIMMED read
+            if trimmed_len < min_len {
                 too_short += 1;
                 continue;
             }
 
-            if ncnt > n_limit {
+            if trimmed_ncnt > n_limit {
                 too_many_n += 1;
                 continue;
             }
 
-            if q_mean_phred > 0 && (qsum as f64 / seq.len() as f64) < q_mean_phred as f64 {
+            if q_mean_phred > 0
+                && trimmed_len > 0
+                && (trimmed_qsum as f64 / trimmed_len as f64) < q_mean_phred as f64
+            {
                 low_quality += 1;
                 continue;
             }
 
-            // Passed - write to output buffer
+            // Passed - write TRIMMED read to output buffer
             out_buf.extend_from_slice(header);
             out_buf.push(b'\n');
-            out_buf.extend_from_slice(seq);
+            out_buf.extend_from_slice(trimmed_seq);
             out_buf.push(b'\n');
             out_buf.extend_from_slice(plus);
             out_buf.push(b'\n');
-            out_buf.extend_from_slice(qual);
+            out_buf.extend_from_slice(trimmed_qual);
             out_buf.push(b'\n');
 
-            // Update after stats
-            after.add(seq.len(), q20, q30, gc);
+            // Update after stats with trimmed read
+            after.add(trimmed_len, trimmed_q20, trimmed_q30, trimmed_gc);
         }
 
         let result = WorkerResult {
@@ -1188,6 +1642,7 @@ fn process_fastq_stream<R: BufRead, W: Write>(
     min_len: usize,
     n_limit: usize,
     q_mean_phred: u8,
+    trimming_config: &TrimmingConfig,
 ) -> Result<StreamAccumulator> {
     let mut acc = StreamAccumulator::new();
     let mut parser = FastqParser::new(reader);
@@ -1202,6 +1657,7 @@ fn process_fastq_stream<R: BufRead, W: Write>(
             min_len,
             n_limit,
             q_mean_phred,
+            trimming_config,
             writer,
         )?;
     }
@@ -1229,6 +1685,9 @@ fn main() -> Result<()> {
     // Determine number of threads
     let num_threads = args.threads.unwrap_or_else(num_cpus::get);
 
+    // Create trimming configuration from CLI args
+    let trimming_config = TrimmingConfig::from_args(&args);
+
     let acc = if num_threads == 1 {
         // SINGLE-THREADED MODE: use streaming approach with new parser
         let reader = open_input(&args.input)?;
@@ -1240,6 +1699,7 @@ fn main() -> Result<()> {
             args.length_required,
             args.n_base_limit,
             args.qualified_quality_phred,
+            &trimming_config,
         )?;
 
         writer.finish()?;
@@ -1266,6 +1726,7 @@ fn main() -> Result<()> {
             let n_limit = args.n_base_limit;
             let q_mean_phred = args.qualified_quality_phred;
             let no_kmer = args.no_kmer;
+            let trimming_config_clone = trimming_config.clone();
 
             let worker = thread::spawn(move || {
                 worker_thread(
@@ -1275,6 +1736,7 @@ fn main() -> Result<()> {
                     n_limit,
                     q_mean_phred,
                     no_kmer,
+                    trimming_config_clone,
                 )
             });
             workers.push(worker);
@@ -1336,3 +1798,10 @@ fn main() -> Result<()> {
 
     Ok(())
 }
+
+// ============================================================================
+// UNIT TESTS (see src/tests.rs)
+// ============================================================================
+
+#[cfg(test)]
+mod tests;
