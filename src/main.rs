@@ -8,6 +8,9 @@
 use anyhow::{Context, Result};
 use clap::Parser;
 use crossbeam_channel::{Receiver, Sender, bounded};
+use flate2::read::GzDecoder;
+use flate2::write::GzEncoder;
+use flate2::Compression;
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -133,14 +136,296 @@ fn kmer_to_string(code: usize) -> String {
     String::from_utf8(result).unwrap()
 }
 
+// ============================================================================
+// IO ABSTRACTION - Compression support (gzip) and stdin/stdout
+// ============================================================================
+
+/// Detect compression format from file extension or magic bytes
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum CompressionFormat {
+    None,
+    Gzip,
+}
+
+impl CompressionFormat {
+    /// Detect from file path
+    fn from_path(path: &str) -> Self {
+        if path == "-" {
+            return CompressionFormat::None; // stdin/stdout defaults to uncompressed
+        }
+
+        let path_lower = path.to_lowercase();
+        if path_lower.ends_with(".gz") || path_lower.ends_with(".gzip") {
+            CompressionFormat::Gzip
+        } else {
+            CompressionFormat::None
+        }
+    }
+
+    /// Detect from magic bytes (for future auto-detection)
+    #[allow(dead_code)]
+    fn from_magic_bytes(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() >= 2 && bytes[0] == 0x1f && bytes[1] == 0x8b {
+            Some(CompressionFormat::Gzip)
+        } else {
+            None
+        }
+    }
+}
+
+/// Open input file or stdin with automatic decompression
+fn open_input(path: &str) -> Result<Box<dyn BufRead + Send>> {
+    if path == "-" {
+        // Read from stdin
+        let stdin = std::io::stdin();
+        let reader = BufReader::with_capacity(16 * 1024 * 1024, stdin);
+        Ok(Box::new(reader))
+    } else {
+        // Open file and detect compression
+        let file = File::open(path).context(format!("Failed to open input file: {}", path))?;
+        let format = CompressionFormat::from_path(path);
+
+        match format {
+            CompressionFormat::Gzip => {
+                let decoder = GzDecoder::new(file);
+                let reader = BufReader::with_capacity(16 * 1024 * 1024, decoder);
+                Ok(Box::new(reader))
+            }
+            CompressionFormat::None => {
+                let reader = BufReader::with_capacity(16 * 1024 * 1024, file);
+                Ok(Box::new(reader))
+            }
+        }
+    }
+}
+
+/// Wrapper for output writer that ensures proper cleanup
+pub enum OutputWriter {
+    Plain(BufWriter<File>),
+    Gzip(BufWriter<GzEncoder<File>>),
+    Stdout(BufWriter<std::io::Stdout>),
+}
+
+impl Write for OutputWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self {
+            OutputWriter::Plain(w) => w.write(buf),
+            OutputWriter::Gzip(w) => w.write(buf),
+            OutputWriter::Stdout(w) => w.write(buf),
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            OutputWriter::Plain(w) => w.flush(),
+            OutputWriter::Gzip(w) => w.flush(),
+            OutputWriter::Stdout(w) => w.flush(),
+        }
+    }
+}
+
+impl OutputWriter {
+    /// Finish writing and ensure gzip encoder is properly finalized
+    pub fn finish(self) -> Result<()> {
+        match self {
+            OutputWriter::Plain(mut w) => {
+                w.flush()?;
+                Ok(())
+            }
+            OutputWriter::Gzip(mut w) => {
+                w.flush()?;
+                let encoder = w.into_inner().context("Failed to finish gzip writer")?;
+                encoder.finish().context("Failed to finish gzip encoding")?;
+                Ok(())
+            }
+            OutputWriter::Stdout(mut w) => {
+                w.flush()?;
+                Ok(())
+            }
+        }
+    }
+}
+
+/// Open output file or stdout with optional compression
+fn open_output(path: &str, compression_level: Option<u32>) -> Result<OutputWriter> {
+    if path == "-" {
+        // Write to stdout
+        let stdout = std::io::stdout();
+        let writer = BufWriter::with_capacity(16 * 1024 * 1024, stdout);
+        Ok(OutputWriter::Stdout(writer))
+    } else {
+        // Create file and detect compression
+        let file = File::create(path).context(format!("Failed to create output file: {}", path))?;
+        let format = CompressionFormat::from_path(path);
+
+        match format {
+            CompressionFormat::Gzip => {
+                let level = compression_level.unwrap_or(6); // Default to level 6
+                let compression = Compression::new(level);
+                let encoder = GzEncoder::new(file, compression);
+                let writer = BufWriter::with_capacity(16 * 1024 * 1024, encoder);
+                Ok(OutputWriter::Gzip(writer))
+            }
+            CompressionFormat::None => {
+                let writer = BufWriter::with_capacity(16 * 1024 * 1024, file);
+                Ok(OutputWriter::Plain(writer))
+            }
+        }
+    }
+}
+
+// ============================================================================
+// ROBUST FASTQ PARSER - State machine handles multiline and missing newlines
+// ============================================================================
+
+/// State machine for parsing FASTQ records
+/// Handles:
+/// - Multiline sequences/qualities (wrapped lines)
+/// - Missing final newline
+/// - Malformed records (skips with warning)
+#[derive(Debug, Clone, Copy, PartialEq)]
+#[allow(dead_code)]
+enum ParseState {
+    ExpectHeader,
+    InSequence,
+    ExpectPlus,
+    InQuality,
+}
+
+/// FASTQ record parser that accumulates multiline sequences/qualities
+pub struct FastqParser<R: BufRead> {
+    reader: R,
+    state: ParseState,
+    header: Vec<u8>,
+    sequence: Vec<u8>,
+    plus: Vec<u8>,
+    quality: Vec<u8>,
+    line_buf: Vec<u8>,
+    eof: bool,
+}
+
+impl<R: BufRead> FastqParser<R> {
+    pub fn new(reader: R) -> Self {
+        FastqParser {
+            reader,
+            state: ParseState::ExpectHeader,
+            header: Vec::new(),
+            sequence: Vec::new(),
+            plus: Vec::new(),
+            quality: Vec::new(),
+            line_buf: Vec::new(),
+            eof: false,
+        }
+    }
+
+    /// Read next record, returns Some((header, seq, plus, qual)) or None if EOF
+    /// Handles multiline sequences and missing final newlines
+    pub fn next_record(&mut self) -> Result<Option<(Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>)>> {
+        // Reset buffers
+        self.header.clear();
+        self.sequence.clear();
+        self.plus.clear();
+        self.quality.clear();
+        self.state = ParseState::ExpectHeader;
+
+        loop {
+            self.line_buf.clear();
+            let bytes_read = self.reader.read_until(b'\n', &mut self.line_buf)?;
+
+            // Handle EOF
+            if bytes_read == 0 {
+                if self.eof {
+                    return Ok(None); // Already processed EOF
+                }
+                self.eof = true;
+
+                // Check if we have a complete record without final newline
+                if self.state == ParseState::InQuality && !self.quality.is_empty() {
+                    // Validate sequence and quality match
+                    if self.sequence.len() == self.quality.len() {
+                        return Ok(Some((
+                            std::mem::take(&mut self.header),
+                            std::mem::take(&mut self.sequence),
+                            std::mem::take(&mut self.plus),
+                            std::mem::take(&mut self.quality),
+                        )));
+                    }
+                }
+                return Ok(None);
+            }
+
+            // Remove trailing newline if present
+            let mut line = &self.line_buf[..];
+            if line.ends_with(b"\n") {
+                line = &line[..line.len() - 1];
+            }
+            if line.ends_with(b"\r") {
+                line = &line[..line.len() - 1];
+            }
+
+            // Skip empty lines
+            if line.is_empty() {
+                continue;
+            }
+
+            match self.state {
+                ParseState::ExpectHeader => {
+                    if line.starts_with(b"@") {
+                        self.header.extend_from_slice(line);
+                        self.state = ParseState::InSequence;
+                    }
+                    // Ignore non-header lines when expecting header
+                }
+                ParseState::InSequence => {
+                    if line.starts_with(b"+") {
+                        // Found plus line, move to quality
+                        self.plus.extend_from_slice(line);
+                        self.state = ParseState::InQuality;
+                    } else {
+                        // Accumulate sequence (handles multiline)
+                        self.sequence.extend_from_slice(line);
+                    }
+                }
+                ParseState::InQuality => {
+                    // Accumulate quality until we have enough bases
+                    self.quality.extend_from_slice(line);
+
+                    // Check if quality matches sequence length
+                    if self.quality.len() >= self.sequence.len() {
+                        // We have a complete record
+                        if self.quality.len() > self.sequence.len() {
+                            // Quality is longer than sequence, truncate
+                            self.quality.truncate(self.sequence.len());
+                        }
+
+                        return Ok(Some((
+                            std::mem::take(&mut self.header),
+                            std::mem::take(&mut self.sequence),
+                            std::mem::take(&mut self.plus),
+                            std::mem::take(&mut self.quality),
+                        )));
+                    }
+                }
+                ParseState::ExpectPlus => {
+                    // This state is unused in current implementation
+                    if line.starts_with(b"+") {
+                        self.plus.extend_from_slice(line);
+                        self.state = ParseState::InQuality;
+                    }
+                }
+            }
+        }
+    }
+}
+
 #[derive(Parser, Debug)]
 #[command(author, version, about = "A fast FASTQ preprocessor", long_about = None)]
 struct Args {
-    /// Input FASTQ file
+    /// Input FASTQ file (use '-' for stdin, supports .gz)
     #[arg(short = 'i', long)]
     input: String,
 
-    /// Output FASTQ file
+    /// Output FASTQ file (use '-' for stdout, .gz extension enables compression)
     #[arg(short = 'o', long)]
     output: String,
 
@@ -159,6 +444,10 @@ struct Args {
     /// JSON report file (default: fastp.json)
     #[arg(short = 'j', long, default_value = "fastp.json")]
     json: String,
+
+    /// Compression level for gzip output (0-9, default: 6)
+    #[arg(short = 'z', long)]
+    compression_level: Option<u32>,
 
     /// Number of worker threads (default: auto-detect CPU count)
     #[arg(short = 't', long)]
@@ -808,10 +1097,9 @@ fn merger_thread(
     receiver: Receiver<Option<WorkerResult>>,
     output_path: String,
     num_workers: usize,
+    compression_level: Option<u32>,
 ) -> Result<StreamAccumulator> {
-    let file = File::create(&output_path)
-        .context(format!("Failed to create output file: {}", output_path))?;
-    let mut writer = BufWriter::with_capacity(16 * 1024 * 1024, file);
+    let mut writer = open_output(&output_path, compression_level)?;
 
     let mut acc = StreamAccumulator::new();
     let mut next_id = 0u64;
@@ -878,7 +1166,7 @@ fn merger_thread(
         }
     }
 
-    writer.flush()?;
+    writer.finish()?;
     Ok(acc)
 }
 
@@ -886,10 +1174,12 @@ fn merger_thread(
 // STREAMING PARSER - processes records without loading all into memory
 // ============================================================================
 
-/// Stream-process FASTQ records directly from reader
+/// Stream-process FASTQ records using the robust parser
 ///
-/// This is the key optimization: instead of loading all records into a Vec,
-/// we process each record immediately as we read it.
+/// Uses FastqParser which handles:
+/// - Multiline sequences/qualities
+/// - Missing final newlines
+/// - Malformed records
 ///
 /// NO intermediate Vec<FastqRecord> allocation!
 fn process_fastq_stream<R: BufRead, W: Write>(
@@ -900,51 +1190,15 @@ fn process_fastq_stream<R: BufRead, W: Write>(
     q_mean_phred: u8,
 ) -> Result<StreamAccumulator> {
     let mut acc = StreamAccumulator::new();
-    let mut lines = reader.lines();
+    let mut parser = FastqParser::new(reader);
 
-    // Reusable buffers (declared but values assigned in loop)
-    let mut header_buf;
-    let mut seq_buf;
-    let mut plus_buf;
-    let mut qual_buf;
-
-    while let Some(header) = lines.next() {
-        header_buf = header?;
-
-        // Skip empty lines
-        if header_buf.is_empty() {
-            continue;
-        }
-
-        // Ensure it starts with @
-        if !header_buf.starts_with('@') {
-            continue;
-        }
-
-        // Read sequence
-        seq_buf = match lines.next() {
-            Some(s) => s?,
-            None => break,
-        };
-
-        // Read plus line
-        plus_buf = match lines.next() {
-            Some(p) => p?,
-            None => break,
-        };
-
-        // Read quality
-        qual_buf = match lines.next() {
-            Some(q) => q?,
-            None => break,
-        };
-
+    while let Some((header, seq, plus, qual)) = parser.next_record()? {
         // Process this record in a single pass
         acc.process_record(
-            header_buf.as_bytes(),
-            seq_buf.as_bytes(),
-            plus_buf.as_bytes(),
-            qual_buf.as_bytes(),
+            &header,
+            &seq,
+            &plus,
+            &qual,
             min_len,
             n_limit,
             q_mean_phred,
@@ -976,14 +1230,9 @@ fn main() -> Result<()> {
     let num_threads = args.threads.unwrap_or_else(num_cpus::get);
 
     let acc = if num_threads == 1 {
-        // SINGLE-THREADED MODE: use old streaming approach
-        let input_file = File::open(&args.input)
-            .context(format!("Failed to open input file: {}", args.input))?;
-        let reader = BufReader::new(input_file);
-
-        let output_file = File::create(&args.output)
-            .context(format!("Failed to create output file: {}", args.output))?;
-        let mut writer = BufWriter::new(output_file);
+        // SINGLE-THREADED MODE: use streaming approach with new parser
+        let reader = open_input(&args.input)?;
+        let mut writer = open_output(&args.output, args.compression_level)?;
 
         let acc = process_fastq_stream(
             reader,
@@ -993,7 +1242,7 @@ fn main() -> Result<()> {
             args.qualified_quality_phred,
         )?;
 
-        writer.flush()?;
+        writer.finish()?;
         acc
     } else {
         // MULTI-THREADED MODE: 3-stage pipeline
@@ -1037,7 +1286,8 @@ fn main() -> Result<()> {
 
         // Spawn merger thread
         let output_path = args.output.clone();
-        let merger = thread::spawn(move || merger_thread(result_rx, output_path, num_threads));
+        let compression_level = args.compression_level;
+        let merger = thread::spawn(move || merger_thread(result_rx, output_path, num_threads, compression_level));
 
         // Wait for all threads
         producer.join().unwrap()?;
