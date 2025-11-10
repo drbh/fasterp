@@ -50,28 +50,50 @@ pub(crate) static LUT_IS_GC: [bool; 256] = {
     lut
 };
 
+/// Lookup table: base to 2-bit encoding (A=0, C=1, G=2, T=3)
+/// Invalid bases map to 255 (sentinel value)
+const LUT_BASE_TO_2BIT: [u8; 256] = {
+    let mut lut = [255u8; 256];
+    lut[b'A' as usize] = 0;
+    lut[b'a' as usize] = 0;
+    lut[b'C' as usize] = 1;
+    lut[b'c' as usize] = 1;
+    lut[b'G' as usize] = 2;
+    lut[b'g' as usize] = 2;
+    lut[b'T' as usize] = 3;
+    lut[b't' as usize] = 3;
+    lut
+};
+
+/// Lookup table: base index for quality_curves (A=0, T=1, C=2, G=3)
+/// Invalid bases map to 255 (sentinel value)
+const LUT_BASE_IDX: [u8; 256] = {
+    let mut lut = [255u8; 256];
+    lut[b'A' as usize] = 0;
+    lut[b'a' as usize] = 0;
+    lut[b'T' as usize] = 1;
+    lut[b't' as usize] = 1;
+    lut[b'C' as usize] = 2;
+    lut[b'c' as usize] = 2;
+    lut[b'G' as usize] = 3;
+    lut[b'g' as usize] = 3;
+    lut
+};
+
 /// Convert base to 2-bit encoding: A=0, C=1, G=2, T=3
-#[inline]
+/// Uses lookup table for O(1) performance
+#[inline(always)]
 pub(crate) fn base_to_2bit(b: u8) -> Option<u32> {
-    match b {
-        b'A' | b'a' => Some(0),
-        b'C' | b'c' => Some(1),
-        b'G' | b'g' => Some(2),
-        b'T' | b't' => Some(3),
-        _ => None,
-    }
+    let code = LUT_BASE_TO_2BIT[b as usize];
+    if code == 255 { None } else { Some(code as u32) }
 }
 
 /// Get base index for quality_curves: A=0, T=1, C=2, G=3
-#[inline]
+/// Uses lookup table for O(1) performance
+#[inline(always)]
 pub(crate) fn base_idx(b: u8) -> Option<usize> {
-    match b {
-        b'A' | b'a' => Some(0),
-        b'T' | b't' => Some(1),
-        b'C' | b'c' => Some(2),
-        b'G' | b'g' => Some(3),
-        _ => None,
-    }
+    let idx = LUT_BASE_IDX[b as usize];
+    if idx == 255 { None } else { Some(idx as usize) }
 }
 
 /// Count 5-mers using 2-bit rolling code
@@ -105,8 +127,29 @@ pub(crate) fn count_k5_2bit(seq: &[u8], kmer_table: &mut [usize; 1024]) {
     }
 }
 
-/// Convert 2-bit encoded kmer to String for JSON output
-pub(crate) fn kmer_to_string(code: usize) -> String {
+/// Static cache of all 1024 possible 5-mer strings
+/// Initialized once on first use, then reused
+static KMER_CACHE: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+
+/// Convert 2-bit encoded kmer to &str for JSON output
+/// Uses static cache - initialized once, then zero allocations
+#[inline(always)]
+pub(crate) fn kmer_to_str(code: usize) -> &'static str {
+    let cache = KMER_CACHE.get_or_init(|| {
+        let mut kmers = Vec::with_capacity(1024);
+        for c in 0..1024 {
+            kmers.push(kmer_to_string_impl(c));
+        }
+        kmers
+    });
+
+    // SAFETY: The cache is never mutated after initialization
+    // and lives for the entire program lifetime
+    unsafe { std::mem::transmute::<&str, &'static str>(cache[code].as_str()) }
+}
+
+/// Internal implementation of kmer_to_string
+fn kmer_to_string_impl(code: usize) -> String {
     let bases = [b'A', b'C', b'G', b'T'];
     let mut result = Vec::with_capacity(5);
     let mut c = code;
@@ -120,4 +163,10 @@ pub(crate) fn kmer_to_string(code: usize) -> String {
     // Reverse to get correct order (we extracted backwards)
     result.reverse();
     String::from_utf8(result).unwrap()
+}
+
+/// Convert 2-bit encoded kmer to String for JSON output (deprecated)
+#[deprecated(note = "Use kmer_to_str instead for zero-allocation")]
+pub(crate) fn kmer_to_string(code: usize) -> String {
+    kmer_to_str(code).to_string()
 }

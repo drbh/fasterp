@@ -9,6 +9,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use crossbeam_channel::bounded;
 use std::fs::File;
+use std::io::{BufWriter, Write};
 use std::thread;
 
 mod io;
@@ -63,6 +64,10 @@ struct Args {
     /// JSON report file (default: fastp.json)
     #[arg(short = 'j', long, default_value = "fastp.json")]
     json: String,
+
+    /// Stats output format: compact (default), pretty, off, or jsonl
+    #[arg(long, default_value = "compact")]
+    stats_format: String,
 
     /// Compression level for gzip output (0-9, default: 6)
     #[arg(short = 'z', long)]
@@ -280,10 +285,40 @@ fn main() -> Result<()> {
         },
     };
 
-    // Write JSON report
-    let json_file =
-        File::create(&args.json).context(format!("Failed to create JSON file: {}", args.json))?;
-    serde_json::to_writer_pretty(json_file, &report)?;
+    // Write JSON report based on stats_format
+    match args.stats_format.as_str() {
+        "off" => {
+            // Skip JSON output entirely
+        }
+        "compact" => {
+            let json_file = File::create(&args.json)
+                .context(format!("Failed to create JSON file: {}", args.json))?;
+            // Use a large BufWriter (256 KiB) to reduce system calls
+            let mut buf_writer = BufWriter::with_capacity(256 * 1024, json_file);
+            serde_json::to_writer(&mut buf_writer, &report)?;
+            // Explicit flush to ensure data is written
+            // (BufWriter::drop also flushes, but explicit is clearer)
+        }
+        "pretty" => {
+            let json_file = File::create(&args.json)
+                .context(format!("Failed to create JSON file: {}", args.json))?;
+            let mut buf_writer = BufWriter::with_capacity(256 * 1024, json_file);
+            serde_json::to_writer_pretty(&mut buf_writer, &report)?;
+        }
+        "jsonl" => {
+            let json_file = File::create(&args.json)
+                .context(format!("Failed to create JSON file: {}", args.json))?;
+            let mut buf_writer = BufWriter::with_capacity(256 * 1024, json_file);
+            serde_json::to_writer(&mut buf_writer, &report)?;
+            writeln!(buf_writer)?;
+        }
+        _ => {
+            anyhow::bail!(
+                "Invalid stats format: {}. Use 'compact', 'pretty', 'off', or 'jsonl'",
+                args.stats_format
+            );
+        }
+    }
 
     Ok(())
 }

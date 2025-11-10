@@ -964,7 +964,7 @@ fn test_strict_combined_filters() {
 
 /// Helper to create a FASTQ record with specific quality pattern
 fn create_fastq_record(name: &str, seq: &str, qual: &str) -> String {
-    format!("@{}\n{}\n+\n{}\n", name, seq, qual)
+    format!("@{name}\n{seq}\n+\n{qual}\n")
 }
 
 /// Helper to create quality string with specific phred scores
@@ -1095,8 +1095,8 @@ fn test_average_quality_filter() {
 
     // Create two reads: one with mean Q20, one with mean Q15
     let seq = "A".repeat(100);
-    let qual_20 = quality_string_from_phred(&vec![20u8; 100]); // Mean = 20
-    let qual_15 = quality_string_from_phred(&vec![15u8; 100]); // Mean = 15
+    let qual_20 = quality_string_from_phred(&[20u8; 100]); // Mean = 20
+    let qual_15 = quality_string_from_phred(&[15u8; 100]); // Mean = 15
 
     let mut input_data = String::new();
     input_data.push_str(&create_fastq_record("read_q20", &seq, &qual_20));
@@ -1154,7 +1154,7 @@ fn test_max_length_trimming() {
 
     // Create a 150bp read
     let seq = "ACGT".repeat(37) + "AC"; // 150 bases
-    let qual = quality_string_from_phred(&vec![30u8; 150]);
+    let qual = quality_string_from_phred(&[30u8; 150]);
     let record = create_fastq_record("long_read", &seq, &qual);
 
     fs::write(&input_fq, record).unwrap();
@@ -1275,8 +1275,8 @@ fn test_n_base_limit_exact_boundary() {
     // Create reads with different N counts
     let seq_5n = "ACGT".repeat(20) + "NNNNN"; // Exactly 5 Ns
     let seq_6n = "ACGT".repeat(20) + "NNNNNN"; // 6 Ns
-    let qual = quality_string_from_phred(&vec![30u8; 85]);
-    let qual6 = quality_string_from_phred(&vec![30u8; 86]);
+    let qual = quality_string_from_phred(&[30u8; 85]);
+    let qual6 = quality_string_from_phred(&[30u8; 86]);
 
     let mut input_data = String::new();
     input_data.push_str(&create_fastq_record("read_5n", &seq_5n, &qual));
@@ -1332,7 +1332,7 @@ fn test_length_filter_after_trimming() {
 
     // Create a 100bp read
     let seq = "A".repeat(100);
-    let qual = quality_string_from_phred(&vec![30u8; 100]);
+    let qual = quality_string_from_phred(&[30u8; 100]);
     let record = create_fastq_record("test_read", &seq, &qual);
 
     fs::write(&input_fq, record).unwrap();
@@ -1381,8 +1381,8 @@ fn test_empty_output_all_filtered() {
     let mut input_data = String::new();
     for i in 0..10 {
         let seq = "A".repeat(50); // All 50bp
-        let qual = quality_string_from_phred(&vec![30u8; 50]);
-        input_data.push_str(&create_fastq_record(&format!("read{}", i), &seq, &qual));
+        let qual = quality_string_from_phred(&[30u8; 50]);
+        input_data.push_str(&create_fastq_record(&format!("read{i}"), &seq, &qual));
     }
 
     fs::write(&input_fq, input_data).unwrap();

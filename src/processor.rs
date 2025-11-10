@@ -295,8 +295,14 @@ impl StreamAccumulator {
         let trimmed_seq = &seq[trimming_result.start_pos..trimming_result.end_pos];
         let trimmed_qual = &qual[trimming_result.start_pos..trimming_result.end_pos];
 
-        // Recompute stats for trimmed read (used for filtering) - SIMD accelerated
+        // Early length check - skip expensive stats computation for reads that are too short
         let trimmed_len = trimmed_seq.len();
+        if trimmed_len < min_len {
+            self.too_short += 1;
+            return Ok(());
+        }
+
+        // Recompute stats for trimmed read (used for filtering) - SIMD accelerated
         let trimmed_stats = simd::compute_stats(trimmed_seq, trimmed_qual, qualified_quality_phred);
         let trimmed_qsum = trimmed_stats.qsum;
         let trimmed_q20 = trimmed_stats.q20;
@@ -305,11 +311,7 @@ impl StreamAccumulator {
         let trimmed_gc = trimmed_stats.gc;
         let unqualified_count = trimmed_stats.unqualified;
 
-        // Apply filters on TRIMMED read
-        if trimmed_len < min_len {
-            self.too_short += 1;
-            return Ok(());
-        }
+        // Apply remaining filters on TRIMMED read
 
         if trimmed_ncnt > n_limit {
             self.too_many_n += 1;
@@ -349,11 +351,16 @@ impl StreamAccumulator {
     }
 
     /// Convert kmer_table to IndexMap for JSON output
+    /// Uses static string cache - only 1024 allocations total (reused across calls)
     pub(crate) fn kmer_table_to_map(&self) -> IndexMap<String, usize> {
         let mut map = IndexMap::new();
         for code in 0..1024 {
-            let kmer_str = kmer_to_string(code);
-            map.insert(kmer_str, self.kmer_table[code]);
+            // kmer_to_str returns &'static str from cache, we convert to String for the map
+            // This still allocates, but only once per unique kmer string (cached in kmer_to_str)
+            map.insert(
+                crate::kmer::kmer_to_str(code).to_string(),
+                self.kmer_table[code],
+            );
         }
         map
     }

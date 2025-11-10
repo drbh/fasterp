@@ -7,11 +7,10 @@
 //!
 //! This pipeline achieves 2-4x speedup on large datasets with multi-threading.
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use crossbeam_channel::{Receiver, Sender};
 use std::collections::BTreeMap;
-use std::fs::File;
-use std::io::{BufReader, Read, Write};
+use std::io::{Read, Write};
 
 use crate::io::open_output;
 use crate::kmer::*;
@@ -60,81 +59,88 @@ pub(crate) fn producer_thread(
     batch_bytes: usize,
     sender: Sender<Option<Batch>>,
 ) -> Result<()> {
-    let file =
-        File::open(&input_path).context(format!("Failed to open input file: {input_path}"))?;
-    let mut reader = BufReader::with_capacity(16 * 1024 * 1024, file); // 16 MiB buffer
+    let mut reader = crate::io::open_input(&input_path)?; // Handles compression automatically
 
     let mut batch_id = 0u64;
     let mut carryover = Vec::new();
+    let mut buffer = vec![0u8; batch_bytes]; // Reuse buffer allocation
 
     loop {
-        // Read a chunk
-        let mut buffer = vec![0u8; batch_bytes];
+        // Read a chunk - reusing buffer
         let bytes_read = reader.read(&mut buffer)?;
-        buffer.truncate(bytes_read);
 
         // Prepend carryover from previous iteration
-        if !carryover.is_empty() {
-            let mut combined = carryover.clone();
-            combined.extend_from_slice(&buffer);
-            buffer = combined;
+        let carryover_len = carryover.len();
+        let actual_len = if carryover_len > 0 {
+            // Move buffer data to make room for carryover at the start
+            if carryover_len + bytes_read > buffer.len() {
+                // Need to grow buffer
+                buffer.resize(carryover_len + bytes_read, 0);
+            }
+            // Shift read data to make room
+            buffer.copy_within(0..bytes_read, carryover_len);
+            // Copy carryover to start
+            buffer[..carryover_len].copy_from_slice(&carryover);
             carryover.clear();
-        }
+            carryover_len + bytes_read
+        } else {
+            bytes_read
+        };
 
-        if buffer.is_empty() {
+        if actual_len == 0 {
             break; // EOF and no carryover
         }
 
         // Determine if this is the last chunk
-        let is_eof = bytes_read == 0 || bytes_read < batch_bytes;
+        // Note: For compressed streams, bytes_read < batch_bytes doesn't mean EOF!
+        // Decompression streams can return fewer bytes than requested even when more data exists.
+        let is_eof = bytes_read == 0;
 
-        // Find complete FASTQ records
-        // A record is complete if it has 4 lines ending with newline
+        // Single-pass scan: find complete records AND line starts
         let mut complete_end = 0;
         let mut line_count = 0;
+        let mut line_starts = vec![0];
 
-        for i in 0..buffer.len() {
+        for i in 0..actual_len {
             if buffer[i] == b'\n' {
                 line_count += 1;
                 // After every 4 lines, we have a complete record
                 if line_count % 4 == 0 {
                     complete_end = i + 1;
                 }
+                // Track line starts for parsing
+                if i + 1 < actual_len {
+                    line_starts.push(i + 1);
+                }
             }
         }
 
         // On EOF, if we have remaining lines that form complete records, use them
-        let complete_part = if is_eof && line_count > 0 {
+        let complete_len = if is_eof && line_count > 0 {
             // Check if we have complete records
             if line_count % 4 == 0 {
                 // All lines end with newline and form complete records
-                &buffer[..]
-            } else if line_count % 4 == 3 && complete_end < buffer.len() {
+                actual_len
+            } else if line_count % 4 == 3 && complete_end < actual_len {
                 // We have 3 newlines, meaning 4th line exists but no trailing newline
                 // This is still a complete record
-                &buffer[..]
+                actual_len
             } else {
-                &buffer[..complete_end]
+                complete_end
             }
         } else {
-            &buffer[..complete_end]
+            complete_end
         };
 
         // Save incomplete part for next iteration (if not EOF)
-        if !is_eof && complete_end < buffer.len() {
-            carryover = buffer[complete_end..].to_vec();
+        if !is_eof && complete_len < actual_len {
+            carryover = buffer[complete_len..actual_len].to_vec();
         }
 
-        // Parse complete records
-        if !complete_part.is_empty() {
-            let mut line_starts = vec![0];
-
-            // Find all line starts
-            for i in 0..complete_part.len() {
-                if complete_part[i] == b'\n' && i + 1 < complete_part.len() {
-                    line_starts.push(i + 1);
-                }
-            }
+        // Parse complete records - use pre-computed line_starts
+        if complete_len > 0 {
+            // Filter line_starts to only those within complete_len
+            line_starts.retain(|&pos| pos < complete_len);
 
             // Group into 4-line records
             let mut recs = Vec::new();
@@ -152,7 +158,7 @@ pub(crate) fn producer_thread(
             if !recs.is_empty() {
                 let batch = Batch {
                     id: batch_id,
-                    buf: complete_part.to_vec(),
+                    buf: buffer[..complete_len].to_vec(),
                     recs,
                 };
                 batch_id += 1;
@@ -302,8 +308,14 @@ pub(crate) fn worker_thread(
             let trimmed_seq = &seq[trimming_result.start_pos..trimming_result.end_pos];
             let trimmed_qual = &qual[trimming_result.start_pos..trimming_result.end_pos];
 
-            // Recompute stats for trimmed read (used for filtering) - SIMD accelerated
+            // Early length check - skip expensive stats computation for reads that are too short
             let trimmed_len = trimmed_seq.len();
+            if trimmed_len < min_len {
+                too_short += 1;
+                continue;
+            }
+
+            // Recompute stats for trimmed read (used for filtering) - SIMD accelerated
             let trimmed_stats =
                 simd::compute_stats(trimmed_seq, trimmed_qual, qualified_quality_phred);
             let trimmed_qsum = trimmed_stats.qsum;
@@ -313,11 +325,7 @@ pub(crate) fn worker_thread(
             let trimmed_gc = trimmed_stats.gc;
             let unqualified_count = trimmed_stats.unqualified;
 
-            // Apply filters on TRIMMED read
-            if trimmed_len < min_len {
-                too_short += 1;
-                continue;
-            }
+            // Apply remaining filters on TRIMMED read
 
             if trimmed_ncnt > n_limit {
                 too_many_n += 1;
