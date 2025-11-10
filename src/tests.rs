@@ -209,6 +209,7 @@ fn test_trim_read_no_trimming() {
         enable_poly_g: false,
         enable_poly_x: false,
         poly_min_len: 10,
+        adapter_config: crate::adapter::AdapterConfig::new(),
     };
 
     let result = trim_read(seq, qual, &config);
@@ -232,6 +233,7 @@ fn test_trim_read_fixed_trimming() {
         enable_poly_g: false,
         enable_poly_x: false,
         poly_min_len: 10,
+        adapter_config: crate::adapter::AdapterConfig::new(),
     };
 
     let result = trim_read(seq, qual, &config);
@@ -255,6 +257,7 @@ fn test_trim_read_quality_trimming() {
         enable_poly_g: false,
         enable_poly_x: false,
         poly_min_len: 10,
+        adapter_config: crate::adapter::AdapterConfig::new(),
     };
 
     let result = trim_read(seq, qual, &config);
@@ -281,6 +284,7 @@ fn test_trim_read_poly_g_trimming() {
         enable_poly_g: true,
         enable_poly_x: false,
         poly_min_len: 10,
+        adapter_config: crate::adapter::AdapterConfig::new(),
     };
 
     let result = trim_read(seq, qual, &config);
@@ -305,6 +309,7 @@ fn test_trim_read_poly_x_trimming() {
         enable_poly_g: false,
         enable_poly_x: true,
         poly_min_len: 10,
+        adapter_config: crate::adapter::AdapterConfig::new(),
     };
 
     let result = trim_read(seq, qual, &config);
@@ -330,6 +335,7 @@ fn test_trim_read_combined_trimming() {
         enable_poly_g: true,
         enable_poly_x: false,
         poly_min_len: 10,
+        adapter_config: crate::adapter::AdapterConfig::new(),
     };
 
     let result = trim_read(seq, qual, &config);
@@ -355,6 +361,7 @@ fn test_trim_read_trim_entire_read() {
         enable_poly_g: true,
         enable_poly_x: false,
         poly_min_len: 10,
+        adapter_config: crate::adapter::AdapterConfig::new(),
     };
 
     let result = trim_read(seq, qual, &config);
@@ -428,6 +435,7 @@ fn test_trimming_config_disabled() {
         enable_poly_g: false,
         enable_poly_x: false,
         poly_min_len: 10,
+        adapter_config: crate::adapter::AdapterConfig::new(),
     };
 
     assert!(!config.is_enabled(), "Config should be disabled");
@@ -446,6 +454,7 @@ fn test_trimming_config_enabled_quality() {
         enable_poly_g: false,
         enable_poly_x: false,
         poly_min_len: 10,
+        adapter_config: crate::adapter::AdapterConfig::new(),
     };
 
     assert!(config.is_enabled(), "Config should be enabled");
@@ -464,6 +473,7 @@ fn test_trimming_config_enabled_fixed() {
         enable_poly_g: false,
         enable_poly_x: false,
         poly_min_len: 10,
+        adapter_config: crate::adapter::AdapterConfig::new(),
     };
 
     assert!(config.is_enabled(), "Config should be enabled");
@@ -482,6 +492,7 @@ fn test_trimming_config_enabled_poly() {
         enable_poly_g: true,
         enable_poly_x: false,
         poly_min_len: 10,
+        adapter_config: crate::adapter::AdapterConfig::new(),
     };
 
     assert!(config.is_enabled(), "Config should be enabled");

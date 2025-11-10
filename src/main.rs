@@ -12,6 +12,7 @@ use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::thread;
 
+mod adapter;
 mod io;
 mod kmer;
 mod pipeline;
@@ -37,6 +38,26 @@ struct Args {
     /// Output FASTQ file (use '-' for stdout, .gz extension enables compression)
     #[arg(short = 'o', long)]
     output: String,
+
+    /// Read2 input file (paired-end mode)
+    #[arg(short = 'I', long = "in2")]
+    input2: Option<String>,
+
+    /// Read2 output file (paired-end mode)
+    #[arg(short = 'O', long = "out2")]
+    output2: Option<String>,
+
+    /// Output file for unpaired read1
+    #[arg(long)]
+    unpaired1: Option<String>,
+
+    /// Output file for unpaired read2
+    #[arg(long)]
+    unpaired2: Option<String>,
+
+    /// Input is interleaved paired-end
+    #[arg(long)]
+    interleaved_in: bool,
 
     /// Minimum length required (default: 15)
     #[arg(short = 'l', long, default_value = "15")]
@@ -119,6 +140,22 @@ struct Args {
     #[arg(long, default_value = "0")]
     trim_tail: usize,
 
+    /// Trim N bases from front for read1 (fastp compatibility)
+    #[arg(short = 'f', long = "trim_front1", default_value = "0")]
+    trim_front1: usize,
+
+    /// Trim N bases from tail for read1 (fastp compatibility)
+    #[arg(long = "trim_tail1", default_value = "0")]
+    trim_tail1: usize,
+
+    /// Trim N bases from front for read2 (fastp compatibility)
+    #[arg(short = 'F', long = "trim_front2", default_value = "0")]
+    trim_front2: usize,
+
+    /// Trim N bases from tail for read2 (fastp compatibility)
+    #[arg(short = 'T', long = "trim_tail2", default_value = "0")]
+    trim_tail2: usize,
+
     /// Enable polyG tail trimming
     #[arg(long)]
     trim_poly_g: bool,
@@ -135,25 +172,274 @@ struct Args {
     #[arg(long, default_value = "10")]
     poly_g_min_len: usize,
 
-    /// Disable adapter trimming (no-op for compatibility - adapters not implemented)
+    /// Disable adapter trimming
     #[arg(short = 'A', long)]
     disable_adapter_trimming: bool,
+
+    /// Adapter sequence for read1 (auto-use Illumina TruSeq if not specified)
+    #[arg(short = 'a', long = "adapter_sequence")]
+    adapter_sequence: Option<String>,
+
+    /// Adapter sequence for read2
+    #[arg(long = "adapter_sequence_r2")]
+    adapter_sequence_r2: Option<String>,
+
+    /// Enable adapter auto-detection for paired-end (use PE overlap)
+    #[arg(long = "detect_adapter_for_pe")]
+    detect_adapter_for_pe: bool,
 }
 
 // Helper function to create TrimmingConfig from CLI args
 fn create_trimming_config(args: &Args) -> TrimmingConfig {
+    use crate::adapter::{AdapterConfig, adapters};
+
+    // Create adapter configuration
+    let mut adapter_config = AdapterConfig::new();
+
+    if !args.disable_adapter_trimming {
+        // Only enable adapter trimming if user explicitly specifies adapters
+        // fastp uses auto-detection by default, which we haven't implemented yet
+        // So we only trim when adapters are explicitly provided
+        if let Some(ref seq) = args.adapter_sequence {
+            adapter_config.adapter_seq = Some(seq.as_bytes().to_vec());
+        }
+
+        if let Some(ref seq) = args.adapter_sequence_r2 {
+            adapter_config.adapter_seq_r2 = Some(seq.as_bytes().to_vec());
+        }
+
+        adapter_config.detect_adapter_for_pe = args.detect_adapter_for_pe;
+    }
+
+    // Determine trim values - prefer read-specific args, fall back to generic
+    let trim_front = if args.trim_front1 > 0 {
+        args.trim_front1
+    } else {
+        args.trim_front
+    };
+    let trim_tail = if args.trim_tail1 > 0 {
+        args.trim_tail1
+    } else {
+        args.trim_tail
+    };
+
     TrimmingConfig {
         enable_trim_front: args.cut_front && args.cut_mean_quality > 0,
         enable_trim_tail: args.cut_tail && args.cut_mean_quality > 0 && !args.disable_trim_tail,
         cut_mean_quality: args.cut_mean_quality,
         cut_window_size: args.cut_window_size,
-        trim_front_bases: args.trim_front,
-        trim_tail_bases: args.trim_tail,
+        trim_front_bases: trim_front,
+        trim_tail_bases: trim_tail,
         max_len: args.max_len,
         enable_poly_g: args.trim_poly_g && !args.disable_trim_poly_g,
         enable_poly_x: args.trim_poly_x,
         poly_min_len: args.poly_g_min_len,
+        adapter_config,
     }
+}
+
+// Helper function to create TrimmingConfig for read2 in paired-end mode
+fn create_trimming_config_r2(args: &Args) -> TrimmingConfig {
+    use crate::adapter::AdapterConfig;
+
+    // Create adapter configuration for R2
+    let mut adapter_config = AdapterConfig::new();
+
+    if !args.disable_adapter_trimming {
+        // For R2, use adapter_seq_r2 if specified
+        if let Some(ref seq) = args.adapter_sequence_r2 {
+            adapter_config.adapter_seq = Some(seq.as_bytes().to_vec());
+        } else if let Some(ref seq) = args.adapter_sequence {
+            // Fall back to R1 adapter if R2 not specified
+            adapter_config.adapter_seq = Some(seq.as_bytes().to_vec());
+        }
+
+        adapter_config.detect_adapter_for_pe = args.detect_adapter_for_pe;
+    }
+
+    // Determine trim values for R2
+    // Per fastp docs: "If not specified, it will follow read1's settings"
+    let trim_front = if args.trim_front2 > 0 {
+        args.trim_front2
+    } else if args.trim_front1 > 0 {
+        args.trim_front1
+    } else {
+        args.trim_front
+    };
+
+    let trim_tail = if args.trim_tail2 > 0 {
+        args.trim_tail2
+    } else if args.trim_tail1 > 0 {
+        args.trim_tail1
+    } else {
+        args.trim_tail
+    };
+
+    TrimmingConfig {
+        enable_trim_front: args.cut_front && args.cut_mean_quality > 0,
+        enable_trim_tail: args.cut_tail && args.cut_mean_quality > 0 && !args.disable_trim_tail,
+        cut_mean_quality: args.cut_mean_quality,
+        cut_window_size: args.cut_window_size,
+        trim_front_bases: trim_front,
+        trim_tail_bases: trim_tail,
+        max_len: args.max_len,
+        enable_poly_g: args.trim_poly_g && !args.disable_trim_poly_g,
+        enable_poly_x: args.trim_poly_x,
+        poly_min_len: args.poly_g_min_len,
+        adapter_config,
+    }
+}
+
+// Helper function to build and write paired-end report
+fn build_and_write_paired_end_report(args: &Args, pe_acc: PairedEndAccumulator) -> Result<()> {
+    let before_stats_r1 = pe_acc.before_r1.to_read_stats();
+    let after_stats_r1 = pe_acc.after_r1.to_read_stats();
+    let before_stats_r2 = pe_acc.before_r2.to_read_stats();
+    let after_stats_r2 = pe_acc.after_r2.to_read_stats();
+
+    let quality_curves_r1 = pe_acc.pos_r1.to_quality_curves();
+    let quality_curves_r2 = pe_acc.pos_r2.to_quality_curves();
+    let kmer_map_r1 = pe_acc.kmer_table_to_map_r1();
+    let kmer_map_r2 = pe_acc.kmer_table_to_map_r2();
+
+    // Calculate combined before/after stats for summary
+    let combined_before = ReadStats {
+        // Count both R1 and R2 reads to match fastp's behavior
+        total_reads: before_stats_r1.total_reads + before_stats_r2.total_reads,
+        total_bases: before_stats_r1.total_bases + before_stats_r2.total_bases,
+        q20_bases: before_stats_r1.q20_bases + before_stats_r2.q20_bases,
+        q30_bases: before_stats_r1.q30_bases + before_stats_r2.q30_bases,
+        q20_rate: if before_stats_r1.total_bases + before_stats_r2.total_bases > 0 {
+            (before_stats_r1.q20_bases + before_stats_r2.q20_bases) as f64
+                / (before_stats_r1.total_bases + before_stats_r2.total_bases) as f64
+        } else {
+            0.0
+        },
+        q30_rate: if before_stats_r1.total_bases + before_stats_r2.total_bases > 0 {
+            (before_stats_r1.q30_bases + before_stats_r2.q30_bases) as f64
+                / (before_stats_r1.total_bases + before_stats_r2.total_bases) as f64
+        } else {
+            0.0
+        },
+        read1_mean_length: if before_stats_r1.total_reads + before_stats_r2.total_reads > 0 {
+            (before_stats_r1.total_bases + before_stats_r2.total_bases)
+                / (before_stats_r1.total_reads + before_stats_r2.total_reads)
+        } else {
+            0
+        },
+        gc_content: if before_stats_r1.total_bases + before_stats_r2.total_bases > 0 {
+            (before_stats_r1.gc_content * before_stats_r1.total_bases as f64
+                + before_stats_r2.gc_content * before_stats_r2.total_bases as f64)
+                / (before_stats_r1.total_bases + before_stats_r2.total_bases) as f64
+        } else {
+            0.0
+        },
+    };
+
+    let combined_after = ReadStats {
+        // Count both R1 and R2 reads to match fastp's behavior
+        total_reads: after_stats_r1.total_reads + after_stats_r2.total_reads,
+        total_bases: after_stats_r1.total_bases + after_stats_r2.total_bases,
+        q20_bases: after_stats_r1.q20_bases + after_stats_r2.q20_bases,
+        q30_bases: after_stats_r1.q30_bases + after_stats_r2.q30_bases,
+        q20_rate: if after_stats_r1.total_bases + after_stats_r2.total_bases > 0 {
+            (after_stats_r1.q20_bases + after_stats_r2.q20_bases) as f64
+                / (after_stats_r1.total_bases + after_stats_r2.total_bases) as f64
+        } else {
+            0.0
+        },
+        q30_rate: if after_stats_r1.total_bases + after_stats_r2.total_bases > 0 {
+            (after_stats_r1.q30_bases + after_stats_r2.q30_bases) as f64
+                / (after_stats_r1.total_bases + after_stats_r2.total_bases) as f64
+        } else {
+            0.0
+        },
+        read1_mean_length: if after_stats_r1.total_reads + after_stats_r2.total_reads > 0 {
+            (after_stats_r1.total_bases + after_stats_r2.total_bases)
+                / (after_stats_r1.total_reads + after_stats_r2.total_reads)
+        } else {
+            0
+        },
+        gc_content: if after_stats_r1.total_bases + after_stats_r2.total_bases > 0 {
+            (after_stats_r1.gc_content * after_stats_r1.total_bases as f64
+                + after_stats_r2.gc_content * after_stats_r2.total_bases as f64)
+                / (after_stats_r1.total_bases + after_stats_r2.total_bases) as f64
+        } else {
+            0.0
+        },
+    };
+
+    let report = FastpReport {
+        summary: Summary {
+            fastp_version: env!("CARGO_PKG_VERSION").to_string(),
+            sequencing: format!(
+                "paired end ({} cycles + {} cycles)",
+                pe_acc.max_cycle_r1, pe_acc.max_cycle_r2
+            ),
+            before_filtering: combined_before,
+            after_filtering: combined_after,
+        },
+        filtering_result: FilteringResult {
+            // Count both R1 and R2 reads to match fastp's behavior
+            passed_filter_reads: pe_acc.after_r1.total_reads + pe_acc.after_r2.total_reads,
+            low_quality_reads: pe_acc.low_quality,
+            too_many_n_reads: pe_acc.too_many_n,
+            too_short_reads: pe_acc.too_short,
+            too_long_reads: 0,
+        },
+        read1_before_filtering: DetailedReadStats {
+            total_reads: before_stats_r1.total_reads,
+            total_bases: before_stats_r1.total_bases,
+            q20_bases: before_stats_r1.q20_bases,
+            q30_bases: before_stats_r1.q30_bases,
+            quality_curves: quality_curves_r1,
+            kmer_count: kmer_map_r1,
+        },
+        read2_before_filtering: Some(DetailedReadStats {
+            total_reads: before_stats_r2.total_reads,
+            total_bases: before_stats_r2.total_bases,
+            q20_bases: before_stats_r2.q20_bases,
+            q30_bases: before_stats_r2.q30_bases,
+            quality_curves: quality_curves_r2,
+            kmer_count: kmer_map_r2,
+        }),
+        read1_after_filtering: None,
+        read2_after_filtering: None,
+    };
+
+    // Write JSON report
+    match args.stats_format.as_str() {
+        "off" => {
+            // Skip JSON output
+        }
+        "compact" => {
+            let json_file = File::create(&args.json)
+                .context(format!("Failed to create JSON file: {}", args.json))?;
+            let mut buf_writer = BufWriter::with_capacity(256 * 1024, json_file);
+            serde_json::to_writer(&mut buf_writer, &report)?;
+        }
+        "pretty" => {
+            let json_file = File::create(&args.json)
+                .context(format!("Failed to create JSON file: {}", args.json))?;
+            let mut buf_writer = BufWriter::with_capacity(256 * 1024, json_file);
+            serde_json::to_writer_pretty(&mut buf_writer, &report)?;
+        }
+        "jsonl" => {
+            let json_file = File::create(&args.json)
+                .context(format!("Failed to create JSON file: {}", args.json))?;
+            let mut buf_writer = BufWriter::with_capacity(256 * 1024, json_file);
+            serde_json::to_writer(&mut buf_writer, &report)?;
+            writeln!(buf_writer)?;
+        }
+        _ => {
+            anyhow::bail!(
+                "Invalid stats format: {}. Use 'compact', 'pretty', 'off', or 'jsonl'",
+                args.stats_format
+            );
+        }
+    }
+
+    Ok(())
 }
 
 // MAIN FUNCTION
@@ -171,12 +457,79 @@ fn create_trimming_config(args: &Args) -> TrimmingConfig {
 fn main() -> Result<()> {
     let args = Args::parse();
 
+    // Determine if paired-end mode
+    let is_paired_end = args.input2.is_some() || args.interleaved_in;
+
+    // Validate paired-end arguments
+    if is_paired_end {
+        if args.interleaved_in {
+            anyhow::bail!("Interleaved input is not yet implemented");
+        }
+        if args.input2.is_none() {
+            anyhow::bail!("Paired-end mode requires -I/--in2 for read2 input");
+        }
+        if args.output2.is_none() {
+            anyhow::bail!("Paired-end mode requires -O/--out2 for read2 output");
+        }
+    }
+
     // Determine number of threads
     let num_threads = args.threads.unwrap_or_else(num_cpus::get);
 
     // Create trimming configuration from CLI args
-    let trimming_config = create_trimming_config(&args);
+    let mut trimming_config = create_trimming_config(&args);
 
+    // Process based on mode (single-end or paired-end)
+    if is_paired_end {
+        // PAIRED-END MODE
+        if num_threads > 1 {
+            anyhow::bail!(
+                "Multi-threading for paired-end mode is not yet implemented. Please use -t 1"
+            );
+        }
+
+        // Create separate trimming configs for R1 and R2
+        let mut trimming_config_r1 = trimming_config;
+        let mut trimming_config_r2 = create_trimming_config_r2(&args);
+
+        // Apply fastp's undocumented default: trim_tail=1 for paired-end mode
+        // (only if user didn't explicitly set any tail trimming)
+        if args.trim_tail == 0 && args.trim_tail1 == 0 {
+            trimming_config_r1.trim_tail_bases = 1;
+        }
+        if args.trim_tail == 0 && args.trim_tail1 == 0 && args.trim_tail2 == 0 {
+            trimming_config_r2.trim_tail_bases = 1;
+        }
+
+        // Single-threaded paired-end processing
+        let reader1 = open_input(&args.input)?;
+        let reader2 = open_input(args.input2.as_ref().unwrap())?;
+        let mut writer1 = open_output(&args.output, args.compression_level)?;
+        let mut writer2 = open_output(args.output2.as_ref().unwrap(), args.compression_level)?;
+
+        let pe_acc = process_paired_fastq_stream(
+            reader1,
+            reader2,
+            &mut writer1,
+            &mut writer2,
+            args.length_required,
+            args.n_base_limit,
+            args.qualified_quality_phred,
+            args.unqualified_percent_limit,
+            args.average_qual,
+            &trimming_config_r1,
+            &trimming_config_r2,
+        )?;
+
+        writer1.finish()?;
+        writer2.finish()?;
+
+        // Build paired-end report
+        build_and_write_paired_end_report(&args, pe_acc)?;
+        return Ok(());
+    }
+
+    // SINGLE-END MODE
     let acc = if num_threads == 1 {
         // SINGLE-THREADED MODE: use streaming approach with new parser
         let reader = open_input(&args.input)?;
@@ -284,6 +637,9 @@ fn main() -> Result<()> {
             quality_curves,
             kmer_count: kmer_map,
         },
+        read2_before_filtering: None,
+        read1_after_filtering: None,
+        read2_after_filtering: None,
     };
 
     // Write JSON report based on stats_format

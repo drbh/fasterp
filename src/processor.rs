@@ -176,6 +176,26 @@ pub(crate) struct StreamAccumulator {
     pub max_cycle: usize,
 }
 
+/// Paired-end accumulator for streaming processing
+pub(crate) struct PairedEndAccumulator {
+    pub before_r1: SimpleStats,
+    pub before_r2: SimpleStats,
+    pub after_r1: SimpleStats,
+    pub after_r2: SimpleStats,
+    pub pos_r1: PositionStats,
+    pub pos_r2: PositionStats,
+    pub kmer_table_r1: [usize; 1024],
+    pub kmer_table_r2: [usize; 1024],
+
+    // Filtering counts
+    pub too_short: usize,
+    pub too_many_n: usize,
+    pub low_quality: usize,
+    pub invalid: usize,
+    pub max_cycle_r1: usize,
+    pub max_cycle_r2: usize,
+}
+
 impl StreamAccumulator {
     pub(crate) fn new() -> Self {
         Self {
@@ -425,6 +445,50 @@ impl StreamAccumulator {
     }
 }
 
+impl PairedEndAccumulator {
+    pub(crate) fn new() -> Self {
+        Self {
+            before_r1: SimpleStats::default(),
+            before_r2: SimpleStats::default(),
+            after_r1: SimpleStats::default(),
+            after_r2: SimpleStats::default(),
+            pos_r1: PositionStats::new(),
+            pos_r2: PositionStats::new(),
+            kmer_table_r1: [0; 1024],
+            kmer_table_r2: [0; 1024],
+            too_short: 0,
+            too_many_n: 0,
+            low_quality: 0,
+            invalid: 0,
+            max_cycle_r1: 0,
+            max_cycle_r2: 0,
+        }
+    }
+
+    /// Convert kmer tables to IndexMaps
+    pub(crate) fn kmer_table_to_map_r1(&self) -> IndexMap<String, usize> {
+        let mut map = IndexMap::new();
+        for code in 0..1024 {
+            map.insert(
+                crate::kmer::kmer_to_str(code).to_string(),
+                self.kmer_table_r1[code],
+            );
+        }
+        map
+    }
+
+    pub(crate) fn kmer_table_to_map_r2(&self) -> IndexMap<String, usize> {
+        let mut map = IndexMap::new();
+        for code in 0..1024 {
+            map.insert(
+                crate::kmer::kmer_to_str(code).to_string(),
+                self.kmer_table_r2[code],
+            );
+        }
+        map
+    }
+}
+
 /// Single-threaded streaming FASTQ processing
 ///
 /// Processes FASTQ records one-by-one with zero intermediate allocations.
@@ -461,4 +525,295 @@ pub(crate) fn process_fastq_stream<R: BufRead, W: Write>(
     }
 
     Ok(acc)
+}
+
+/// Paired-end streaming FASTQ processing
+///
+/// Processes two FASTQ files simultaneously, maintaining read pair synchronization.
+/// Read pairs pass/fail together - if either fails filtering, both are discarded.
+pub(crate) fn process_paired_fastq_stream<R1: BufRead, R2: BufRead, W1: Write, W2: Write>(
+    reader1: R1,
+    reader2: R2,
+    writer1: &mut W1,
+    writer2: &mut W2,
+    min_len: usize,
+    n_limit: usize,
+    qualified_quality_phred: u8,
+    unqualified_percent_limit: usize,
+    average_qual: u8,
+    trimming_config_r1: &TrimmingConfig,
+    trimming_config_r2: &TrimmingConfig,
+) -> Result<PairedEndAccumulator> {
+    let mut acc = PairedEndAccumulator::new();
+    let mut parser1 = FastqParser::new(reader1);
+    let mut parser2 = FastqParser::new(reader2);
+
+    loop {
+        let record1 = parser1.next_record()?;
+        let record2 = parser2.next_record()?;
+
+        // Check for EOF - both files must end at the same time
+        match (record1, record2) {
+            (None, None) => break, // Both files ended - normal termination
+            (Some(_), None) | (None, Some(_)) => {
+                anyhow::bail!("Read1 and Read2 files have different numbers of records");
+            }
+            (Some((header1, seq1, plus1, qual1)), Some((header2, seq2, plus2, qual2))) => {
+                // Validate both records
+                if seq1.len() != qual1.len() || seq2.len() != qual2.len() {
+                    acc.invalid += 1;
+                    continue;
+                }
+
+                // Track max cycle lengths
+                if seq1.len() > acc.max_cycle_r1 {
+                    acc.max_cycle_r1 = seq1.len();
+                }
+                if seq2.len() > acc.max_cycle_r2 {
+                    acc.max_cycle_r2 = seq2.len();
+                }
+
+                // Process read1 statistics (before filtering)
+                let stats1 =
+                    process_read_stats(&seq1, &qual1, &mut acc.pos_r1, &mut acc.kmer_table_r1)?;
+                acc.before_r1
+                    .add(seq1.len(), stats1.q20, stats1.q30, stats1.gc);
+
+                // Process read2 statistics (before filtering)
+                let stats2 =
+                    process_read_stats(&seq2, &qual2, &mut acc.pos_r2, &mut acc.kmer_table_r2)?;
+                acc.before_r2
+                    .add(seq2.len(), stats2.q20, stats2.q30, stats2.gc);
+
+                // Apply trimming to both reads
+                let trim_result1 = if trimming_config_r1.is_enabled() {
+                    trim_read(&seq1, &qual1, trimming_config_r1)
+                } else {
+                    TrimmingResult {
+                        start_pos: 0,
+                        end_pos: seq1.len(),
+                        poly_g_trimmed: 0,
+                        poly_x_trimmed: 0,
+                    }
+                };
+
+                let trim_result2 = if trimming_config_r2.is_enabled() {
+                    // Use adapter_seq_r2 for read2 if available
+                    let adapter_r2 = trimming_config_r2.adapter_config.adapter_seq_r2.as_deref();
+                    trim_read_with_adapter(&seq2, &qual2, trimming_config_r2, adapter_r2)
+                } else {
+                    TrimmingResult {
+                        start_pos: 0,
+                        end_pos: seq2.len(),
+                        poly_g_trimmed: 0,
+                        poly_x_trimmed: 0,
+                    }
+                };
+
+                let trimmed_seq1 = &seq1[trim_result1.start_pos..trim_result1.end_pos];
+                let trimmed_qual1 = &qual1[trim_result1.start_pos..trim_result1.end_pos];
+                let trimmed_seq2 = &seq2[trim_result2.start_pos..trim_result2.end_pos];
+                let trimmed_qual2 = &qual2[trim_result2.start_pos..trim_result2.end_pos];
+
+                // Check if either read is too short
+                if trimmed_seq1.len() < min_len || trimmed_seq2.len() < min_len {
+                    acc.too_short += 1;
+                    continue;
+                }
+
+                // Recompute stats for trimmed reads
+                let trimmed_stats1 =
+                    simd::compute_stats(trimmed_seq1, trimmed_qual1, qualified_quality_phred);
+                let trimmed_stats2 =
+                    simd::compute_stats(trimmed_seq2, trimmed_qual2, qualified_quality_phred);
+
+                // Check N-base filter for both reads
+                if trimmed_stats1.ncnt > n_limit || trimmed_stats2.ncnt > n_limit {
+                    acc.too_many_n += 1;
+                    continue;
+                }
+
+                // Check unqualified percent for both reads
+                let mut fail_quality = false;
+                if qualified_quality_phred > 0 {
+                    if trimmed_seq1.len() > 0
+                        && 100 * trimmed_stats1.unqualified
+                            > unqualified_percent_limit * trimmed_seq1.len()
+                    {
+                        fail_quality = true;
+                    }
+                    if trimmed_seq2.len() > 0
+                        && 100 * trimmed_stats2.unqualified
+                            > unqualified_percent_limit * trimmed_seq2.len()
+                    {
+                        fail_quality = true;
+                    }
+                }
+
+                // Check average quality for both reads
+                if average_qual > 0 {
+                    if trimmed_seq1.len() > 0 {
+                        let mean_qual1 = trimmed_stats1.qsum as f64 / trimmed_seq1.len() as f64;
+                        if mean_qual1 < average_qual as f64 {
+                            fail_quality = true;
+                        }
+                    }
+                    if trimmed_seq2.len() > 0 {
+                        let mean_qual2 = trimmed_stats2.qsum as f64 / trimmed_seq2.len() as f64;
+                        if mean_qual2 < average_qual as f64 {
+                            fail_quality = true;
+                        }
+                    }
+                }
+
+                if fail_quality {
+                    acc.low_quality += 1;
+                    continue;
+                }
+
+                // Both reads passed - write them
+                writeln!(writer1, "{}", std::str::from_utf8(&header1)?)?;
+                writeln!(writer1, "{}", std::str::from_utf8(trimmed_seq1)?)?;
+                writeln!(writer1, "{}", std::str::from_utf8(&plus1)?)?;
+                writeln!(writer1, "{}", std::str::from_utf8(trimmed_qual1)?)?;
+
+                writeln!(writer2, "{}", std::str::from_utf8(&header2)?)?;
+                writeln!(writer2, "{}", std::str::from_utf8(trimmed_seq2)?)?;
+                writeln!(writer2, "{}", std::str::from_utf8(&plus2)?)?;
+                writeln!(writer2, "{}", std::str::from_utf8(trimmed_qual2)?)?;
+
+                // Update "after" stats
+                acc.after_r1.add(
+                    trimmed_seq1.len(),
+                    trimmed_stats1.q20,
+                    trimmed_stats1.q30,
+                    trimmed_stats1.gc,
+                );
+                acc.after_r2.add(
+                    trimmed_seq2.len(),
+                    trimmed_stats2.q20,
+                    trimmed_stats2.q30,
+                    trimmed_stats2.gc,
+                );
+            }
+        }
+    }
+
+    Ok(acc)
+}
+
+/// Helper function to process read statistics
+struct ReadStats {
+    q20: usize,
+    q30: usize,
+    gc: usize,
+}
+
+fn process_read_stats(
+    seq: &[u8],
+    qual: &[u8],
+    pos: &mut PositionStats,
+    kmer_table: &mut [usize; 1024],
+) -> Result<ReadStats> {
+    // Compute basic stats using SIMD if available
+    let stats = if simd::is_simd_available() {
+        let s = simd::compute_stats(seq, qual, 0);
+
+        pos.ensure_capacity(seq.len());
+
+        // SAFETY: We've validated seq.len() == qual.len(), and ensured capacity
+        unsafe {
+            let seq_ptr = seq.as_ptr();
+            let qual_ptr = qual.as_ptr();
+            let len = seq.len();
+
+            let total_sum_ptr = pos.total_sum.as_mut_ptr();
+            let total_cnt_ptr = pos.total_cnt.as_mut_ptr();
+            let base_sum_ptrs = [
+                pos.base_sum[0].as_mut_ptr(),
+                pos.base_sum[1].as_mut_ptr(),
+                pos.base_sum[2].as_mut_ptr(),
+                pos.base_sum[3].as_mut_ptr(),
+            ];
+            let base_cnt_ptrs = [
+                pos.base_cnt[0].as_mut_ptr(),
+                pos.base_cnt[1].as_mut_ptr(),
+                pos.base_cnt[2].as_mut_ptr(),
+                pos.base_cnt[3].as_mut_ptr(),
+            ];
+
+            util::loop_seq_qual_indexed(seq_ptr, qual_ptr, len, |i, b, q| {
+                let qval = (q - 33) as u64;
+                *total_sum_ptr.add(i) += qval;
+                *total_cnt_ptr.add(i) += 1;
+
+                if let Some(bi) = base_idx(b) {
+                    *base_sum_ptrs[bi].add(i) += qval;
+                    *base_cnt_ptrs[bi].add(i) += 1;
+                }
+            });
+        }
+
+        ReadStats {
+            q20: s.q20,
+            q30: s.q30,
+            gc: s.gc,
+        }
+    } else {
+        // Non-SIMD path
+        let mut q20 = 0usize;
+        let mut q30 = 0usize;
+        let mut gc = 0usize;
+
+        pos.ensure_capacity(seq.len());
+
+        unsafe {
+            let seq_ptr = seq.as_ptr();
+            let qual_ptr = qual.as_ptr();
+            let len = seq.len();
+
+            let total_sum_ptr = pos.total_sum.as_mut_ptr();
+            let total_cnt_ptr = pos.total_cnt.as_mut_ptr();
+            let base_sum_ptrs = [
+                pos.base_sum[0].as_mut_ptr(),
+                pos.base_sum[1].as_mut_ptr(),
+                pos.base_sum[2].as_mut_ptr(),
+                pos.base_sum[3].as_mut_ptr(),
+            ];
+            let base_cnt_ptrs = [
+                pos.base_cnt[0].as_mut_ptr(),
+                pos.base_cnt[1].as_mut_ptr(),
+                pos.base_cnt[2].as_mut_ptr(),
+                pos.base_cnt[3].as_mut_ptr(),
+            ];
+
+            util::loop_seq_qual_indexed(seq_ptr, qual_ptr, len, |i, b, q| {
+                let qval = (q - 33) as u32;
+                if q >= 53 {
+                    q20 += 1;
+                }
+                if q >= 63 {
+                    q30 += 1;
+                }
+                if b == b'G' || b == b'g' || b == b'C' || b == b'c' {
+                    gc += 1;
+                }
+
+                *total_sum_ptr.add(i) += qval as u64;
+                *total_cnt_ptr.add(i) += 1;
+
+                if let Some(bi) = base_idx(b) {
+                    *base_sum_ptrs[bi].add(i) += qval as u64;
+                    *base_cnt_ptrs[bi].add(i) += 1;
+                }
+            });
+        }
+
+        ReadStats { q20, q30, gc }
+    };
+
+    // K-mer counting
+    count_k5_2bit(seq, kmer_table);
+
+    Ok(stats)
 }

@@ -75,6 +75,12 @@ pub(crate) struct FastpReport {
     pub summary: Summary,
     pub filtering_result: FilteringResult,
     pub read1_before_filtering: DetailedReadStats,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub read2_before_filtering: Option<DetailedReadStats>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub read1_after_filtering: Option<DetailedReadStats>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub read2_after_filtering: Option<DetailedReadStats>,
 }
 
 /// Accumulator for per-position quality statistics
