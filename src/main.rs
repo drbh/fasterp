@@ -560,7 +560,7 @@ fn build_and_write_paired_end_report(
 
     let report = FasterpReport {
         summary: Summary {
-            fasterp_version: env!("CARGO_PKG_VERSION").to_string(),
+            fastp_version: env!("CARGO_PKG_VERSION").to_string(),
             sequencing: format!(
                 "paired end ({} cycles + {} cycles)",
                 pe_acc.max_cycle_r1, pe_acc.max_cycle_r2
@@ -1156,7 +1156,7 @@ fn main() -> Result<()> {
 
     let report = FasterpReport {
         summary: Summary {
-            fasterp_version: env!("CARGO_PKG_VERSION").to_string(),
+            fastp_version: env!("CARGO_PKG_VERSION").to_string(),
             sequencing: format!("single end ({} cycles)", acc.max_cycle),
             before_filtering: before_stats.clone(),
             after_filtering: after_stats.clone(),
