@@ -31,7 +31,7 @@ jobs:
     - name: Install dependencies
       run: |
         # Install nucgen for test data generation
-        cargo install nucgen
+        cargo install nucgen --force
         nucgen --version
 
         # Install fastp for comparison
