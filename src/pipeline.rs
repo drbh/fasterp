@@ -41,11 +41,11 @@ pub(crate) struct Batch {
 ///
 /// Zero-copy: stores ranges instead of copying bytes
 pub(crate) struct RecordPiece {
-    pub buf: Arc<Vec<u8>>,     // Shared buffer reference
-    pub header: Range<usize>,  // Header range
-    pub seq: Range<usize>,     // Sequence range
-    pub plus: Range<usize>,    // Plus line range
-    pub qual: Range<usize>,    // Quality range
+    pub buf: Arc<Vec<u8>>,    // Shared buffer reference
+    pub header: Range<usize>, // Header range
+    pub seq: Range<usize>,    // Sequence range
+    pub plus: Range<usize>,   // Plus line range
+    pub qual: Range<usize>,   // Quality range
 }
 
 /// Result from a worker thread (zero-copy version)
@@ -375,7 +375,7 @@ pub(crate) fn worker_thread(
             let trimmed_qual_end = q_start + trimming_result.end_pos;
 
             pieces.push(RecordPiece {
-                buf: Arc::clone(&batch.buf), // Clone Arc, not the buffer!
+                buf: Arc::clone(&batch.buf),  // Clone Arc, not the buffer!
                 header: h_start..s_start - 1, // Exclude newline
                 seq: trimmed_seq_start..trimmed_seq_end,
                 plus: p_start..p_end,
@@ -456,8 +456,9 @@ pub(crate) fn merger_thread(
                             if n == 0 {
                                 return Err(std::io::Error::new(
                                     std::io::ErrorKind::WriteZero,
-                                    "failed to write vectored"
-                                ).into());
+                                    "failed to write vectored",
+                                )
+                                .into());
                             }
                             written += n;
                             // Advance the slices
@@ -471,7 +472,7 @@ pub(crate) fn merger_thread(
                                     let data = unsafe {
                                         std::slice::from_raw_parts(
                                             slice.as_ptr().add(skip),
-                                            len - skip
+                                            len - skip,
                                         )
                                     };
                                     *slice = IoSlice::new(data);

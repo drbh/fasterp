@@ -233,20 +233,37 @@ impl StreamAccumulator {
             self.pos.ensure_capacity(seq.len());
 
             // SAFETY: We've validated seq.len() == qual.len() above, and ensured capacity
-            // Use unsafe loop to eliminate bounds checking in hot path
+            // Extract raw pointers ONCE before loop to avoid repeated Vec::as_mut_slice calls
             unsafe {
                 let seq_ptr = seq.as_ptr();
                 let qual_ptr = qual.as_ptr();
                 let len = seq.len();
 
+                // Get raw pointers to all position stat arrays (ONCE, not per iteration!)
+                let total_sum_ptr = self.pos.total_sum.as_mut_ptr();
+                let total_cnt_ptr = self.pos.total_cnt.as_mut_ptr();
+                let base_sum_ptrs = [
+                    self.pos.base_sum[0].as_mut_ptr(),
+                    self.pos.base_sum[1].as_mut_ptr(),
+                    self.pos.base_sum[2].as_mut_ptr(),
+                    self.pos.base_sum[3].as_mut_ptr(),
+                ];
+                let base_cnt_ptrs = [
+                    self.pos.base_cnt[0].as_mut_ptr(),
+                    self.pos.base_cnt[1].as_mut_ptr(),
+                    self.pos.base_cnt[2].as_mut_ptr(),
+                    self.pos.base_cnt[3].as_mut_ptr(),
+                ];
+
                 util::loop_seq_qual_indexed(seq_ptr, qual_ptr, len, |i, b, q| {
                     let qval = (q - 33) as u64;
-                    *self.pos.total_sum.get_unchecked_mut(i) += qval;
-                    *self.pos.total_cnt.get_unchecked_mut(i) += 1;
+                    // Direct pointer arithmetic - no Vec::as_mut_slice overhead!
+                    *total_sum_ptr.add(i) += qval;
+                    *total_cnt_ptr.add(i) += 1;
 
                     if let Some(bi) = base_idx(b) {
-                        *self.pos.base_sum.get_unchecked_mut(bi).get_unchecked_mut(i) += qval;
-                        *self.pos.base_cnt.get_unchecked_mut(bi).get_unchecked_mut(i) += 1;
+                        *base_sum_ptrs[bi].add(i) += qval;
+                        *base_cnt_ptrs[bi].add(i) += 1;
                     }
                 });
             }
@@ -263,11 +280,27 @@ impl StreamAccumulator {
             self.pos.ensure_capacity(seq.len());
 
             // SAFETY: We've validated seq.len() == qual.len() above, and ensured capacity
-            // Use unsafe loop to eliminate bounds checking in hot path
+            // Extract raw pointers ONCE before loop to avoid repeated Vec::as_mut_slice calls
             unsafe {
                 let seq_ptr = seq.as_ptr();
                 let qual_ptr = qual.as_ptr();
                 let len = seq.len();
+
+                // Get raw pointers to all position stat arrays (ONCE, not per iteration!)
+                let total_sum_ptr = self.pos.total_sum.as_mut_ptr();
+                let total_cnt_ptr = self.pos.total_cnt.as_mut_ptr();
+                let base_sum_ptrs = [
+                    self.pos.base_sum[0].as_mut_ptr(),
+                    self.pos.base_sum[1].as_mut_ptr(),
+                    self.pos.base_sum[2].as_mut_ptr(),
+                    self.pos.base_sum[3].as_mut_ptr(),
+                ];
+                let base_cnt_ptrs = [
+                    self.pos.base_cnt[0].as_mut_ptr(),
+                    self.pos.base_cnt[1].as_mut_ptr(),
+                    self.pos.base_cnt[2].as_mut_ptr(),
+                    self.pos.base_cnt[3].as_mut_ptr(),
+                ];
 
                 util::loop_seq_qual_indexed(seq_ptr, qual_ptr, len, |i, b, q| {
                     let qval = (q - 33) as u32;
@@ -285,13 +318,13 @@ impl StreamAccumulator {
                         gc += 1;
                     }
 
-                    *self.pos.total_sum.get_unchecked_mut(i) += qval as u64;
-                    *self.pos.total_cnt.get_unchecked_mut(i) += 1;
+                    // Direct pointer arithmetic - no Vec::as_mut_slice overhead!
+                    *total_sum_ptr.add(i) += qval as u64;
+                    *total_cnt_ptr.add(i) += 1;
 
                     if let Some(bi) = base_idx(b) {
-                        *self.pos.base_sum.get_unchecked_mut(bi).get_unchecked_mut(i) +=
-                            qval as u64;
-                        *self.pos.base_cnt.get_unchecked_mut(bi).get_unchecked_mut(i) += 1;
+                        *base_sum_ptrs[bi].add(i) += qval as u64;
+                        *base_cnt_ptrs[bi].add(i) += 1;
                     }
                 });
             }
