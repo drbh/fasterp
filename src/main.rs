@@ -490,17 +490,11 @@ fn main() -> Result<()> {
     let num_threads = args.threads.unwrap_or_else(num_cpus::get);
 
     // Create trimming configuration from CLI args
-    let mut trimming_config = create_trimming_config(&args);
+    let trimming_config = create_trimming_config(&args);
 
     // Process based on mode (single-end or paired-end)
     if is_paired_end {
         // PAIRED-END MODE
-        if num_threads > 1 {
-            anyhow::bail!(
-                "Multi-threading for paired-end mode is not yet implemented. Please use -t 1"
-            );
-        }
-
         // Create separate trimming configs for R1 and R2
         let mut trimming_config_r1 = trimming_config;
         let mut trimming_config_r2 = create_trimming_config_r2(&args);
@@ -514,33 +508,121 @@ fn main() -> Result<()> {
             trimming_config_r2.trim_tail_bases = 1;
         }
 
-        // Single-threaded paired-end processing
-        let reader1 = open_input(&args.input)?;
-        let reader2 = open_input(args.input2.as_ref().unwrap())?;
-        let mut writer1 = open_output(&args.output, args.compression_level)?;
-        let mut writer2 = open_output(args.output2.as_ref().unwrap(), args.compression_level)?;
-
         // Apply disable_length_filtering flag
-        let min_len = if args.disable_length_filtering { 0 } else { args.length_required };
+        let min_len = if args.disable_length_filtering {
+            0
+        } else {
+            args.length_required
+        };
 
-        let pe_acc = process_paired_fastq_stream(
-            reader1,
-            reader2,
-            &mut writer1,
-            &mut writer2,
-            min_len,
-            args.n_base_limit,
-            args.qualified_quality_phred,
-            args.unqualified_percent_limit,
-            args.average_qual,
-            args.low_complexity_filter,
-            args.complexity_threshold,
-            &trimming_config_r1,
-            &trimming_config_r2,
-        )?;
+        let pe_acc = if num_threads == 1 {
+            // SINGLE-THREADED PAIRED-END MODE
+            let reader1 = open_input(&args.input)?;
+            let reader2 = open_input(args.input2.as_ref().unwrap())?;
+            let mut writer1 = open_output(&args.output, args.compression_level)?;
+            let mut writer2 = open_output(args.output2.as_ref().unwrap(), args.compression_level)?;
 
-        writer1.finish()?;
-        writer2.finish()?;
+            let pe_acc = process_paired_fastq_stream(
+                reader1,
+                reader2,
+                &mut writer1,
+                &mut writer2,
+                min_len,
+                args.n_base_limit,
+                args.qualified_quality_phred,
+                args.unqualified_percent_limit,
+                args.average_qual,
+                args.low_complexity_filter,
+                args.complexity_threshold,
+                &trimming_config_r1,
+                &trimming_config_r2,
+            )?;
+
+            writer1.finish()?;
+            writer2.finish()?;
+            pe_acc
+        } else {
+            // MULTI-THREADED PAIRED-END MODE
+            use crate::pipeline::{
+                PairedBatch, PairedWorkerResult, paired_merger_thread, paired_producer_thread,
+                paired_worker_thread,
+            };
+            use crossbeam_channel::bounded;
+
+            let backlog = args.max_backlog.unwrap_or(num_threads + 1);
+
+            // Create channels
+            let (batch_tx, batch_rx) = bounded::<Option<PairedBatch>>(backlog);
+            let (result_tx, result_rx) = bounded::<Option<PairedWorkerResult>>(backlog);
+
+            // Spawn producer thread
+            let input_path1 = args.input.clone();
+            let input_path2 = args.input2.as_ref().unwrap().clone();
+            let batch_bytes = args.batch_bytes;
+            let producer = thread::spawn(move || {
+                paired_producer_thread(input_path1, input_path2, batch_bytes, batch_tx)
+            });
+
+            // Spawn worker threads
+            let mut workers = Vec::new();
+            for _ in 0..num_threads {
+                let batch_rx_clone = batch_rx.clone();
+                let result_tx_clone = result_tx.clone();
+                let min_len_for_worker = min_len;
+                let n_limit = args.n_base_limit;
+                let qualified_qual = args.qualified_quality_phred;
+                let unqualified_pct = args.unqualified_percent_limit;
+                let avg_qual = args.average_qual;
+                let low_complexity = args.low_complexity_filter;
+                let complexity_thresh = args.complexity_threshold;
+                let no_kmer = args.no_kmer;
+                let trimming_config_r1_clone = trimming_config_r1.clone();
+                let trimming_config_r2_clone = trimming_config_r2.clone();
+
+                let worker = thread::spawn(move || {
+                    paired_worker_thread(
+                        batch_rx_clone,
+                        result_tx_clone,
+                        min_len_for_worker,
+                        n_limit,
+                        qualified_qual,
+                        unqualified_pct,
+                        avg_qual,
+                        low_complexity,
+                        complexity_thresh,
+                        no_kmer,
+                        trimming_config_r1_clone,
+                        trimming_config_r2_clone,
+                    )
+                });
+                workers.push(worker);
+            }
+
+            // Drop original senders so merger knows when all workers are done
+            drop(batch_rx);
+            drop(result_tx);
+
+            // Spawn merger thread
+            let output_path1 = args.output.clone();
+            let output_path2 = args.output2.as_ref().unwrap().clone();
+            let compression_level = args.compression_level;
+            let merger = thread::spawn(move || {
+                paired_merger_thread(
+                    result_rx,
+                    output_path1,
+                    output_path2,
+                    num_threads,
+                    compression_level,
+                )
+            });
+
+            // Wait for all threads
+            producer.join().unwrap()?;
+            for worker in workers {
+                worker.join().unwrap();
+            }
+            merger.join().unwrap()?
+        };
 
         // Build paired-end report
         build_and_write_paired_end_report(&args, pe_acc)?;
@@ -549,7 +631,11 @@ fn main() -> Result<()> {
 
     // SINGLE-END MODE
     // Apply disable_length_filtering flag
-    let min_len = if args.disable_length_filtering { 0 } else { args.length_required };
+    let min_len = if args.disable_length_filtering {
+        0
+    } else {
+        args.length_required
+    };
 
     let acc = if num_threads == 1 {
         // SINGLE-THREADED MODE: use streaming approach with new parser

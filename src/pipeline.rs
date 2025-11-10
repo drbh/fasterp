@@ -90,6 +90,53 @@ pub(crate) struct WorkerResult {
     pub invalid: usize,
 }
 
+// ============================================================================
+// PAIRED-END MULTI-THREADING STRUCTURES
+// ============================================================================
+
+/// A batch of paired-end FASTQ records
+///
+/// Contains raw bytes and record positions for both R1 and R2
+/// Uses Arc for zero-copy sharing between workers
+#[derive(Clone)]
+pub(crate) struct PairedBatch {
+    pub id: u64,
+    pub buf_r1: Arc<Vec<u8>>,     // R1 shared buffer
+    pub buf_r2: Arc<Vec<u8>>,     // R2 shared buffer
+    pub recs_r1: Vec<[usize; 4]>, // R1 record positions
+    pub recs_r2: Vec<[usize; 4]>, // R2 record positions
+}
+
+/// A paired-end record represented as ranges into shared buffers
+///
+/// Zero-copy: stores ranges for both R1 and R2
+pub(crate) struct PairedRecordPiece {
+    pub r1: RecordPiece,
+    pub r2: RecordPiece,
+}
+
+/// Result from a paired-end worker thread
+pub(crate) struct PairedWorkerResult {
+    pub id: u64,
+    pub pieces: Vec<PairedRecordPiece>,
+    // R1 stats
+    pub before_r1: SimpleStats,
+    pub after_r1: SimpleStats,
+    pub pos_r1: PositionStats,
+    pub k5_r1: [usize; 1024],
+    // R2 stats
+    pub before_r2: SimpleStats,
+    pub after_r2: SimpleStats,
+    pub pos_r2: PositionStats,
+    pub k5_r2: [usize; 1024],
+    // Filter counts (shared - pairs pass/fail together)
+    pub too_short: usize,
+    pub too_many_n: usize,
+    pub low_quality: usize,
+    pub low_complexity: usize,
+    pub invalid: usize,
+}
+
 /// Producer thread: read blocks and parse into batches
 ///
 /// Reads large blocks (batch_bytes) from input, parses FASTQ records,
@@ -574,5 +621,705 @@ pub(crate) fn merger_thread(
     // Flush BufWriter and finish inner writer
     writer.flush()?;
     writer.into_inner().map_err(|e| e.into_error())?.finish()?;
+    Ok(acc)
+}
+
+// ============================================================================
+// PAIRED-END MULTI-THREADING PIPELINE
+// ============================================================================
+
+/// Paired-end producer thread: read both R1 and R2 simultaneously
+///
+/// Reads blocks from both input files, parses FASTQ records, and emits
+/// PairedBatch structures with synchronized record counts.
+pub(crate) fn paired_producer_thread(
+    input1_path: String,
+    input2_path: String,
+    batch_bytes: usize,
+    sender: Sender<Option<PairedBatch>>,
+) -> Result<()> {
+    let mut reader1 = crate::io::open_input(&input1_path)?;
+    let mut reader2 = crate::io::open_input(&input2_path)?;
+
+    let mut batch_id = 0u64;
+    let mut carryover1 = Vec::new();
+    let mut carryover2 = Vec::new();
+    let mut buffer1 = vec![0u8; batch_bytes];
+    let mut buffer2 = vec![0u8; batch_bytes];
+
+    loop {
+        // Read chunks from both files
+        let bytes_read1 = reader1.read(&mut buffer1)?;
+        let bytes_read2 = reader2.read(&mut buffer2)?;
+
+        // Prepend carryover for R1
+        let carryover_len1 = carryover1.len();
+        let actual_len1 = if carryover_len1 > 0 {
+            if carryover_len1 + bytes_read1 > buffer1.len() {
+                buffer1.resize(carryover_len1 + bytes_read1, 0);
+            }
+            buffer1.copy_within(0..bytes_read1, carryover_len1);
+            buffer1[..carryover_len1].copy_from_slice(&carryover1);
+            carryover1.clear();
+            carryover_len1 + bytes_read1
+        } else {
+            bytes_read1
+        };
+
+        // Prepend carryover for R2
+        let carryover_len2 = carryover2.len();
+        let actual_len2 = if carryover_len2 > 0 {
+            if carryover_len2 + bytes_read2 > buffer2.len() {
+                buffer2.resize(carryover_len2 + bytes_read2, 0);
+            }
+            buffer2.copy_within(0..bytes_read2, carryover_len2);
+            buffer2[..carryover_len2].copy_from_slice(&carryover2);
+            carryover2.clear();
+            carryover_len2 + bytes_read2
+        } else {
+            bytes_read2
+        };
+
+        // Check for EOF
+        if actual_len1 == 0 && actual_len2 == 0 {
+            break; // Both files ended and no carryover
+        }
+
+        // Verify both files have data (or both don't)
+        if (actual_len1 == 0) != (actual_len2 == 0) {
+            anyhow::bail!(
+                "Paired-end files are not synchronized: R1 has {} bytes, R2 has {} bytes",
+                actual_len1,
+                actual_len2
+            );
+        }
+
+        let is_eof1 = bytes_read1 == 0;
+        let is_eof2 = bytes_read2 == 0;
+
+        // Parse R1
+        let (complete_len1, recs1) = parse_fastq_buffer(&buffer1, actual_len1, is_eof1)?;
+
+        // Parse R2
+        let (complete_len2, recs2) = parse_fastq_buffer(&buffer2, actual_len2, is_eof2)?;
+
+        // Verify same number of records
+        if recs1.len() != recs2.len() {
+            anyhow::bail!(
+                "Paired-end files have different numbers of records in batch {}: R1={}, R2={}",
+                batch_id,
+                recs1.len(),
+                recs2.len()
+            );
+        }
+
+        // Save incomplete parts for next iteration
+        if !is_eof1 && complete_len1 < actual_len1 {
+            carryover1 = buffer1[complete_len1..actual_len1].to_vec();
+        }
+        if !is_eof2 && complete_len2 < actual_len2 {
+            carryover2 = buffer2[complete_len2..actual_len2].to_vec();
+        }
+
+        // Send batch if we have records
+        if !recs1.is_empty() {
+            let batch = PairedBatch {
+                id: batch_id,
+                buf_r1: Arc::new(buffer1[..complete_len1].to_vec()),
+                buf_r2: Arc::new(buffer2[..complete_len2].to_vec()),
+                recs_r1: recs1,
+                recs_r2: recs2,
+            };
+
+            if sender.send(Some(batch)).is_err() {
+                break; // Receiver disconnected
+            }
+
+            batch_id += 1;
+        }
+
+        // Break if both files reached EOF
+        if is_eof1 && is_eof2 {
+            break;
+        }
+    }
+
+    // Send sentinel
+    let _ = sender.send(None);
+    Ok(())
+}
+
+/// Helper function to parse FASTQ records from a buffer
+/// Returns (complete_len, records)
+fn parse_fastq_buffer(
+    buffer: &[u8],
+    actual_len: usize,
+    is_eof: bool,
+) -> Result<(usize, Vec<[usize; 4]>)> {
+    if actual_len == 0 {
+        return Ok((0, Vec::new()));
+    }
+
+    // Single-pass scan: find complete records AND line starts
+    let mut complete_end = 0;
+    let mut line_count = 0;
+    let mut line_starts = vec![0];
+
+    for i in 0..actual_len {
+        if buffer[i] == b'\n' {
+            line_count += 1;
+            // After every 4 lines, we have a complete record
+            if line_count % 4 == 0 {
+                complete_end = i + 1;
+            }
+            // Track line starts for parsing
+            if i + 1 < actual_len {
+                line_starts.push(i + 1);
+            }
+        }
+    }
+
+    // On EOF, if we have remaining lines that form complete records, use them
+    let complete_len = if is_eof && line_count > 0 {
+        // Check if we have complete records
+        if line_count % 4 == 0 {
+            // All lines end with newline and form complete records
+            actual_len
+        } else if line_count % 4 == 3 && complete_end < actual_len {
+            // We have 3 newlines, meaning 4th line exists but no trailing newline
+            // This is still a complete record
+            actual_len
+        } else {
+            complete_end
+        }
+    } else {
+        complete_end
+    };
+
+    // Parse complete records - use pre-computed line_starts
+    let mut recs = Vec::new();
+    if complete_len > 0 {
+        // Filter line_starts to only those within complete_len
+        line_starts.retain(|&pos| pos < complete_len);
+
+        // Group into 4-line records
+        for i in (0..line_starts.len()).step_by(4) {
+            if i + 3 < line_starts.len() {
+                recs.push([
+                    line_starts[i],
+                    line_starts[i + 1],
+                    line_starts[i + 2],
+                    line_starts[i + 3],
+                ]);
+            }
+        }
+    }
+
+    Ok((complete_len, recs))
+}
+
+/// Paired-end worker thread: process read pairs with synchronization
+///
+/// Processes both R1 and R2 together. Read pairs pass/fail together -
+/// if either read fails ANY filter, BOTH reads are discarded.
+pub(crate) fn paired_worker_thread(
+    receiver: Receiver<Option<PairedBatch>>,
+    sender: Sender<Option<PairedWorkerResult>>,
+    min_len: usize,
+    n_limit: usize,
+    qualified_quality_phred: u8,
+    unqualified_percent_limit: usize,
+    average_qual: u8,
+    low_complexity_filter: bool,
+    complexity_threshold: usize,
+    no_kmer: bool,
+    trimming_config_r1: TrimmingConfig,
+    trimming_config_r2: TrimmingConfig,
+) {
+    while let Ok(Some(batch)) = receiver.recv() {
+        let mut before_r1 = SimpleStats::default();
+        let mut after_r1 = SimpleStats::default();
+        let mut pos_r1 = PositionStats::new();
+        let mut k5_r1 = [0usize; 1024];
+
+        let mut before_r2 = SimpleStats::default();
+        let mut after_r2 = SimpleStats::default();
+        let mut pos_r2 = PositionStats::new();
+        let mut k5_r2 = [0usize; 1024];
+
+        let mut too_short = 0usize;
+        let mut too_many_n = 0usize;
+        let mut low_quality = 0usize;
+        let mut low_complexity = 0usize;
+        let mut invalid = 0usize;
+        let mut pieces = Vec::new();
+
+        // Process each pair
+        for (idx, (&rec1, &rec2)) in batch.recs_r1.iter().zip(batch.recs_r2.iter()).enumerate() {
+            // Parse R1
+            let (seq1, qual1, seq1_end, qual1_end) =
+                parse_record(&batch.buf_r1, rec1, idx, &batch.recs_r1);
+
+            // Parse R2
+            let (seq2, qual2, seq2_end, qual2_end) =
+                parse_record(&batch.buf_r2, rec2, idx, &batch.recs_r2);
+
+            // Validate both records
+            if seq1.len() != qual1.len() || seq2.len() != qual2.len() {
+                invalid += 1;
+                continue;
+            }
+
+            // Compute stats for R1
+            let stats1 = simd::compute_stats(seq1, qual1, 0);
+            before_r1.add(seq1.len(), stats1.q20, stats1.q30, stats1.gc);
+            update_position_stats(&mut pos_r1, seq1, qual1);
+            if !no_kmer {
+                count_k5_2bit(seq1, &mut k5_r1);
+            }
+
+            // Compute stats for R2
+            let stats2 = simd::compute_stats(seq2, qual2, 0);
+            before_r2.add(seq2.len(), stats2.q20, stats2.q30, stats2.gc);
+            update_position_stats(&mut pos_r2, seq2, qual2);
+            if !no_kmer {
+                count_k5_2bit(seq2, &mut k5_r2);
+            }
+
+            // Apply trimming to R1
+            let trim_result1 = if trimming_config_r1.is_enabled() {
+                trim_read(seq1, qual1, &trimming_config_r1)
+            } else {
+                TrimmingResult {
+                    start_pos: 0,
+                    end_pos: seq1.len(),
+                    poly_g_trimmed: 0,
+                    poly_x_trimmed: 0,
+                }
+            };
+
+            // Apply trimming to R2
+            let trim_result2 = if trimming_config_r2.is_enabled() {
+                trim_read(seq2, qual2, &trimming_config_r2)
+            } else {
+                TrimmingResult {
+                    start_pos: 0,
+                    end_pos: seq2.len(),
+                    poly_g_trimmed: 0,
+                    poly_x_trimmed: 0,
+                }
+            };
+
+            // Get trimmed sequences
+            let trimmed_seq1 = &seq1[trim_result1.start_pos..trim_result1.end_pos];
+            let trimmed_qual1 = &qual1[trim_result1.start_pos..trim_result1.end_pos];
+            let trimmed_seq2 = &seq2[trim_result2.start_pos..trim_result2.end_pos];
+            let trimmed_qual2 = &qual2[trim_result2.start_pos..trim_result2.end_pos];
+
+            // Check length filter (EITHER read too short = BOTH fail)
+            if trimmed_seq1.len() < min_len || trimmed_seq2.len() < min_len {
+                too_short += 1;
+                continue;
+            }
+
+            // Recompute stats for trimmed reads
+            let trimmed_stats1 =
+                simd::compute_stats(trimmed_seq1, trimmed_qual1, qualified_quality_phred);
+            let trimmed_stats2 =
+                simd::compute_stats(trimmed_seq2, trimmed_qual2, qualified_quality_phred);
+
+            // Check N limit (EITHER read too many N = BOTH fail)
+            if trimmed_stats1.ncnt > n_limit || trimmed_stats2.ncnt > n_limit {
+                too_many_n += 1;
+                continue;
+            }
+
+            // Check unqualified percent (EITHER read fails = BOTH fail)
+            let mut fail_quality = false;
+            if qualified_quality_phred > 0 {
+                if trimmed_seq1.len() > 0 {
+                    if 100 * trimmed_stats1.unqualified
+                        > unqualified_percent_limit * trimmed_seq1.len()
+                    {
+                        fail_quality = true;
+                    }
+                }
+                if trimmed_seq2.len() > 0 {
+                    if 100 * trimmed_stats2.unqualified
+                        > unqualified_percent_limit * trimmed_seq2.len()
+                    {
+                        fail_quality = true;
+                    }
+                }
+            }
+
+            // Check average quality (EITHER read fails = BOTH fail)
+            if average_qual > 0 {
+                if trimmed_seq1.len() > 0 {
+                    let mean_qual1 = trimmed_stats1.qsum as f64 / trimmed_seq1.len() as f64;
+                    if mean_qual1 < average_qual as f64 {
+                        fail_quality = true;
+                    }
+                }
+                if trimmed_seq2.len() > 0 {
+                    let mean_qual2 = trimmed_stats2.qsum as f64 / trimmed_seq2.len() as f64;
+                    if mean_qual2 < average_qual as f64 {
+                        fail_quality = true;
+                    }
+                }
+            }
+
+            if fail_quality {
+                low_quality += 1;
+                continue;
+            }
+
+            // Check low complexity (EITHER read fails = BOTH fail)
+            if low_complexity_filter {
+                let mut fail_complexity = false;
+                if trimmed_seq1.len() > 0 {
+                    let complexity1 = calculate_complexity(trimmed_seq1);
+                    if complexity1 < complexity_threshold {
+                        fail_complexity = true;
+                    }
+                }
+                if trimmed_seq2.len() > 0 {
+                    let complexity2 = calculate_complexity(trimmed_seq2);
+                    if complexity2 < complexity_threshold {
+                        fail_complexity = true;
+                    }
+                }
+
+                if fail_complexity {
+                    low_complexity += 1;
+                    continue;
+                }
+            }
+
+            // BOTH reads passed - emit ranges for BOTH
+            let [h1_start, s1_start, p1_start, q1_start] = rec1;
+            let [h2_start, s2_start, p2_start, q2_start] = rec2;
+
+            let trimmed_seq1_start = s1_start + trim_result1.start_pos;
+            let trimmed_seq1_end = s1_start + trim_result1.end_pos;
+            let trimmed_qual1_start = q1_start + trim_result1.start_pos;
+            let trimmed_qual1_end = q1_start + trim_result1.end_pos;
+
+            let trimmed_seq2_start = s2_start + trim_result2.start_pos;
+            let trimmed_seq2_end = s2_start + trim_result2.end_pos;
+            let trimmed_qual2_start = q2_start + trim_result2.start_pos;
+            let trimmed_qual2_end = q2_start + trim_result2.end_pos;
+
+            pieces.push(PairedRecordPiece {
+                r1: RecordPiece {
+                    buf: batch.buf_r1.clone(),
+                    header: h1_start..s1_start - 1,
+                    seq: trimmed_seq1_start..trimmed_seq1_end,
+                    plus: p1_start..q1_start - 1,
+                    qual: trimmed_qual1_start..trimmed_qual1_end,
+                },
+                r2: RecordPiece {
+                    buf: batch.buf_r2.clone(),
+                    header: h2_start..s2_start - 1,
+                    seq: trimmed_seq2_start..trimmed_seq2_end,
+                    plus: p2_start..q2_start - 1,
+                    qual: trimmed_qual2_start..trimmed_qual2_end,
+                },
+            });
+
+            // Update "after" stats for BOTH reads
+            after_r1.add(
+                trimmed_seq1.len(),
+                trimmed_stats1.q20,
+                trimmed_stats1.q30,
+                trimmed_stats1.gc,
+            );
+            after_r2.add(
+                trimmed_seq2.len(),
+                trimmed_stats2.q20,
+                trimmed_stats2.q30,
+                trimmed_stats2.gc,
+            );
+        }
+
+        let result = PairedWorkerResult {
+            id: batch.id,
+            pieces,
+            before_r1,
+            after_r1,
+            pos_r1,
+            k5_r1,
+            before_r2,
+            after_r2,
+            pos_r2,
+            k5_r2,
+            too_short,
+            too_many_n,
+            low_quality,
+            low_complexity,
+            invalid,
+        };
+
+        if sender.send(Some(result)).is_err() {
+            break;
+        }
+    }
+
+    // Send sentinel
+    let _ = sender.send(None);
+}
+
+/// Helper to parse a single record from buffer
+#[inline]
+fn parse_record<'a>(
+    buf: &'a [u8],
+    rec: [usize; 4],
+    idx: usize,
+    recs: &[[usize; 4]],
+) -> (&'a [u8], &'a [u8], usize, usize) {
+    let [_h_start, s_start, p_start, q_start] = rec;
+    let s_end = p_start - 1;
+    let p_end = q_start - 1;
+    let q_end = if idx + 1 < recs.len() {
+        recs[idx + 1][0] - 1
+    } else {
+        // For the last record, exclude trailing newline if present
+        let buf_len = buf.len();
+        if buf_len > 0 && buf[buf_len - 1] == b'\n' {
+            buf_len - 1
+        } else {
+            buf_len
+        }
+    };
+
+    let seq = &buf[s_start..s_end];
+    let qual = &buf[q_start..q_end];
+
+    (seq, qual, s_end, q_end)
+}
+
+/// Helper to update position stats
+#[inline]
+fn update_position_stats(pos: &mut PositionStats, seq: &[u8], qual: &[u8]) {
+    pos.ensure_capacity(seq.len());
+
+    for i in 0..seq.len() {
+        let q = qual[i];
+        let qval = (q - 33) as u64;
+        let b = seq[i];
+
+        pos.total_sum[i] += qval;
+        pos.total_cnt[i] += 1;
+
+        if let Some(bi) = base_idx(b) {
+            pos.base_sum[bi][i] += qval;
+            pos.base_cnt[bi][i] += 1;
+        }
+    }
+}
+
+/// Paired-end merger thread: write both outputs in order
+pub(crate) fn paired_merger_thread(
+    receiver: Receiver<Option<PairedWorkerResult>>,
+    output1_path: String,
+    output2_path: String,
+    num_workers: usize,
+    compression_level: Option<u32>,
+) -> Result<crate::processor::PairedEndAccumulator> {
+    use std::io::Write;
+
+    let mut writer1 = open_output(&output1_path, compression_level)?;
+    let mut writer2 = open_output(&output2_path, compression_level)?;
+
+    let mut acc = crate::processor::PairedEndAccumulator::new();
+    let mut next_id = 0u64;
+    let mut pending: BTreeMap<u64, PairedWorkerResult> = BTreeMap::new();
+    let mut workers_done = 0;
+
+    let newline = [b'\n'];
+
+    while let Ok(msg) = receiver.recv() {
+        match msg {
+            Some(result) => {
+                pending.insert(result.id, result);
+
+                // Process all consecutive batches
+                while let Some(result) = pending.remove(&next_id) {
+                    // Write all passed records using vectored I/O with proper partial write handling
+                    for piece in &result.pieces {
+                        // Write R1 with partial write handling
+                        let b1 = &piece.r1.buf;
+                        let mut iov1 = [
+                            IoSlice::new(&b1[piece.r1.header.clone()]),
+                            IoSlice::new(&newline),
+                            IoSlice::new(&b1[piece.r1.seq.clone()]),
+                            IoSlice::new(&newline),
+                            IoSlice::new(&b1[piece.r1.plus.clone()]),
+                            IoSlice::new(&newline),
+                            IoSlice::new(&b1[piece.r1.qual.clone()]),
+                            IoSlice::new(&newline),
+                        ];
+
+                        let mut written = 0;
+                        let total: usize = iov1.iter().map(|s| s.len()).sum();
+                        while written < total {
+                            let n = writer1.write_vectored(&iov1)?;
+                            if n == 0 {
+                                return Err(std::io::Error::new(
+                                    std::io::ErrorKind::WriteZero,
+                                    "failed to write vectored R1",
+                                )
+                                .into());
+                            }
+                            written += n;
+                            // Advance the slices
+                            let mut skip = n;
+                            for slice in &mut iov1 {
+                                let len = slice.len();
+                                if skip >= len {
+                                    skip -= len;
+                                    *slice = IoSlice::new(&[]);
+                                } else {
+                                    let data = unsafe {
+                                        std::slice::from_raw_parts(
+                                            slice.as_ptr().add(skip),
+                                            len - skip,
+                                        )
+                                    };
+                                    *slice = IoSlice::new(data);
+                                    break;
+                                }
+                            }
+                        }
+
+                        // Write R2 with partial write handling
+                        let b2 = &piece.r2.buf;
+                        let mut iov2 = [
+                            IoSlice::new(&b2[piece.r2.header.clone()]),
+                            IoSlice::new(&newline),
+                            IoSlice::new(&b2[piece.r2.seq.clone()]),
+                            IoSlice::new(&newline),
+                            IoSlice::new(&b2[piece.r2.plus.clone()]),
+                            IoSlice::new(&newline),
+                            IoSlice::new(&b2[piece.r2.qual.clone()]),
+                            IoSlice::new(&newline),
+                        ];
+
+                        let mut written = 0;
+                        let total: usize = iov2.iter().map(|s| s.len()).sum();
+                        while written < total {
+                            let n = writer2.write_vectored(&iov2)?;
+                            if n == 0 {
+                                return Err(std::io::Error::new(
+                                    std::io::ErrorKind::WriteZero,
+                                    "failed to write vectored R2",
+                                )
+                                .into());
+                            }
+                            written += n;
+                            // Advance the slices
+                            let mut skip = n;
+                            for slice in &mut iov2 {
+                                let len = slice.len();
+                                if skip >= len {
+                                    skip -= len;
+                                    *slice = IoSlice::new(&[]);
+                                } else {
+                                    let data = unsafe {
+                                        std::slice::from_raw_parts(
+                                            slice.as_ptr().add(skip),
+                                            len - skip,
+                                        )
+                                    };
+                                    *slice = IoSlice::new(data);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+
+                    // Merge stats - R1
+                    acc.before_r1.total_reads += result.before_r1.total_reads;
+                    acc.before_r1.total_bases += result.before_r1.total_bases;
+                    acc.before_r1.q20_bases += result.before_r1.q20_bases;
+                    acc.before_r1.q30_bases += result.before_r1.q30_bases;
+                    acc.before_r1.gc_bases += result.before_r1.gc_bases;
+
+                    acc.after_r1.total_reads += result.after_r1.total_reads;
+                    acc.after_r1.total_bases += result.after_r1.total_bases;
+                    acc.after_r1.q20_bases += result.after_r1.q20_bases;
+                    acc.after_r1.q30_bases += result.after_r1.q30_bases;
+                    acc.after_r1.gc_bases += result.after_r1.gc_bases;
+
+                    // Merge stats - R2
+                    acc.before_r2.total_reads += result.before_r2.total_reads;
+                    acc.before_r2.total_bases += result.before_r2.total_bases;
+                    acc.before_r2.q20_bases += result.before_r2.q20_bases;
+                    acc.before_r2.q30_bases += result.before_r2.q30_bases;
+                    acc.before_r2.gc_bases += result.before_r2.gc_bases;
+
+                    acc.after_r2.total_reads += result.after_r2.total_reads;
+                    acc.after_r2.total_bases += result.after_r2.total_bases;
+                    acc.after_r2.q20_bases += result.after_r2.q20_bases;
+                    acc.after_r2.q30_bases += result.after_r2.q30_bases;
+                    acc.after_r2.gc_bases += result.after_r2.gc_bases;
+
+                    // Merge position stats - R1
+                    acc.pos_r1.ensure_capacity(result.pos_r1.total_sum.len());
+                    for i in 0..result.pos_r1.total_sum.len() {
+                        acc.pos_r1.total_sum[i] += result.pos_r1.total_sum[i];
+                        acc.pos_r1.total_cnt[i] += result.pos_r1.total_cnt[i];
+                        for b in 0..4 {
+                            acc.pos_r1.base_sum[b][i] += result.pos_r1.base_sum[b][i];
+                            acc.pos_r1.base_cnt[b][i] += result.pos_r1.base_cnt[b][i];
+                        }
+                    }
+
+                    // Merge position stats - R2
+                    acc.pos_r2.ensure_capacity(result.pos_r2.total_sum.len());
+                    for i in 0..result.pos_r2.total_sum.len() {
+                        acc.pos_r2.total_sum[i] += result.pos_r2.total_sum[i];
+                        acc.pos_r2.total_cnt[i] += result.pos_r2.total_cnt[i];
+                        for b in 0..4 {
+                            acc.pos_r2.base_sum[b][i] += result.pos_r2.base_sum[b][i];
+                            acc.pos_r2.base_cnt[b][i] += result.pos_r2.base_cnt[b][i];
+                        }
+                    }
+
+                    for (i, &count) in result.k5_r1.iter().enumerate() {
+                        acc.kmer_table_r1[i] += count;
+                    }
+                    for (i, &count) in result.k5_r2.iter().enumerate() {
+                        acc.kmer_table_r2[i] += count;
+                    }
+
+                    acc.too_short += result.too_short;
+                    acc.too_many_n += result.too_many_n;
+                    acc.low_quality += result.low_quality;
+                    acc.low_complexity += result.low_complexity;
+                    acc.invalid += result.invalid;
+
+                    if result.pos_r1.total_sum.len() > acc.max_cycle_r1 {
+                        acc.max_cycle_r1 = result.pos_r1.total_sum.len();
+                    }
+                    if result.pos_r2.total_sum.len() > acc.max_cycle_r2 {
+                        acc.max_cycle_r2 = result.pos_r2.total_sum.len();
+                    }
+
+                    next_id += 1;
+                }
+            }
+            None => {
+                workers_done += 1;
+                if workers_done == num_workers {
+                    break;
+                }
+            }
+        }
+    }
+
+    writer1.finish()?;
+    writer2.finish()?;
+
     Ok(acc)
 }

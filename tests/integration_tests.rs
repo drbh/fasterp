@@ -2294,9 +2294,7 @@ fn test_trimming_with_multithreading_consistency() {
     compare_json_outputs(&json_st, &json_mt);
 }
 
-// ============================================================================
 // PAIRED-END TESTS
-// ============================================================================
 
 #[test]
 fn test_paired_end_basic_processing() {
@@ -2556,9 +2554,7 @@ fn test_paired_end_combined_filters() {
     compare_json_outputs(&fastp_json, &fasterp_json);
 }
 
-// ============================================================================
 // ADAPTER TRIMMING TESTS
-// ============================================================================
 
 #[test]
 fn test_adapter_trimming_single_end_custom_adapter() {
@@ -2880,182 +2876,229 @@ fn test_paired_end_with_trimming_and_adapters() {
 
     compare_json_outputs(&fastp_json, &fasterp_json);
 }
-// ============================================================================
 // EDGE CASE TESTS - Added for robustness
-// ============================================================================
 
 #[test]
 fn test_adapter_5base_perfect_match() {
     // Test minimum length adapter match (5 bases, 0 mismatches)
     let temp_dir = TempDir::new().unwrap();
-    
+
     // Create test data with 5-base partial adapter at the end
     let test_input = temp_dir.path().join("test_input.fq");
     fs::write(&test_input, "@read1\nACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTAGATC\n+\n?????????????????????????????????????????????????????????????\n").unwrap();
-    
+
     let fastp_out = temp_dir.path().join("fastp_out.fq");
     let fasterp_out = temp_dir.path().join("fasterp_out.fq");
-    
+
     // Run fastp
     let status = Command::new("fastp")
-        .arg("-i").arg(&test_input)
-        .arg("-o").arg(&fastp_out)
-        .arg("-a").arg("AGATCGGAAGAGC")
-        .arg("-L")  // Disable length filtering
+        .arg("-i")
+        .arg(&test_input)
+        .arg("-o")
+        .arg(&fastp_out)
+        .arg("-a")
+        .arg("AGATCGGAAGAGC")
+        .arg("-L") // Disable length filtering
         .stderr(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .status()
         .expect("Failed to run fastp");
     assert!(status.success());
-    
+
     // Run fasterp
     let status = Command::new(cargo_bin("fasterp"))
-        .arg("-i").arg(&test_input)
-        .arg("-o").arg(&fasterp_out)
-        .arg("-a").arg("AGATCGGAAGAGC")
+        .arg("-i")
+        .arg(&test_input)
+        .arg("-o")
+        .arg(&fasterp_out)
+        .arg("-a")
+        .arg("AGATCGGAAGAGC")
         .arg("-L")
         .status()
         .expect("Failed to run fasterp");
     assert!(status.success());
-    
+
     // Compare outputs
     let fastp_content = fs::read_to_string(&fastp_out).unwrap();
     let fasterp_content = fs::read_to_string(&fasterp_out).unwrap();
-    assert_eq!(fastp_content, fasterp_content, "5-base adapter match outputs don't match");
+    assert_eq!(
+        fastp_content, fasterp_content,
+        "5-base adapter match outputs don't match"
+    );
 }
 
 #[test]
 fn test_adapter_8base_with_mismatch() {
     // Test 8-base adapter with 1 mismatch (should trim)
     let temp_dir = TempDir::new().unwrap();
-    
+
     // Create test data with 8-base adapter (1 mismatch) at the end
     // AGATCGGC has 1 mismatch vs AGATCGGA
     let test_input = temp_dir.path().join("test_input.fq");
     fs::write(&test_input, "@read1\nACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTAGATCGGC\n+\n????????????????????????????????????????????????????????????????\n").unwrap();
-    
+
     let fastp_out = temp_dir.path().join("fastp_out.fq");
     let fasterp_out = temp_dir.path().join("fasterp_out.fq");
-    
+
     // Run fastp
     Command::new("fastp")
-        .arg("-i").arg(&test_input)
-        .arg("-o").arg(&fastp_out)
-        .arg("-a").arg("AGATCGGAAGAGC")
+        .arg("-i")
+        .arg(&test_input)
+        .arg("-o")
+        .arg(&fastp_out)
+        .arg("-a")
+        .arg("AGATCGGAAGAGC")
         .arg("-L")
         .stderr(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .status()
         .expect("Failed to run fastp");
-    
+
     // Run fasterp
     Command::new(cargo_bin("fasterp"))
-        .arg("-i").arg(&test_input)
-        .arg("-o").arg(&fasterp_out)
-        .arg("-a").arg("AGATCGGAAGAGC")
+        .arg("-i")
+        .arg(&test_input)
+        .arg("-o")
+        .arg(&fasterp_out)
+        .arg("-a")
+        .arg("AGATCGGAAGAGC")
         .arg("-L")
         .status()
         .expect("Failed to run fasterp");
-    
+
     // Compare outputs
     let fastp_content = fs::read_to_string(&fastp_out).unwrap();
     let fasterp_content = fs::read_to_string(&fasterp_out).unwrap();
-    assert_eq!(fastp_content, fasterp_content, "8-base adapter with mismatch outputs don't match");
+    assert_eq!(
+        fastp_content, fasterp_content,
+        "8-base adapter with mismatch outputs don't match"
+    );
 }
 
 #[test]
 fn test_adapter_5base_with_mismatch_not_trimmed() {
     // Test 5-base adapter with 1 mismatch (should NOT trim)
     let temp_dir = TempDir::new().unwrap();
-    
+
     // Create test data with 5-base adapter (1 mismatch) at the end
     // AGATX has 1 mismatch vs AGATC
     let test_input = temp_dir.path().join("test_input.fq");
     fs::write(&test_input, "@read1\nACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTAGATX\n+\n?????????????????????????????????????????????????????????????\n").unwrap();
-    
+
     let fastp_out = temp_dir.path().join("fastp_out.fq");
     let fasterp_out = temp_dir.path().join("fasterp_out.fq");
-    
+
     // Run fastp
     Command::new("fastp")
-        .arg("-i").arg(&test_input)
-        .arg("-o").arg(&fastp_out)
-        .arg("-a").arg("AGATCGGAAGAGC")
+        .arg("-i")
+        .arg(&test_input)
+        .arg("-o")
+        .arg(&fastp_out)
+        .arg("-a")
+        .arg("AGATCGGAAGAGC")
         .arg("-L")
         .stderr(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .status()
         .expect("Failed to run fastp");
-    
+
     // Run fasterp
     Command::new(cargo_bin("fasterp"))
-        .arg("-i").arg(&test_input)
-        .arg("-o").arg(&fasterp_out)
-        .arg("-a").arg("AGATCGGAAGAGC")
+        .arg("-i")
+        .arg(&test_input)
+        .arg("-o")
+        .arg(&fasterp_out)
+        .arg("-a")
+        .arg("AGATCGGAAGAGC")
         .arg("-L")
         .status()
         .expect("Failed to run fasterp");
-    
+
     // Compare outputs - should be identical (no trimming)
     let fastp_content = fs::read_to_string(&fastp_out).unwrap();
     let fasterp_content = fs::read_to_string(&fasterp_out).unwrap();
-    assert_eq!(fastp_content, fasterp_content, "5-base adapter with mismatch should not be trimmed");
+    assert_eq!(
+        fastp_content, fasterp_content,
+        "5-base adapter with mismatch should not be trimmed"
+    );
 }
 
 #[test]
 fn test_paired_end_asymmetric_front_trimming() {
     // Test different trim_front values for R1 and R2
     let temp_dir = TempDir::new().unwrap();
-    
+
     let fastp_r1 = temp_dir.path().join("fastp_r1.fq");
     let fastp_r2 = temp_dir.path().join("fastp_r2.fq");
     let fastp_json = temp_dir.path().join("fastp.json");
-    
+
     let fasterp_r1 = temp_dir.path().join("fasterp_r1.fq");
     let fasterp_r2 = temp_dir.path().join("fasterp_r2.fq");
     let fasterp_json = temp_dir.path().join("fasterp.json");
-    
+
     // Run fastp with asymmetric trimming: R1 trims 10 from front, R2 trims 5 from front
     let status = Command::new("fastp")
-        .arg("-i").arg(test_data_path("pe_small_R1.fq"))
-        .arg("-I").arg(test_data_path("pe_small_R2.fq"))
-        .arg("-o").arg(&fastp_r1)
-        .arg("-O").arg(&fastp_r2)
-        .arg("-j").arg(&fastp_json)
-        .arg("-t").arg("1")
-        .arg("--trim_front1").arg("10")
-        .arg("--trim_front2").arg("5")
-        .arg("-L")  // Disable length filtering for this test
+        .arg("-i")
+        .arg(test_data_path("pe_small_R1.fq"))
+        .arg("-I")
+        .arg(test_data_path("pe_small_R2.fq"))
+        .arg("-o")
+        .arg(&fastp_r1)
+        .arg("-O")
+        .arg(&fastp_r2)
+        .arg("-j")
+        .arg(&fastp_json)
+        .arg("-t")
+        .arg("1")
+        .arg("--trim_front1")
+        .arg("10")
+        .arg("--trim_front2")
+        .arg("5")
+        .arg("-L") // Disable length filtering for this test
         .stderr(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .status()
         .expect("Failed to run fastp");
     assert!(status.success());
-    
+
     // Run fasterp with same parameters
     let status = Command::new(cargo_bin("fasterp"))
-        .arg("-i").arg(test_data_path("pe_small_R1.fq"))
-        .arg("-I").arg(test_data_path("pe_small_R2.fq"))
-        .arg("-o").arg(&fasterp_r1)
-        .arg("-O").arg(&fasterp_r2)
-        .arg("-j").arg(&fasterp_json)
-        .arg("-t").arg("1")
-        .arg("--trim_front1").arg("10")
-        .arg("--trim_front2").arg("5")
+        .arg("-i")
+        .arg(test_data_path("pe_small_R1.fq"))
+        .arg("-I")
+        .arg(test_data_path("pe_small_R2.fq"))
+        .arg("-o")
+        .arg(&fasterp_r1)
+        .arg("-O")
+        .arg(&fasterp_r2)
+        .arg("-j")
+        .arg(&fasterp_json)
+        .arg("-t")
+        .arg("1")
+        .arg("--trim_front1")
+        .arg("10")
+        .arg("--trim_front2")
+        .arg("5")
         .arg("-L")
         .status()
         .expect("Failed to run fasterp");
     assert!(status.success());
-    
+
     // Compare outputs
     let fastp_r1_content = fs::read_to_string(&fastp_r1).unwrap();
     let fasterp_r1_content = fs::read_to_string(&fasterp_r1).unwrap();
-    assert_eq!(fastp_r1_content, fasterp_r1_content, "R1 outputs don't match with asymmetric front trimming");
-    
+    assert_eq!(
+        fastp_r1_content, fasterp_r1_content,
+        "R1 outputs don't match with asymmetric front trimming"
+    );
+
     let fastp_r2_content = fs::read_to_string(&fastp_r2).unwrap();
     let fasterp_r2_content = fs::read_to_string(&fasterp_r2).unwrap();
-    assert_eq!(fastp_r2_content, fasterp_r2_content, "R2 outputs don't match with asymmetric front trimming");
-    
+    assert_eq!(
+        fastp_r2_content, fasterp_r2_content,
+        "R2 outputs don't match with asymmetric front trimming"
+    );
+
     compare_json_outputs(&fastp_json, &fasterp_json);
 }
 
@@ -3063,56 +3106,78 @@ fn test_paired_end_asymmetric_front_trimming() {
 fn test_paired_end_asymmetric_tail_trimming() {
     // Test different trim_tail values for R1 and R2
     let temp_dir = TempDir::new().unwrap();
-    
+
     let fastp_r1 = temp_dir.path().join("fastp_r1.fq");
     let fastp_r2 = temp_dir.path().join("fastp_r2.fq");
     let fastp_json = temp_dir.path().join("fastp.json");
-    
+
     let fasterp_r1 = temp_dir.path().join("fasterp_r1.fq");
     let fasterp_r2 = temp_dir.path().join("fasterp_r2.fq");
     let fasterp_json = temp_dir.path().join("fasterp.json");
-    
+
     // Run fastp with asymmetric tail trimming: R1 trims 8 from tail, R2 trims 4 from tail
     let status = Command::new("fastp")
-        .arg("-i").arg(test_data_path("pe_small_R1.fq"))
-        .arg("-I").arg(test_data_path("pe_small_R2.fq"))
-        .arg("-o").arg(&fastp_r1)
-        .arg("-O").arg(&fastp_r2)
-        .arg("-j").arg(&fastp_json)
-        .arg("-t").arg("1")
-        .arg("--trim_tail1").arg("8")
-        .arg("--trim_tail2").arg("4")
+        .arg("-i")
+        .arg(test_data_path("pe_small_R1.fq"))
+        .arg("-I")
+        .arg(test_data_path("pe_small_R2.fq"))
+        .arg("-o")
+        .arg(&fastp_r1)
+        .arg("-O")
+        .arg(&fastp_r2)
+        .arg("-j")
+        .arg(&fastp_json)
+        .arg("-t")
+        .arg("1")
+        .arg("--trim_tail1")
+        .arg("8")
+        .arg("--trim_tail2")
+        .arg("4")
         .arg("-L")
         .stderr(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .status()
         .expect("Failed to run fastp");
     assert!(status.success());
-    
+
     // Run fasterp with same parameters
     let status = Command::new(cargo_bin("fasterp"))
-        .arg("-i").arg(test_data_path("pe_small_R1.fq"))
-        .arg("-I").arg(test_data_path("pe_small_R2.fq"))
-        .arg("-o").arg(&fasterp_r1)
-        .arg("-O").arg(&fasterp_r2)
-        .arg("-j").arg(&fasterp_json)
-        .arg("-t").arg("1")
-        .arg("--trim_tail1").arg("8")
-        .arg("--trim_tail2").arg("4")
+        .arg("-i")
+        .arg(test_data_path("pe_small_R1.fq"))
+        .arg("-I")
+        .arg(test_data_path("pe_small_R2.fq"))
+        .arg("-o")
+        .arg(&fasterp_r1)
+        .arg("-O")
+        .arg(&fasterp_r2)
+        .arg("-j")
+        .arg(&fasterp_json)
+        .arg("-t")
+        .arg("1")
+        .arg("--trim_tail1")
+        .arg("8")
+        .arg("--trim_tail2")
+        .arg("4")
         .arg("-L")
         .status()
         .expect("Failed to run fasterp");
     assert!(status.success());
-    
+
     // Compare outputs
     let fastp_r1_content = fs::read_to_string(&fastp_r1).unwrap();
     let fasterp_r1_content = fs::read_to_string(&fasterp_r1).unwrap();
-    assert_eq!(fastp_r1_content, fasterp_r1_content, "R1 outputs don't match with asymmetric tail trimming");
-    
+    assert_eq!(
+        fastp_r1_content, fasterp_r1_content,
+        "R1 outputs don't match with asymmetric tail trimming"
+    );
+
     let fastp_r2_content = fs::read_to_string(&fastp_r2).unwrap();
     let fasterp_r2_content = fs::read_to_string(&fasterp_r2).unwrap();
-    assert_eq!(fastp_r2_content, fasterp_r2_content, "R2 outputs don't match with asymmetric tail trimming");
-    
+    assert_eq!(
+        fastp_r2_content, fasterp_r2_content,
+        "R2 outputs don't match with asymmetric tail trimming"
+    );
+
     compare_json_outputs(&fastp_json, &fasterp_json);
 }
 
@@ -3120,126 +3185,181 @@ fn test_paired_end_asymmetric_tail_trimming() {
 fn test_adapter_at_exact_minimum_length() {
     // Test read that becomes exactly minimum length after adapter trimming
     let temp_dir = TempDir::new().unwrap();
-    
+
     // Create a read that will be exactly 15 bases (default min length) after adapter trimming
     let test_input = temp_dir.path().join("test_input.fq");
     // 15 bases + 13 base adapter = 28 bases total
-    fs::write(&test_input, "@read1\nACGTACGTACGTACGAGATCGGAAGAGC\n+\n????????????????????????????\n").unwrap();
-    
+    fs::write(
+        &test_input,
+        "@read1\nACGTACGTACGTACGAGATCGGAAGAGC\n+\n????????????????????????????\n",
+    )
+    .unwrap();
+
     let fastp_out = temp_dir.path().join("fastp_out.fq");
     let fasterp_out = temp_dir.path().join("fasterp_out.fq");
-    
+
     // Run fastp
     Command::new("fastp")
-        .arg("-i").arg(&test_input)
-        .arg("-o").arg(&fastp_out)
-        .arg("-a").arg("AGATCGGAAGAGC")
-        .arg("-l").arg("15")  // Minimum length
+        .arg("-i")
+        .arg(&test_input)
+        .arg("-o")
+        .arg(&fastp_out)
+        .arg("-a")
+        .arg("AGATCGGAAGAGC")
+        .arg("-l")
+        .arg("15") // Minimum length
         .stderr(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .status()
         .expect("Failed to run fastp");
-    
+
     // Run fasterp
     Command::new(cargo_bin("fasterp"))
-        .arg("-i").arg(&test_input)
-        .arg("-o").arg(&fasterp_out)
-        .arg("-a").arg("AGATCGGAAGAGC")
-        .arg("-l").arg("15")
+        .arg("-i")
+        .arg(&test_input)
+        .arg("-o")
+        .arg(&fasterp_out)
+        .arg("-a")
+        .arg("AGATCGGAAGAGC")
+        .arg("-l")
+        .arg("15")
         .status()
         .expect("Failed to run fasterp");
-    
+
     // Compare outputs - read should pass (exactly min length)
     let fastp_content = fs::read_to_string(&fastp_out).unwrap();
     let fasterp_content = fs::read_to_string(&fasterp_out).unwrap();
-    assert_eq!(fastp_content, fasterp_content, "Outputs don't match for read at exact minimum length");
-    assert!(fastp_content.contains("ACGTACGTACGTACG"), "Read should be present in output");
+    assert_eq!(
+        fastp_content, fasterp_content,
+        "Outputs don't match for read at exact minimum length"
+    );
+    assert!(
+        fastp_content.contains("ACGTACGTACGTACG"),
+        "Read should be present in output"
+    );
 }
 
 #[test]
 fn test_adapter_below_minimum_length() {
     // Test read that becomes too short after adapter trimming
     let temp_dir = TempDir::new().unwrap();
-    
+
     // Create a read that will be 14 bases (below min length) after adapter trimming
     let test_input = temp_dir.path().join("test_input.fq");
     // 14 bases + 13 base adapter = 27 bases total
-    fs::write(&test_input, "@read1\nACGTACGTACGTACGATCGGAAGAGC\n+\n??????????????????????????\n").unwrap();
-    
+    fs::write(
+        &test_input,
+        "@read1\nACGTACGTACGTACGATCGGAAGAGC\n+\n??????????????????????????\n",
+    )
+    .unwrap();
+
     let fastp_out = temp_dir.path().join("fastp_out.fq");
     let fasterp_out = temp_dir.path().join("fasterp_out.fq");
-    
+
     // Run fastp
     Command::new("fastp")
-        .arg("-i").arg(&test_input)
-        .arg("-o").arg(&fastp_out)
-        .arg("-a").arg("AGATCGGAAGAGC")
-        .arg("-l").arg("15")  // Minimum length
+        .arg("-i")
+        .arg(&test_input)
+        .arg("-o")
+        .arg(&fastp_out)
+        .arg("-a")
+        .arg("AGATCGGAAGAGC")
+        .arg("-l")
+        .arg("15") // Minimum length
         .stderr(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .status()
         .expect("Failed to run fastp");
-    
+
     // Run fasterp
     Command::new(cargo_bin("fasterp"))
-        .arg("-i").arg(&test_input)
-        .arg("-o").arg(&fasterp_out)
-        .arg("-a").arg("AGATCGGAAGAGC")
-        .arg("-l").arg("15")
+        .arg("-i")
+        .arg(&test_input)
+        .arg("-o")
+        .arg(&fasterp_out)
+        .arg("-a")
+        .arg("AGATCGGAAGAGC")
+        .arg("-l")
+        .arg("15")
         .status()
         .expect("Failed to run fasterp");
-    
+
     // Compare outputs - read should be filtered out
     let fastp_content = fs::read_to_string(&fastp_out).unwrap();
     let fasterp_content = fs::read_to_string(&fasterp_out).unwrap();
-    assert_eq!(fastp_content, fasterp_content, "Outputs don't match for read below minimum length");
-    assert!(fastp_content.is_empty(), "Output should be empty (read filtered out)");
+    assert_eq!(
+        fastp_content, fasterp_content,
+        "Outputs don't match for read below minimum length"
+    );
+    assert!(
+        fastp_content.is_empty(),
+        "Output should be empty (read filtered out)"
+    );
 }
 
 #[test]
 fn test_extreme_quality_filter_with_adapters() {
     // Stress test: very strict quality filter + adapter trimming
     let temp_dir = TempDir::new().unwrap();
-    
+
     let fastp_out = temp_dir.path().join("fastp_out.fq");
     let fastp_json = temp_dir.path().join("fastp.json");
     let fasterp_out = temp_dir.path().join("fasterp_out.fq");
     let fasterp_json = temp_dir.path().join("fasterp.json");
-    
+
     // Very strict quality filter: Q30, 10% unqualified allowed, min length 100
     let status = Command::new("fastp")
-        .arg("-i").arg(test_data_path("pe_medium_R1.fq"))
-        .arg("-o").arg(&fastp_out)
-        .arg("-j").arg(&fastp_json)
-        .arg("-a").arg("AGATCGGAAGAGC")
-        .arg("-q").arg("30")  // Very high quality threshold
-        .arg("-u").arg("10")  // Very strict unqualified percent
-        .arg("-l").arg("100") // Long minimum length
-        .arg("-n").arg("2")   // Max 2 N bases
+        .arg("-i")
+        .arg(test_data_path("pe_medium_R1.fq"))
+        .arg("-o")
+        .arg(&fastp_out)
+        .arg("-j")
+        .arg(&fastp_json)
+        .arg("-a")
+        .arg("AGATCGGAAGAGC")
+        .arg("-q")
+        .arg("30") // Very high quality threshold
+        .arg("-u")
+        .arg("10") // Very strict unqualified percent
+        .arg("-l")
+        .arg("100") // Long minimum length
+        .arg("-n")
+        .arg("2") // Max 2 N bases
         .stderr(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .status()
         .expect("Failed to run fastp");
     assert!(status.success());
-    
+
     let status = Command::new(cargo_bin("fasterp"))
-        .arg("-i").arg(test_data_path("pe_medium_R1.fq"))
-        .arg("-o").arg(&fasterp_out)
-        .arg("-j").arg(&fasterp_json)
-        .arg("-a").arg("AGATCGGAAGAGC")
-        .arg("-q").arg("30")
-        .arg("-u").arg("10")
-        .arg("-l").arg("100")
-        .arg("-n").arg("2")
+        .arg("-i")
+        .arg(test_data_path("pe_medium_R1.fq"))
+        .arg("-o")
+        .arg(&fasterp_out)
+        .arg("-j")
+        .arg(&fasterp_json)
+        .arg("-a")
+        .arg("AGATCGGAAGAGC")
+        .arg("-q")
+        .arg("30")
+        .arg("-u")
+        .arg("10")
+        .arg("-l")
+        .arg("100")
+        .arg("-n")
+        .arg("2")
         .status()
         .expect("Failed to run fasterp");
     assert!(status.success());
-    
+
     // Compare outputs
     let fastp_content = fs::read_to_string(&fastp_out).unwrap();
     let fasterp_content = fs::read_to_string(&fasterp_out).unwrap();
-    assert_eq!(fastp_content, fasterp_content, "Outputs don't match with extreme quality filter");
-    
+    assert_eq!(
+        fastp_content, fasterp_content,
+        "Outputs don't match with extreme quality filter"
+    );
+
     compare_json_outputs(&fastp_json, &fasterp_json);
 }
 
@@ -3247,133 +3367,183 @@ fn test_extreme_quality_filter_with_adapters() {
 fn test_paired_end_all_features_combined() {
     // Stress test: all features enabled simultaneously
     let temp_dir = TempDir::new().unwrap();
-    
+
     let fastp_r1 = temp_dir.path().join("fastp_r1.fq");
     let fastp_r2 = temp_dir.path().join("fastp_r2.fq");
     let fastp_json = temp_dir.path().join("fastp.json");
-    
+
     let fasterp_r1 = temp_dir.path().join("fasterp_r1.fq");
     let fasterp_r2 = temp_dir.path().join("fasterp_r2.fq");
     let fasterp_json = temp_dir.path().join("fasterp.json");
-    
+
     // Enable everything: adapters, quality filter, length filter, N filter, trimming
     let status = Command::new("fastp")
-        .arg("-i").arg(test_data_path("pe_medium_R1.fq"))
-        .arg("-I").arg(test_data_path("pe_medium_R2.fq"))
-        .arg("-o").arg(&fastp_r1)
-        .arg("-O").arg(&fastp_r2)
-        .arg("-j").arg(&fastp_json)
-        .arg("-t").arg("1")
-        .arg("-a").arg("AGATCGGAAGAGC")
-        .arg("--adapter_sequence_r2").arg("AGATCGGAAGAGC")
-        .arg("--trim_front1").arg("3")
-        .arg("--trim_tail1").arg("2")
-        .arg("--trim_front2").arg("4")
-        .arg("--trim_tail2").arg("3")
-        .arg("-q").arg("20")
-        .arg("-u").arg("30")
-        .arg("-l").arg("50")
-        .arg("-n").arg("5")
+        .arg("-i")
+        .arg(test_data_path("pe_medium_R1.fq"))
+        .arg("-I")
+        .arg(test_data_path("pe_medium_R2.fq"))
+        .arg("-o")
+        .arg(&fastp_r1)
+        .arg("-O")
+        .arg(&fastp_r2)
+        .arg("-j")
+        .arg(&fastp_json)
+        .arg("-t")
+        .arg("1")
+        .arg("-a")
+        .arg("AGATCGGAAGAGC")
+        .arg("--adapter_sequence_r2")
+        .arg("AGATCGGAAGAGC")
+        .arg("--trim_front1")
+        .arg("3")
+        .arg("--trim_tail1")
+        .arg("2")
+        .arg("--trim_front2")
+        .arg("4")
+        .arg("--trim_tail2")
+        .arg("3")
+        .arg("-q")
+        .arg("20")
+        .arg("-u")
+        .arg("30")
+        .arg("-l")
+        .arg("50")
+        .arg("-n")
+        .arg("5")
         .stderr(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .status()
         .expect("Failed to run fastp");
     assert!(status.success());
-    
+
     let status = Command::new(cargo_bin("fasterp"))
-        .arg("-i").arg(test_data_path("pe_medium_R1.fq"))
-        .arg("-I").arg(test_data_path("pe_medium_R2.fq"))
-        .arg("-o").arg(&fasterp_r1)
-        .arg("-O").arg(&fasterp_r2)
-        .arg("-j").arg(&fasterp_json)
-        .arg("-t").arg("1")
-        .arg("-a").arg("AGATCGGAAGAGC")
-        .arg("--adapter_sequence_r2").arg("AGATCGGAAGAGC")
-        .arg("--trim_front1").arg("3")
-        .arg("--trim_tail1").arg("2")
-        .arg("--trim_front2").arg("4")
-        .arg("--trim_tail2").arg("3")
-        .arg("-q").arg("20")
-        .arg("-u").arg("30")
-        .arg("-l").arg("50")
-        .arg("-n").arg("5")
+        .arg("-i")
+        .arg(test_data_path("pe_medium_R1.fq"))
+        .arg("-I")
+        .arg(test_data_path("pe_medium_R2.fq"))
+        .arg("-o")
+        .arg(&fasterp_r1)
+        .arg("-O")
+        .arg(&fasterp_r2)
+        .arg("-j")
+        .arg(&fasterp_json)
+        .arg("-t")
+        .arg("1")
+        .arg("-a")
+        .arg("AGATCGGAAGAGC")
+        .arg("--adapter_sequence_r2")
+        .arg("AGATCGGAAGAGC")
+        .arg("--trim_front1")
+        .arg("3")
+        .arg("--trim_tail1")
+        .arg("2")
+        .arg("--trim_front2")
+        .arg("4")
+        .arg("--trim_tail2")
+        .arg("3")
+        .arg("-q")
+        .arg("20")
+        .arg("-u")
+        .arg("30")
+        .arg("-l")
+        .arg("50")
+        .arg("-n")
+        .arg("5")
         .status()
         .expect("Failed to run fasterp");
     assert!(status.success());
-    
+
     // Compare outputs
     let fastp_r1_content = fs::read_to_string(&fastp_r1).unwrap();
     let fasterp_r1_content = fs::read_to_string(&fasterp_r1).unwrap();
-    assert_eq!(fastp_r1_content, fasterp_r1_content, "R1 outputs don't match with all features combined");
-    
+    assert_eq!(
+        fastp_r1_content, fasterp_r1_content,
+        "R1 outputs don't match with all features combined"
+    );
+
     let fastp_r2_content = fs::read_to_string(&fastp_r2).unwrap();
     let fasterp_r2_content = fs::read_to_string(&fasterp_r2).unwrap();
-    assert_eq!(fastp_r2_content, fasterp_r2_content, "R2 outputs don't match with all features combined");
-    
+    assert_eq!(
+        fastp_r2_content, fasterp_r2_content,
+        "R2 outputs don't match with all features combined"
+    );
+
     compare_json_outputs(&fastp_json, &fasterp_json);
 }
-// ============================================================================
 // LOW COMPLEXITY FILTER TESTS
-// ============================================================================
 
 #[test]
 fn test_low_complexity_filter_basic() {
     // Test basic low complexity filtering
     let temp_dir = TempDir::new().unwrap();
-    
+
     // Create test data with mix of low and high complexity reads
     let test_input = temp_dir.path().join("test_input.fq");
     fs::write(&test_input, "@low1\nAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n+\n????????????????????????????????????????\n@high1\nACGTACGTACGTACGTACGTACGTACGTACGTACGTACGT\n+\n????????????????????????????????????????\n@low2\nTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTT\n+\n????????????????????????????????????????\n@high2\nGATCGATCGATCGATCGATCGATCGATCGATCGATCGATC\n+\n????????????????????????????????????????\n").unwrap();
-    
+
     let fastp_out = temp_dir.path().join("fastp_out.fq");
     let fasterp_out = temp_dir.path().join("fasterp_out.fq");
-    
+
     // Run fastp with low complexity filter
     Command::new("fastp")
-        .arg("-i").arg(&test_input)
-        .arg("-o").arg(&fastp_out)
-        .arg("-y")  // Enable low complexity filter
-        .arg("-Y").arg("30")  // 30% complexity threshold
-        .arg("-L")  // Disable length filtering
+        .arg("-i")
+        .arg(&test_input)
+        .arg("-o")
+        .arg(&fastp_out)
+        .arg("-y") // Enable low complexity filter
+        .arg("-Y")
+        .arg("30") // 30% complexity threshold
+        .arg("-L") // Disable length filtering
         .stderr(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .status()
         .expect("Failed to run fastp");
-    
+
     // Run fasterp with same parameters
     Command::new(cargo_bin("fasterp"))
-        .arg("-i").arg(&test_input)
-        .arg("-o").arg(&fasterp_out)
+        .arg("-i")
+        .arg(&test_input)
+        .arg("-o")
+        .arg(&fasterp_out)
         .arg("-y")
-        .arg("-Y").arg("30")
+        .arg("-Y")
+        .arg("30")
         .arg("-L")
         .status()
         .expect("Failed to run fasterp");
-    
+
     // Compare outputs
     let fastp_content = fs::read_to_string(&fastp_out).unwrap();
     let fasterp_content = fs::read_to_string(&fasterp_out).unwrap();
-    assert_eq!(fastp_content, fasterp_content, "Low complexity filter outputs don't match");
+    assert_eq!(
+        fastp_content, fasterp_content,
+        "Low complexity filter outputs don't match"
+    );
 }
 
 #[test]
 fn test_low_complexity_with_quality_filter() {
     // Test low complexity filter combined with quality filtering
     let temp_dir = TempDir::new().unwrap();
-    
+
     let fastp_out = temp_dir.path().join("fastp_out.fq");
     let fastp_json = temp_dir.path().join("fastp.json");
     let fasterp_out = temp_dir.path().join("fasterp_out.fq");
     let fasterp_json = temp_dir.path().join("fasterp.json");
-    
+
     // Run fastp with both low complexity and quality filters
     let status = Command::new("fastp")
-        .arg("-i").arg(test_data_path("pe_medium_R1.fq"))
-        .arg("-o").arg(&fastp_out)
-        .arg("-j").arg(&fastp_json)
-        .arg("-y")  // Enable low complexity filter
-        .arg("-Y").arg("30")  // 30% complexity threshold
-        .arg("-q").arg("20")  // Quality filter
+        .arg("-i")
+        .arg(test_data_path("pe_medium_R1.fq"))
+        .arg("-o")
+        .arg(&fastp_out)
+        .arg("-j")
+        .arg(&fastp_json)
+        .arg("-y") // Enable low complexity filter
+        .arg("-Y")
+        .arg("30") // 30% complexity threshold
+        .arg("-q")
+        .arg("20") // Quality filter
         .stderr(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .status()
@@ -3382,21 +3552,29 @@ fn test_low_complexity_with_quality_filter() {
 
     // Run fasterp with same parameters
     let status = Command::new(cargo_bin("fasterp"))
-        .arg("-i").arg(test_data_path("pe_medium_R1.fq"))
-        .arg("-o").arg(&fasterp_out)
-        .arg("-j").arg(&fasterp_json)
+        .arg("-i")
+        .arg(test_data_path("pe_medium_R1.fq"))
+        .arg("-o")
+        .arg(&fasterp_out)
+        .arg("-j")
+        .arg(&fasterp_json)
         .arg("-y")
-        .arg("-Y").arg("30")
-        .arg("-q").arg("20")
+        .arg("-Y")
+        .arg("30")
+        .arg("-q")
+        .arg("20")
         .status()
         .expect("Failed to run fasterp");
     assert!(status.success());
-    
+
     // Compare outputs
     let fastp_content = fs::read_to_string(&fastp_out).unwrap();
     let fasterp_content = fs::read_to_string(&fasterp_out).unwrap();
-    assert_eq!(fastp_content, fasterp_content, "Outputs don't match with combined filters");
-    
+    assert_eq!(
+        fastp_content, fasterp_content,
+        "Outputs don't match with combined filters"
+    );
+
     compare_json_outputs(&fastp_json, &fasterp_json);
 }
 
@@ -3404,53 +3582,539 @@ fn test_low_complexity_with_quality_filter() {
 fn test_low_complexity_paired_end() {
     // Test low complexity filter with paired-end reads
     let temp_dir = TempDir::new().unwrap();
-    
+
     let fastp_r1 = temp_dir.path().join("fastp_r1.fq");
     let fastp_r2 = temp_dir.path().join("fastp_r2.fq");
     let fastp_json = temp_dir.path().join("fastp.json");
-    
+
     let fasterp_r1 = temp_dir.path().join("fasterp_r1.fq");
     let fasterp_r2 = temp_dir.path().join("fasterp_r2.fq");
     let fasterp_json = temp_dir.path().join("fasterp.json");
-    
+
     // Run fastp with low complexity filter on paired-end
     let status = Command::new("fastp")
-        .arg("-i").arg(test_data_path("pe_small_R1.fq"))
-        .arg("-I").arg(test_data_path("pe_small_R2.fq"))
-        .arg("-o").arg(&fastp_r1)
-        .arg("-O").arg(&fastp_r2)
-        .arg("-j").arg(&fastp_json)
-        .arg("-t").arg("1")
+        .arg("-i")
+        .arg(test_data_path("pe_small_R1.fq"))
+        .arg("-I")
+        .arg(test_data_path("pe_small_R2.fq"))
+        .arg("-o")
+        .arg(&fastp_r1)
+        .arg("-O")
+        .arg(&fastp_r2)
+        .arg("-j")
+        .arg(&fastp_json)
+        .arg("-t")
+        .arg("1")
         .arg("-y")
-        .arg("-Y").arg("30")
+        .arg("-Y")
+        .arg("30")
         .stderr(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .status()
         .expect("Failed to run fastp");
     assert!(status.success());
-    
+
     // Run fasterp with same parameters
     let status = Command::new(cargo_bin("fasterp"))
-        .arg("-i").arg(test_data_path("pe_small_R1.fq"))
-        .arg("-I").arg(test_data_path("pe_small_R2.fq"))
-        .arg("-o").arg(&fasterp_r1)
-        .arg("-O").arg(&fasterp_r2)
-        .arg("-j").arg(&fasterp_json)
-        .arg("-t").arg("1")
+        .arg("-i")
+        .arg(test_data_path("pe_small_R1.fq"))
+        .arg("-I")
+        .arg(test_data_path("pe_small_R2.fq"))
+        .arg("-o")
+        .arg(&fasterp_r1)
+        .arg("-O")
+        .arg(&fasterp_r2)
+        .arg("-j")
+        .arg(&fasterp_json)
+        .arg("-t")
+        .arg("1")
         .arg("-y")
-        .arg("-Y").arg("30")
+        .arg("-Y")
+        .arg("30")
         .status()
         .expect("Failed to run fasterp");
     assert!(status.success());
-    
+
     // Compare outputs
     let fastp_r1_content = fs::read_to_string(&fastp_r1).unwrap();
     let fasterp_r1_content = fs::read_to_string(&fasterp_r1).unwrap();
-    assert_eq!(fastp_r1_content, fasterp_r1_content, "R1 outputs don't match");
-    
+    assert_eq!(
+        fastp_r1_content, fasterp_r1_content,
+        "R1 outputs don't match"
+    );
+
     let fastp_r2_content = fs::read_to_string(&fastp_r2).unwrap();
     let fasterp_r2_content = fs::read_to_string(&fasterp_r2).unwrap();
-    assert_eq!(fastp_r2_content, fasterp_r2_content, "R2 outputs don't match");
-    
+    assert_eq!(
+        fastp_r2_content, fasterp_r2_content,
+        "R2 outputs don't match"
+    );
+
     compare_json_outputs(&fastp_json, &fasterp_json);
+}
+
+//
+// Multi-threaded Paired-End Tests
+//
+
+#[test]
+fn test_multithreaded_pe_basic() {
+    let single_r1 = "/tmp/test_mt_pe_basic_single_R1.fq";
+    let single_r2 = "/tmp/test_mt_pe_basic_single_R2.fq";
+    let multi_r1 = "/tmp/test_mt_pe_basic_multi_R1.fq";
+    let multi_r2 = "/tmp/test_mt_pe_basic_multi_R2.fq";
+    let single_json = "/tmp/test_mt_pe_basic_single.json";
+    let multi_json = "/tmp/test_mt_pe_basic_multi.json";
+
+    // Run single-threaded
+    let status = Command::new(cargo_bin("fasterp"))
+        .arg("-i")
+        .arg(test_data_path("pe_medium_R1.fq"))
+        .arg("-I")
+        .arg(test_data_path("pe_medium_R2.fq"))
+        .arg("-o")
+        .arg(single_r1)
+        .arg("-O")
+        .arg(single_r2)
+        .arg("-j")
+        .arg(single_json)
+        .arg("-t")
+        .arg("1")
+        .status()
+        .expect("Failed to run fasterp single-threaded");
+    assert!(status.success());
+
+    // Run multi-threaded
+    let status = Command::new(cargo_bin("fasterp"))
+        .arg("-i")
+        .arg(test_data_path("pe_medium_R1.fq"))
+        .arg("-I")
+        .arg(test_data_path("pe_medium_R2.fq"))
+        .arg("-o")
+        .arg(multi_r1)
+        .arg("-O")
+        .arg(multi_r2)
+        .arg("-j")
+        .arg(multi_json)
+        .arg("-t")
+        .arg("4")
+        .status()
+        .expect("Failed to run fasterp multi-threaded");
+    assert!(status.success());
+
+    // Compare outputs - should be identical
+    let single_r1_content = fs::read_to_string(single_r1).unwrap();
+    let multi_r1_content = fs::read_to_string(multi_r1).unwrap();
+    assert_eq!(
+        single_r1_content, multi_r1_content,
+        "R1 outputs don't match between single and multi-threaded"
+    );
+
+    let single_r2_content = fs::read_to_string(single_r2).unwrap();
+    let multi_r2_content = fs::read_to_string(multi_r2).unwrap();
+    assert_eq!(
+        single_r2_content, multi_r2_content,
+        "R2 outputs don't match between single and multi-threaded"
+    );
+
+    compare_json_outputs(&PathBuf::from(single_json), &PathBuf::from(multi_json));
+}
+
+#[test]
+fn test_multithreaded_pe_with_quality_filter() {
+    let single_r1 = "/tmp/test_mt_pe_qual_single_R1.fq";
+    let single_r2 = "/tmp/test_mt_pe_qual_single_R2.fq";
+    let multi_r1 = "/tmp/test_mt_pe_qual_multi_R1.fq";
+    let multi_r2 = "/tmp/test_mt_pe_qual_multi_R2.fq";
+    let single_json = "/tmp/test_mt_pe_qual_single.json";
+    let multi_json = "/tmp/test_mt_pe_qual_multi.json";
+
+    // Run single-threaded
+    let status = Command::new(cargo_bin("fasterp"))
+        .arg("-i")
+        .arg(test_data_path("pe_medium_R1.fq"))
+        .arg("-I")
+        .arg(test_data_path("pe_medium_R2.fq"))
+        .arg("-o")
+        .arg(single_r1)
+        .arg("-O")
+        .arg(single_r2)
+        .arg("-j")
+        .arg(single_json)
+        .arg("-q")
+        .arg("25") // Quality filter
+        .arg("-u")
+        .arg("30") // Unqualified percent limit
+        .arg("-t")
+        .arg("1")
+        .status()
+        .expect("Failed to run fasterp single-threaded");
+    assert!(status.success());
+
+    // Run multi-threaded
+    let status = Command::new(cargo_bin("fasterp"))
+        .arg("-i")
+        .arg(test_data_path("pe_medium_R1.fq"))
+        .arg("-I")
+        .arg(test_data_path("pe_medium_R2.fq"))
+        .arg("-o")
+        .arg(multi_r1)
+        .arg("-O")
+        .arg(multi_r2)
+        .arg("-j")
+        .arg(multi_json)
+        .arg("-q")
+        .arg("25")
+        .arg("-u")
+        .arg("30")
+        .arg("-t")
+        .arg("4")
+        .status()
+        .expect("Failed to run fasterp multi-threaded");
+    assert!(status.success());
+
+    // Compare outputs
+    let single_r1_content = fs::read_to_string(single_r1).unwrap();
+    let multi_r1_content = fs::read_to_string(multi_r1).unwrap();
+    assert_eq!(
+        single_r1_content, multi_r1_content,
+        "R1 outputs don't match"
+    );
+
+    let single_r2_content = fs::read_to_string(single_r2).unwrap();
+    let multi_r2_content = fs::read_to_string(multi_r2).unwrap();
+    assert_eq!(
+        single_r2_content, multi_r2_content,
+        "R2 outputs don't match"
+    );
+
+    compare_json_outputs(&PathBuf::from(single_json), &PathBuf::from(multi_json));
+}
+
+#[test]
+fn test_multithreaded_pe_with_adapters() {
+    let single_r1 = "/tmp/test_mt_pe_adapter_single_R1.fq";
+    let single_r2 = "/tmp/test_mt_pe_adapter_single_R2.fq";
+    let multi_r1 = "/tmp/test_mt_pe_adapter_multi_R1.fq";
+    let multi_r2 = "/tmp/test_mt_pe_adapter_multi_R2.fq";
+    let single_json = "/tmp/test_mt_pe_adapter_single.json";
+    let multi_json = "/tmp/test_mt_pe_adapter_multi.json";
+
+    // Run single-threaded
+    let status = Command::new(cargo_bin("fasterp"))
+        .arg("-i")
+        .arg(test_data_path("pe_medium_R1.fq"))
+        .arg("-I")
+        .arg(test_data_path("pe_medium_R2.fq"))
+        .arg("-o")
+        .arg(single_r1)
+        .arg("-O")
+        .arg(single_r2)
+        .arg("-j")
+        .arg(single_json)
+        .arg("--adapter_sequence")
+        .arg("AGATCGGAAGAGC")
+        .arg("--adapter_sequence_r2")
+        .arg("AGATCGGAAGAGC")
+        .arg("-t")
+        .arg("1")
+        .status()
+        .expect("Failed to run fasterp single-threaded");
+    assert!(status.success());
+
+    // Run multi-threaded
+    let status = Command::new(cargo_bin("fasterp"))
+        .arg("-i")
+        .arg(test_data_path("pe_medium_R1.fq"))
+        .arg("-I")
+        .arg(test_data_path("pe_medium_R2.fq"))
+        .arg("-o")
+        .arg(multi_r1)
+        .arg("-O")
+        .arg(multi_r2)
+        .arg("-j")
+        .arg(multi_json)
+        .arg("--adapter_sequence")
+        .arg("AGATCGGAAGAGC")
+        .arg("--adapter_sequence_r2")
+        .arg("AGATCGGAAGAGC")
+        .arg("-t")
+        .arg("4")
+        .status()
+        .expect("Failed to run fasterp multi-threaded");
+    assert!(status.success());
+
+    // Compare outputs
+    let single_r1_content = fs::read_to_string(single_r1).unwrap();
+    let multi_r1_content = fs::read_to_string(multi_r1).unwrap();
+    assert_eq!(
+        single_r1_content, multi_r1_content,
+        "R1 outputs don't match"
+    );
+
+    let single_r2_content = fs::read_to_string(single_r2).unwrap();
+    let multi_r2_content = fs::read_to_string(multi_r2).unwrap();
+    assert_eq!(
+        single_r2_content, multi_r2_content,
+        "R2 outputs don't match"
+    );
+
+    compare_json_outputs(&PathBuf::from(single_json), &PathBuf::from(multi_json));
+}
+
+#[test]
+fn test_multithreaded_pe_with_trimming() {
+    let single_r1 = "/tmp/test_mt_pe_trim_single_R1.fq";
+    let single_r2 = "/tmp/test_mt_pe_trim_single_R2.fq";
+    let multi_r1 = "/tmp/test_mt_pe_trim_multi_R1.fq";
+    let multi_r2 = "/tmp/test_mt_pe_trim_multi_R2.fq";
+    let single_json = "/tmp/test_mt_pe_trim_single.json";
+    let multi_json = "/tmp/test_mt_pe_trim_multi.json";
+
+    // Run single-threaded
+    let status = Command::new(cargo_bin("fasterp"))
+        .arg("-i")
+        .arg(test_data_path("pe_medium_R1.fq"))
+        .arg("-I")
+        .arg(test_data_path("pe_medium_R2.fq"))
+        .arg("-o")
+        .arg(single_r1)
+        .arg("-O")
+        .arg(single_r2)
+        .arg("-j")
+        .arg(single_json)
+        .arg("--trim_front1")
+        .arg("5")
+        .arg("--trim_tail1")
+        .arg("3")
+        .arg("--trim_front2")
+        .arg("3")
+        .arg("--trim_tail2")
+        .arg("5")
+        .arg("-t")
+        .arg("1")
+        .status()
+        .expect("Failed to run fasterp single-threaded");
+    assert!(status.success());
+
+    // Run multi-threaded
+    let status = Command::new(cargo_bin("fasterp"))
+        .arg("-i")
+        .arg(test_data_path("pe_medium_R1.fq"))
+        .arg("-I")
+        .arg(test_data_path("pe_medium_R2.fq"))
+        .arg("-o")
+        .arg(multi_r1)
+        .arg("-O")
+        .arg(multi_r2)
+        .arg("-j")
+        .arg(multi_json)
+        .arg("--trim_front1")
+        .arg("5")
+        .arg("--trim_tail1")
+        .arg("3")
+        .arg("--trim_front2")
+        .arg("3")
+        .arg("--trim_tail2")
+        .arg("5")
+        .arg("-t")
+        .arg("4")
+        .status()
+        .expect("Failed to run fasterp multi-threaded");
+    assert!(status.success());
+
+    // Compare outputs
+    let single_r1_content = fs::read_to_string(single_r1).unwrap();
+    let multi_r1_content = fs::read_to_string(multi_r1).unwrap();
+    assert_eq!(
+        single_r1_content, multi_r1_content,
+        "R1 outputs don't match"
+    );
+
+    let single_r2_content = fs::read_to_string(single_r2).unwrap();
+    let multi_r2_content = fs::read_to_string(multi_r2).unwrap();
+    assert_eq!(
+        single_r2_content, multi_r2_content,
+        "R2 outputs don't match"
+    );
+
+    compare_json_outputs(&PathBuf::from(single_json), &PathBuf::from(multi_json));
+}
+
+#[test]
+fn test_multithreaded_pe_all_features() {
+    let single_r1 = "/tmp/test_mt_pe_all_single_R1.fq";
+    let single_r2 = "/tmp/test_mt_pe_all_single_R2.fq";
+    let multi_r1 = "/tmp/test_mt_pe_all_multi_R1.fq";
+    let multi_r2 = "/tmp/test_mt_pe_all_multi_R2.fq";
+    let single_json = "/tmp/test_mt_pe_all_single.json";
+    let multi_json = "/tmp/test_mt_pe_all_multi.json";
+
+    // Run single-threaded with all features
+    let status = Command::new(cargo_bin("fasterp"))
+        .arg("-i")
+        .arg(test_data_path("pe_medium_R1.fq"))
+        .arg("-I")
+        .arg(test_data_path("pe_medium_R2.fq"))
+        .arg("-o")
+        .arg(single_r1)
+        .arg("-O")
+        .arg(single_r2)
+        .arg("-j")
+        .arg(single_json)
+        .arg("-q")
+        .arg("20") // Quality filter
+        .arg("-u")
+        .arg("40") // Unqualified percent
+        .arg("-l")
+        .arg("25") // Length filter
+        .arg("-n")
+        .arg("5") // N base limit
+        .arg("--trim_front1")
+        .arg("3") // Trimming
+        .arg("--trim_tail1")
+        .arg("2")
+        .arg("--trim_front2")
+        .arg("2")
+        .arg("--trim_tail2")
+        .arg("3")
+        .arg("--adapter_sequence")
+        .arg("AGATCGGAAGAGC") // Adapters
+        .arg("--adapter_sequence_r2")
+        .arg("AGATCGGAAGAGC")
+        .arg("-y") // Low complexity filter
+        .arg("-Y")
+        .arg("30")
+        .arg("-t")
+        .arg("1")
+        .status()
+        .expect("Failed to run fasterp single-threaded");
+    assert!(status.success());
+
+    // Run multi-threaded with all features
+    let status = Command::new(cargo_bin("fasterp"))
+        .arg("-i")
+        .arg(test_data_path("pe_medium_R1.fq"))
+        .arg("-I")
+        .arg(test_data_path("pe_medium_R2.fq"))
+        .arg("-o")
+        .arg(multi_r1)
+        .arg("-O")
+        .arg(multi_r2)
+        .arg("-j")
+        .arg(multi_json)
+        .arg("-q")
+        .arg("20")
+        .arg("-u")
+        .arg("40")
+        .arg("-l")
+        .arg("25")
+        .arg("-n")
+        .arg("5")
+        .arg("--trim_front1")
+        .arg("3")
+        .arg("--trim_tail1")
+        .arg("2")
+        .arg("--trim_front2")
+        .arg("2")
+        .arg("--trim_tail2")
+        .arg("3")
+        .arg("--adapter_sequence")
+        .arg("AGATCGGAAGAGC")
+        .arg("--adapter_sequence_r2")
+        .arg("AGATCGGAAGAGC")
+        .arg("-y")
+        .arg("-Y")
+        .arg("30")
+        .arg("-t")
+        .arg("4")
+        .status()
+        .expect("Failed to run fasterp multi-threaded");
+    assert!(status.success());
+
+    // Compare outputs
+    let single_r1_content = fs::read_to_string(single_r1).unwrap();
+    let multi_r1_content = fs::read_to_string(multi_r1).unwrap();
+    assert_eq!(
+        single_r1_content, multi_r1_content,
+        "R1 outputs don't match"
+    );
+
+    let single_r2_content = fs::read_to_string(single_r2).unwrap();
+    let multi_r2_content = fs::read_to_string(multi_r2).unwrap();
+    assert_eq!(
+        single_r2_content, multi_r2_content,
+        "R2 outputs don't match"
+    );
+
+    compare_json_outputs(&PathBuf::from(single_json), &PathBuf::from(multi_json));
+}
+
+#[test]
+fn test_multithreaded_pe_low_complexity() {
+    let single_r1 = "/tmp/test_mt_pe_complexity_single_R1.fq";
+    let single_r2 = "/tmp/test_mt_pe_complexity_single_R2.fq";
+    let multi_r1 = "/tmp/test_mt_pe_complexity_multi_R1.fq";
+    let multi_r2 = "/tmp/test_mt_pe_complexity_multi_R2.fq";
+    let single_json = "/tmp/test_mt_pe_complexity_single.json";
+    let multi_json = "/tmp/test_mt_pe_complexity_multi.json";
+
+    // Run single-threaded
+    let status = Command::new(cargo_bin("fasterp"))
+        .arg("-i")
+        .arg(test_data_path("pe_medium_R1.fq"))
+        .arg("-I")
+        .arg(test_data_path("pe_medium_R2.fq"))
+        .arg("-o")
+        .arg(single_r1)
+        .arg("-O")
+        .arg(single_r2)
+        .arg("-j")
+        .arg(single_json)
+        .arg("-y")
+        .arg("-Y")
+        .arg("30")
+        .arg("-t")
+        .arg("1")
+        .status()
+        .expect("Failed to run fasterp single-threaded");
+    assert!(status.success());
+
+    // Run multi-threaded
+    let status = Command::new(cargo_bin("fasterp"))
+        .arg("-i")
+        .arg(test_data_path("pe_medium_R1.fq"))
+        .arg("-I")
+        .arg(test_data_path("pe_medium_R2.fq"))
+        .arg("-o")
+        .arg(multi_r1)
+        .arg("-O")
+        .arg(multi_r2)
+        .arg("-j")
+        .arg(multi_json)
+        .arg("-y")
+        .arg("-Y")
+        .arg("30")
+        .arg("-t")
+        .arg("4")
+        .status()
+        .expect("Failed to run fasterp multi-threaded");
+    assert!(status.success());
+
+    // Compare outputs
+    let single_r1_content = fs::read_to_string(single_r1).unwrap();
+    let multi_r1_content = fs::read_to_string(multi_r1).unwrap();
+    assert_eq!(
+        single_r1_content, multi_r1_content,
+        "R1 outputs don't match"
+    );
+
+    let single_r2_content = fs::read_to_string(single_r2).unwrap();
+    let multi_r2_content = fs::read_to_string(multi_r2).unwrap();
+    assert_eq!(
+        single_r2_content, multi_r2_content,
+        "R2 outputs don't match"
+    );
+
+    compare_json_outputs(&PathBuf::from(single_json), &PathBuf::from(multi_json));
 }

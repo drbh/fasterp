@@ -24,12 +24,12 @@ Same interface and behavior, often **>5× faster** but your mileage may vary dep
 | PE Quality filtering          |   ✓   |       ✓       |
 | PE Read synchronization       |   ✓   |       ✓       |
 | PE JSON reports               |   ✓   |       ✓       |
-| PE Multi-threading            |   ✓   |       -       |
+| PE Multi-threading            |   ✓   |       ✓       |
 | Adapter trimming (SE)         |   ✓   |       ✓       |
 | Adapter trimming (PE)         |   ✓   |       ✓       |
 | Auto-detection adapters       |   ✓   |       -       |
 | HTML reports                  |   ✓   | NOT SUPPORTED |
-| Low complexity filtering      |   ✓   |       -       |
+| Low complexity filtering      |   ✓   |       ✓       |
 | Base correction (PE overlap)  |   ✓   |       -       |
 | UMI processing                |   ✓   |       -       |
 | Deduplication                 |   ✓   |       -       |
