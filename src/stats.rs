@@ -41,6 +41,23 @@ pub(crate) struct QualityCurves {
     pub mean: Vec<f64>,
 }
 
+/// Content curves data for per-position base content percentages
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct ContentCurves {
+    #[serde(rename = "A")]
+    pub a: Vec<f64>,
+    #[serde(rename = "T")]
+    pub t: Vec<f64>,
+    #[serde(rename = "C")]
+    pub c: Vec<f64>,
+    #[serde(rename = "G")]
+    pub g: Vec<f64>,
+    #[serde(rename = "N")]
+    pub n: Vec<f64>,
+    #[serde(rename = "GC")]
+    pub gc: Vec<f64>,
+}
+
 /// Detailed read statistics including kmer counts
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct DetailedReadStats {
@@ -49,12 +66,15 @@ pub(crate) struct DetailedReadStats {
     pub q20_bases: usize,
     pub q30_bases: usize,
     pub quality_curves: QualityCurves,
+    pub content_curves: ContentCurves,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub qual_hist: Option<IndexMap<u8, usize>>,
     pub kmer_count: IndexMap<String, usize>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct Summary {
-    pub fastp_version: String,
+    pub fasterp_version: String,
     pub sequencing: String,
     pub before_filtering: ReadStats,
     pub after_filtering: ReadStats,
@@ -72,7 +92,18 @@ pub(crate) struct FilteringResult {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct FastpReport {
+pub(crate) struct DuplicationStats {
+    pub rate: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct AdapterCuttingStats {
+    pub adapter_trimmed_reads: usize,
+    pub adapter_trimmed_bases: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct FasterpReport {
     pub summary: Summary,
     pub filtering_result: FilteringResult,
     pub read1_before_filtering: DetailedReadStats,
@@ -82,6 +113,10 @@ pub(crate) struct FastpReport {
     pub read1_after_filtering: Option<DetailedReadStats>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub read2_after_filtering: Option<DetailedReadStats>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duplication: Option<DuplicationStats>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub adapter_cutting: Option<AdapterCuttingStats>,
 }
 
 /// Accumulator for per-position quality statistics
@@ -94,6 +129,8 @@ pub(crate) struct PositionStats {
     pub total_sum: Vec<u64>,
     /// Total count per position
     pub total_cnt: Vec<u64>,
+    /// Quality score histogram: count of bases at each quality score (0-93, phred33)
+    pub qual_hist: [usize; 94],
 }
 
 impl PositionStats {
@@ -116,6 +153,7 @@ impl PositionStats {
             ],
             total_sum: Vec::with_capacity(TYPICAL_READ_LEN),
             total_cnt: Vec::with_capacity(TYPICAL_READ_LEN),
+            qual_hist: [0; 94],
         }
     }
 
@@ -170,6 +208,62 @@ impl PositionStats {
             mean,
         }
     }
+
+    /// Convert to ContentCurves for JSON output (base content percentages per position)
+    pub(crate) fn to_content_curves(&self) -> ContentCurves {
+        let mut a_pct = Vec::with_capacity(self.total_cnt.len());
+        let mut t_pct = Vec::with_capacity(self.total_cnt.len());
+        let mut c_pct = Vec::with_capacity(self.total_cnt.len());
+        let mut g_pct = Vec::with_capacity(self.total_cnt.len());
+        let mut n_pct = Vec::with_capacity(self.total_cnt.len());
+        let mut gc_pct = Vec::with_capacity(self.total_cnt.len());
+
+        for pos in 0..self.total_cnt.len() {
+            let total = self.total_cnt[pos] as f64;
+            if total > 0.0 {
+                let a = self.base_cnt[0].get(pos).copied().unwrap_or(0) as f64;
+                let t = self.base_cnt[1].get(pos).copied().unwrap_or(0) as f64;
+                let c = self.base_cnt[2].get(pos).copied().unwrap_or(0) as f64;
+                let g = self.base_cnt[3].get(pos).copied().unwrap_or(0) as f64;
+                let bases_sum = a + t + c + g;
+                let n = total - bases_sum;
+
+                a_pct.push(a * 100.0 / total);
+                t_pct.push(t * 100.0 / total);
+                c_pct.push(c * 100.0 / total);
+                g_pct.push(g * 100.0 / total);
+                n_pct.push(n * 100.0 / total);
+                gc_pct.push((g + c) * 100.0 / total);
+            } else {
+                a_pct.push(0.0);
+                t_pct.push(0.0);
+                c_pct.push(0.0);
+                g_pct.push(0.0);
+                n_pct.push(0.0);
+                gc_pct.push(0.0);
+            }
+        }
+
+        ContentCurves {
+            a: a_pct,
+            t: t_pct,
+            c: c_pct,
+            g: g_pct,
+            n: n_pct,
+            gc: gc_pct,
+        }
+    }
+
+    /// Convert quality histogram to IndexMap for JSON output
+    pub(crate) fn to_qual_hist(&self) -> Option<IndexMap<u8, usize>> {
+        let mut hist = IndexMap::new();
+        for (q, &count) in self.qual_hist.iter().enumerate() {
+            if count > 0 {
+                hist.insert(q as u8, count);
+            }
+        }
+        if hist.is_empty() { None } else { Some(hist) }
+    }
 }
 
 /// Simple stats accumulator
@@ -219,4 +313,19 @@ impl SimpleStats {
             },
         }
     }
+}
+
+/// Calculate duplication rate from kmer counts
+/// Duplication is estimated by comparing total kmers to unique kmers
+pub(crate) fn calculate_duplication_rate(kmer_counts: &indexmap::IndexMap<String, usize>) -> f64 {
+    let total_kmers: usize = kmer_counts.values().sum();
+    let unique_kmers = kmer_counts.len();
+
+    if total_kmers == 0 {
+        return 0.0;
+    }
+
+    // Duplication rate = 1 - (unique / total)
+
+    1.0 - (unique_kmers as f64 / total_kmers as f64)
 }

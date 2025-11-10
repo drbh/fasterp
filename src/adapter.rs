@@ -426,22 +426,19 @@ fn try_insertion_match(
     let mut acc_mismatch_from_right = vec![diff_limit + 1; cmplen];
 
     // Initialize first and last elements
-    acc_mismatch_from_left[0] =
-        if ins_data[ins_start_pos].to_ascii_uppercase() == normal_data[0].to_ascii_uppercase() {
-            0
-        } else {
-            1
-        };
+    acc_mismatch_from_left[0] = if ins_data[ins_start_pos].eq_ignore_ascii_case(&normal_data[0]) {
+        0
+    } else {
+        1
+    };
 
     if ins_start_pos + cmplen < ins_data.len() {
-        acc_mismatch_from_right[cmplen - 1] = if ins_data[ins_start_pos + cmplen]
-            .to_ascii_uppercase()
-            == normal_data[cmplen - 1].to_ascii_uppercase()
-        {
-            0
-        } else {
-            1
-        };
+        acc_mismatch_from_right[cmplen - 1] =
+            if ins_data[ins_start_pos + cmplen].eq_ignore_ascii_case(&normal_data[cmplen - 1]) {
+                0
+            } else {
+                1
+            };
     } else {
         return None;
     }
@@ -452,7 +449,7 @@ fn try_insertion_match(
             return None;
         }
 
-        if ins_data[ins_start_pos + i].to_ascii_uppercase() != normal_data[i].to_ascii_uppercase() {
+        if !ins_data[ins_start_pos + i].eq_ignore_ascii_case(&normal_data[i]) {
             acc_mismatch_from_left[i] = acc_mismatch_from_left[i - 1] + 1;
         } else {
             acc_mismatch_from_left[i] = acc_mismatch_from_left[i - 1];
@@ -470,9 +467,7 @@ fn try_insertion_match(
             continue;
         }
 
-        if ins_data[ins_start_pos + i + 1].to_ascii_uppercase()
-            != normal_data[i].to_ascii_uppercase()
-        {
+        if !ins_data[ins_start_pos + i + 1].eq_ignore_ascii_case(&normal_data[i]) {
             acc_mismatch_from_right[i] = acc_mismatch_from_right[i + 1] + 1;
         } else {
             acc_mismatch_from_right[i] = acc_mismatch_from_right[i + 1];
@@ -794,7 +789,10 @@ mod tests {
         // Fastp finds a match at position 18, not position 0
         // The beginning doesn't match due to strict deletion matching criteria
         if let Some(m) = result {
-            assert_ne!(m.position, 0, "Should not match at position 0 with deletion logic");
+            assert_ne!(
+                m.position, 0,
+                "Should not match at position 0 with deletion logic"
+            );
         }
     }
 

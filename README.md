@@ -6,40 +6,40 @@
 **fasterp** — a Rust reimplementation of [**fastp**](https://github.com/OpenGene/fastp).
 Same interface and behavior, often **>5× faster** but your mileage may vary depending on dataset and CPU.
 
-| Feature                       | fastp |    fasterp    |
-| :---------------------------- | :---: | :-----------: |
-| **Single-End Support**        |   ✓   |       ✓       |
-| Quality filtering             |   ✓   |       ✓       |
-| Length filtering              |   ✓   |       ✓       |
-| N-base filtering              |   ✓   |       ✓       |
-| Sliding window trimming       |   ✓   |       ✓       |
-| Fixed position trimming       |   ✓   |       ✓       |
-| PolyG/PolyX trimming          |   ✓   |       ✓       |
-| JSON report                   |   ✓   |       ✓       |
-| 5-mer counting                |   ✓   |       ✓       |
-| Multi-threading               |   ✓   |       ✓       |
-| gzip I/O                      |   ✓   |       ✓       |
-| stdin/stdout support          |   ✓   |       ✓       |
-| **Paired-End Support**        |   ✓   |       ✓       |
-| PE Quality filtering          |   ✓   |       ✓       |
-| PE Read synchronization       |   ✓   |       ✓       |
-| PE JSON reports               |   ✓   |       ✓       |
-| PE Multi-threading            |   ✓   |       ✓       |
-| Adapter trimming (SE)         |   ✓   |       ✓       |
-| Adapter trimming (PE)         |   ✓   |       ✓       |
-| Auto-detection adapters       |   ✓   |       -       |
-| HTML reports                  |   ✓   | NOT SUPPORTED |
-| Low complexity filtering      |   ✓   |       ✓       |
-| Base correction (PE overlap)  |   ✓   |       ✓       |
-| UMI processing                |   ✓   |       ✓       |
-| Deduplication                 |   ✓   |       ✓       |
-| Output splitting              |   ✓   |       ✓       |
-| Read merging                  |   ✓   |       -       |
-| Rust memory safety (mostly)   |   -   |       ✓       |
-| SIMD acceleration (AVX2/NEON) |   -   |       ✓       |
-| Minimal memory usage          |   -   |       ✓       |
-| Few dependencies              |   -   |       ✓       |
-| 5-10× faster performance      |   -   |       ✓       |
+| Feature                       | fastp | fasterp |
+| :---------------------------- | :---: | :-----: |
+| **Single-End Support**        |   ✓   |    ✓    |
+| Quality filtering             |   ✓   |    ✓    |
+| Length filtering              |   ✓   |    ✓    |
+| N-base filtering              |   ✓   |    ✓    |
+| Sliding window trimming       |   ✓   |    ✓    |
+| Fixed position trimming       |   ✓   |    ✓    |
+| PolyG/PolyX trimming          |   ✓   |    ✓    |
+| JSON report                   |   ✓   |    ✓    |
+| 5-mer counting                |   ✓   |    ✓    |
+| Multi-threading               |   ✓   |    ✓    |
+| gzip I/O                      |   ✓   |    ✓    |
+| stdin/stdout support          |   ✓   |    ✓    |
+| **Paired-End Support**        |   ✓   |    ✓    |
+| PE Quality filtering          |   ✓   |    ✓    |
+| PE Read synchronization       |   ✓   |    ✓    |
+| PE JSON reports               |   ✓   |    ✓    |
+| PE Multi-threading            |   ✓   |    ✓    |
+| Adapter trimming (SE)         |   ✓   |    ✓    |
+| Adapter trimming (PE)         |   ✓   |    ✓    |
+| Auto-detection adapters       |   ✓   |    -    |
+| HTML reports                  |   ✓   |    ✓    |
+| Low complexity filtering      |   ✓   |    ✓    |
+| Base correction (PE overlap)  |   ✓   |    ✓    |
+| UMI processing                |   ✓   |    ✓    |
+| Deduplication                 |   ✓   |    ✓    |
+| Output splitting              |   ✓   |    ✓    |
+| Read merging                  |   ✓   |    -    |
+| Rust memory safety (mostly)   |   -   |    ✓    |
+| SIMD acceleration (AVX2/NEON) |   -   |    ✓    |
+| Minimal memory usage          |   -   |    ✓    |
+| Few dependencies              |   -   |    ✓    |
+| 5-10× faster performance      |   -   |    ✓    |
 
 
 ## Installation

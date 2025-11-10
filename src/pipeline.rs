@@ -10,11 +10,10 @@
 use anyhow::Result;
 use crossbeam_channel::{Receiver, Sender};
 use std::collections::BTreeMap;
-use std::io::{BufWriter, IoSlice, Read, Write};
+use std::io::{IoSlice, Read, Write};
 use std::ops::Range;
 use std::sync::Arc;
 
-use crate::io::open_output;
 use crate::kmer::*;
 use crate::processor::StreamAccumulator;
 use crate::simd;
@@ -81,7 +80,9 @@ pub(crate) struct WorkerResult {
     pub before: SimpleStats,
     pub after: SimpleStats,
     pub pos: PositionStats,
+    pub pos_after: PositionStats,
     pub k5: [usize; 1024],
+    pub k5_after: [usize; 1024],
     // Filter counts
     pub too_short: usize,
     pub too_many_n: usize,
@@ -287,7 +288,9 @@ pub(crate) fn worker_thread(
         let mut before = SimpleStats::default();
         let mut after = SimpleStats::default();
         let mut pos = PositionStats::new();
+        let mut pos_after = PositionStats::new();
         let mut k5 = [0usize; 1024];
+        let mut k5_after = [0usize; 1024];
         let mut too_short = 0usize;
         let mut too_many_n = 0usize;
         let mut low_quality = 0usize;
@@ -329,12 +332,18 @@ pub(crate) fn worker_thread(
 
                 pos.ensure_capacity(seq.len());
                 for (i, (&b, &q)) in seq.iter().zip(qual).enumerate() {
-                    pos.total_sum[i] += (q - 33) as u64;
+                    let qval = (q - 33) as u64;
+                    pos.total_sum[i] += qval;
                     pos.total_cnt[i] += 1;
 
                     if let Some(bi) = base_idx(b) {
-                        pos.base_sum[bi][i] += (q - 33) as u64;
+                        pos.base_sum[bi][i] += qval;
                         pos.base_cnt[bi][i] += 1;
+                    }
+
+                    // Track quality histogram
+                    if qval < 94 {
+                        pos.qual_hist[qval as usize] += 1;
                     }
                 }
 
@@ -370,6 +379,11 @@ pub(crate) fn worker_thread(
                     if let Some(bi) = base_idx(b) {
                         pos.base_sum[bi][i] += qval as u64;
                         pos.base_cnt[bi][i] += 1;
+                    }
+
+                    // Track quality histogram
+                    if (qval as usize) < 94 {
+                        pos.qual_hist[qval as usize] += 1;
                     }
                 }
 
@@ -469,6 +483,29 @@ pub(crate) fn worker_thread(
 
             // Update after stats with trimmed read
             after.add(trimmed_len, trimmed_q20, trimmed_q30, trimmed_gc);
+
+            // Track position stats for after-filtering data (including histogram)
+            pos_after.ensure_capacity(trimmed_len);
+            for (i, (&b, &q)) in trimmed_seq.iter().zip(trimmed_qual).enumerate() {
+                let qval = (q - 33) as u64;
+                pos_after.total_sum[i] += qval;
+                pos_after.total_cnt[i] += 1;
+
+                if let Some(bi) = base_idx(b) {
+                    pos_after.base_sum[bi][i] += qval;
+                    pos_after.base_cnt[bi][i] += 1;
+                }
+
+                // Track quality histogram for after-filtering
+                if qval < 94 {
+                    pos_after.qual_hist[qval as usize] += 1;
+                }
+            }
+
+            // K-mer counting for after-filtering data
+            if !no_kmer {
+                count_k5_2bit(trimmed_seq, &mut k5_after);
+            }
         }
 
         let result = WorkerResult {
@@ -477,7 +514,9 @@ pub(crate) fn worker_thread(
             before,
             after,
             pos,
+            pos_after,
             k5,
+            k5_after,
             too_short,
             too_many_n,
             low_quality,
@@ -593,9 +632,36 @@ pub(crate) fn merger_thread(
                         }
                     }
 
+                    // Merge quality histograms
+                    for (q, &count) in result.pos.qual_hist.iter().enumerate() {
+                        acc.pos.qual_hist[q] += count;
+                    }
+
+                    // Merge after-filtering position stats
+                    acc.pos_after
+                        .ensure_capacity(result.pos_after.total_sum.len());
+                    for i in 0..result.pos_after.total_sum.len() {
+                        acc.pos_after.total_sum[i] += result.pos_after.total_sum[i];
+                        acc.pos_after.total_cnt[i] += result.pos_after.total_cnt[i];
+                        for b in 0..4 {
+                            acc.pos_after.base_sum[b][i] += result.pos_after.base_sum[b][i];
+                            acc.pos_after.base_cnt[b][i] += result.pos_after.base_cnt[b][i];
+                        }
+                    }
+
+                    // Merge after-filtering quality histograms
+                    for (q, &count) in result.pos_after.qual_hist.iter().enumerate() {
+                        acc.pos_after.qual_hist[q] += count;
+                    }
+
                     // Merge k-mer counts
                     for (i, &count) in result.k5.iter().enumerate() {
                         acc.kmer_table[i] += count;
+                    }
+
+                    // Merge after-filtering k-mer counts
+                    for (i, &count) in result.k5_after.iter().enumerate() {
+                        acc.kmer_table_after[i] += count;
                     }
 
                     // Merge filter counts
@@ -689,9 +755,7 @@ pub(crate) fn paired_producer_thread(
         // Verify both files have data (or both don't)
         if (actual_len1 == 0) != (actual_len2 == 0) {
             anyhow::bail!(
-                "Paired-end files are not synchronized: R1 has {} bytes, R2 has {} bytes",
-                actual_len1,
-                actual_len2
+                "Paired-end files are not synchronized: R1 has {actual_len1} bytes, R2 has {actual_len2} bytes"
             );
         }
 
@@ -889,10 +953,10 @@ pub(crate) fn paired_worker_thread(
             // Extract UMI if enabled (happens BEFORE any other processing)
             let umi_seq: Vec<u8>;
             let (final_umi_seq1, final_umi_qual1, final_umi_seq2, final_umi_qual2);
-            let mut umi_seq1_buf;
-            let mut umi_qual1_buf;
-            let mut umi_seq2_buf;
-            let mut umi_qual2_buf;
+            let umi_seq1_buf;
+            let umi_qual1_buf;
+            let umi_seq2_buf;
+            let umi_qual2_buf;
             let umi_extracted;
 
             if let Some(ref cfg) = umi_config {
@@ -1072,31 +1136,29 @@ pub(crate) fn paired_worker_thread(
             // Check unqualified percent (EITHER read fails = BOTH fail)
             let mut fail_quality = false;
             if qualified_quality_phred > 0 {
-                if final_seq1.len() > 0 {
-                    if 100 * trimmed_stats1.unqualified
+                if !final_seq1.is_empty()
+                    && 100 * trimmed_stats1.unqualified
                         > unqualified_percent_limit * final_seq1.len()
-                    {
-                        fail_quality = true;
-                    }
+                {
+                    fail_quality = true;
                 }
-                if final_seq2.len() > 0 {
-                    if 100 * trimmed_stats2.unqualified
+                if !final_seq2.is_empty()
+                    && 100 * trimmed_stats2.unqualified
                         > unqualified_percent_limit * final_seq2.len()
-                    {
-                        fail_quality = true;
-                    }
+                {
+                    fail_quality = true;
                 }
             }
 
             // Check average quality (EITHER read fails = BOTH fail)
             if average_qual > 0 {
-                if final_seq1.len() > 0 {
+                if !final_seq1.is_empty() {
                     let mean_qual1 = trimmed_stats1.qsum as f64 / final_seq1.len() as f64;
                     if mean_qual1 < average_qual as f64 {
                         fail_quality = true;
                     }
                 }
-                if final_seq2.len() > 0 {
+                if !final_seq2.is_empty() {
                     let mean_qual2 = trimmed_stats2.qsum as f64 / final_seq2.len() as f64;
                     if mean_qual2 < average_qual as f64 {
                         fail_quality = true;
@@ -1112,13 +1174,13 @@ pub(crate) fn paired_worker_thread(
             // Check low complexity (EITHER read fails = BOTH fail)
             if low_complexity_filter {
                 let mut fail_complexity = false;
-                if final_seq1.len() > 0 {
+                if !final_seq1.is_empty() {
                     let complexity1 = calculate_complexity(final_seq1);
                     if complexity1 < complexity_threshold {
                         fail_complexity = true;
                     }
                 }
-                if final_seq2.len() > 0 {
+                if !final_seq2.is_empty() {
                     let complexity2 = calculate_complexity(final_seq2);
                     if complexity2 < complexity_threshold {
                         fail_complexity = true;

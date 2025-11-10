@@ -305,6 +305,7 @@ pub(crate) fn trim_read_with_adapter(
 
         if let Some(adapter) = adapter_to_use {
             let current_seq = &seq[result.start_pos..result.end_pos];
+
             if let Some(adapter_match) = crate::adapter::find_adapter(
                 current_seq,
                 adapter,
@@ -325,7 +326,8 @@ pub(crate) fn trim_read_with_adapter(
     };
 
     // 3. Fixed tail trimming (AFTER adapter trim)
-    if config.trim_tail_bases > 0 && !adapter_trimmed {
+    // Note: fastp applies fixed tail trimming AFTER adapter trimming
+    if config.trim_tail_bases > 0 {
         result.end_pos = result.end_pos.saturating_sub(config.trim_tail_bases);
     }
 

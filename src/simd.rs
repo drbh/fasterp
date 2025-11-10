@@ -64,7 +64,7 @@ pub fn compute_stats(seq: &[u8], qual: &[u8], qual_threshold: u8) -> Stats {
     #[cfg(target_arch = "aarch64")]
     {
         // Always use NEON on aarch64 (available on all ARM64 platforms)
-        return unsafe { compute_stats_neon(seq, qual, qual_threshold) };
+        unsafe { compute_stats_neon(seq, qual, qual_threshold) }
     }
 
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]

@@ -93,13 +93,13 @@ impl SplitWriter {
 
         // Generate prefix with padding
         let prefix = if self.config.prefix_digits == 0 {
-            format!("{}", file_num)
+            format!("{file_num}")
         } else {
             format!("{:0width$}", file_num, width = self.config.prefix_digits)
         };
 
         // Combine: directory/prefix.filename
-        parent.join(format!("{}.{}", prefix, filename))
+        parent.join(format!("{prefix}.{filename}"))
     }
 
     /// Open the next output file
@@ -171,8 +171,7 @@ impl SplitWriter {
 
 impl Write for SplitWriter {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.write(buf)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        self.write(buf).map_err(std::io::Error::other)?;
         Ok(buf.len())
     }
 

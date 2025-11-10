@@ -22,21 +22,23 @@ fn main() {
 
     let mut results = Vec::new();
 
+    let test_file_small = "test_data/small_1k.fq";
+    let test_file_medium = "test_data/medium_10k.fq";
+    // let test_file_medium = "test_data/xlarge_500k.fq";
+
     // Benchmark 1: Small dataset (1k reads)
-    if let Some(result) = run_benchmark("test_data/small_1k.fq", "Small dataset (1k reads)", &[]) {
+    if let Some(result) = run_benchmark(test_file_small, "Small dataset (1k reads)", &[]) {
         results.push(result);
     }
 
     // Benchmark 2: Medium dataset (10k reads)
-    if let Some(result) =
-        run_benchmark("test_data/medium_10k.fq", "Medium dataset (10k reads)", &[])
-    {
+    if let Some(result) = run_benchmark(test_file_medium, "Medium dataset (10k reads)", &[]) {
         results.push(result);
     }
 
     // Benchmark 3: Quality trimming
     if let Some(result) = run_benchmark(
-        "test_data/medium_10k.fq",
+        test_file_medium,
         "With quality trimming (10k reads)",
         &["--cut-tail", "--cut-mean-quality", "20"],
     ) {
@@ -77,6 +79,7 @@ fn run_benchmark(input: &str, name: &str, extra_args: &[&str]) -> Option<BenchRe
             .arg("-j")
             .arg(&fastp_json)
             .args(extra_args)
+            .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .status();
     }
@@ -106,6 +109,7 @@ fn run_benchmark(input: &str, name: &str, extra_args: &[&str]) -> Option<BenchRe
             .arg("-j")
             .arg(&fastp_json)
             .args(&fastp_args)
+            .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .status();
 
@@ -140,6 +144,8 @@ fn run_benchmark(input: &str, name: &str, extra_args: &[&str]) -> Option<BenchRe
             .arg("-j")
             .arg(&fasterp_json)
             .args(extra_args)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
             .status();
 
         let duration = start.elapsed();

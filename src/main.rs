@@ -8,12 +8,14 @@
 use anyhow::{Context, Result};
 use clap::Parser;
 use crossbeam_channel::bounded;
+use indexmap::IndexMap;
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::thread;
 
 mod adapter;
 mod dedup;
+mod html;
 mod io;
 mod kmer;
 mod overlap;
@@ -100,8 +102,12 @@ struct Args {
     complexity_threshold: usize,
 
     /// JSON report file (default: fastp.json)
-    #[arg(short = 'j', long, default_value = "fastp.json")]
+    #[arg(short = 'j', long, default_value = "fasterp.json")]
     json: String,
+
+    /// HTML report file (default: fasterp.html)
+    #[arg(long, default_value = "fasterp.html")]
+    html: String,
 
     /// Stats output format: compact (default), pretty, off, or jsonl
     #[arg(long, default_value = "compact")]
@@ -263,7 +269,7 @@ struct Args {
 
 // Helper function to create TrimmingConfig from CLI args
 fn create_trimming_config(args: &Args) -> TrimmingConfig {
-    use crate::adapter::{AdapterConfig, adapters};
+    use crate::adapter::AdapterConfig;
 
     // Create adapter configuration
     let mut adapter_config = AdapterConfig::new();
@@ -424,7 +430,7 @@ fn create_dedup_config(args: &Args) -> Result<dedup::DedupConfig> {
 fn create_split_config(args: &Args) -> Result<split::SplitConfig> {
     // Validate split parameters
     if let Some(num_files) = args.split {
-        if num_files < 2 || num_files > 999 {
+        if !(2..=999).contains(&num_files) {
             anyhow::bail!("Split file number must be between 2 and 999");
         }
     }
@@ -455,7 +461,11 @@ fn create_split_config(args: &Args) -> Result<split::SplitConfig> {
 }
 
 // Helper function to build and write paired-end report
-fn build_and_write_paired_end_report(args: &Args, pe_acc: PairedEndAccumulator) -> Result<()> {
+fn build_and_write_paired_end_report(
+    args: &Args,
+    pe_acc: PairedEndAccumulator,
+    start_time: std::time::Instant,
+) -> Result<()> {
     let before_stats_r1 = pe_acc.before_r1.to_read_stats();
     let after_stats_r1 = pe_acc.after_r1.to_read_stats();
     let before_stats_r2 = pe_acc.before_r2.to_read_stats();
@@ -463,8 +473,23 @@ fn build_and_write_paired_end_report(args: &Args, pe_acc: PairedEndAccumulator) 
 
     let quality_curves_r1 = pe_acc.pos_r1.to_quality_curves();
     let quality_curves_r2 = pe_acc.pos_r2.to_quality_curves();
+    let content_curves_r1 = pe_acc.pos_r1.to_content_curves();
+    let content_curves_r2 = pe_acc.pos_r2.to_content_curves();
+    let qual_hist_r1 = pe_acc.pos_r1.to_qual_hist();
+    let qual_hist_r2 = pe_acc.pos_r2.to_qual_hist();
+    let quality_curves_r1_after = pe_acc.pos_r1_after.to_quality_curves();
+    let quality_curves_r2_after = pe_acc.pos_r2_after.to_quality_curves();
+    let content_curves_r1_after = pe_acc.pos_r1_after.to_content_curves();
+    let content_curves_r2_after = pe_acc.pos_r2_after.to_content_curves();
+    let qual_hist_r1_after = pe_acc.pos_r1_after.to_qual_hist();
+    let qual_hist_r2_after = pe_acc.pos_r2_after.to_qual_hist();
     let kmer_map_r1 = pe_acc.kmer_table_to_map_r1();
     let kmer_map_r2 = pe_acc.kmer_table_to_map_r2();
+
+    // Calculate duplication rate from combined kmer counts
+    let dup_rate_r1 = stats::calculate_duplication_rate(&kmer_map_r1);
+    let dup_rate_r2 = stats::calculate_duplication_rate(&kmer_map_r2);
+    let combined_dup_rate = (dup_rate_r1 + dup_rate_r2) / 2.0;
 
     // Calculate combined before/after stats for summary
     let combined_before = ReadStats {
@@ -533,9 +558,9 @@ fn build_and_write_paired_end_report(args: &Args, pe_acc: PairedEndAccumulator) 
         },
     };
 
-    let report = FastpReport {
+    let report = FasterpReport {
         summary: Summary {
-            fastp_version: env!("CARGO_PKG_VERSION").to_string(),
+            fasterp_version: env!("CARGO_PKG_VERSION").to_string(),
             sequencing: format!(
                 "paired end ({} cycles + {} cycles)",
                 pe_acc.max_cycle_r1, pe_acc.max_cycle_r2
@@ -558,6 +583,8 @@ fn build_and_write_paired_end_report(args: &Args, pe_acc: PairedEndAccumulator) 
             q20_bases: before_stats_r1.q20_bases,
             q30_bases: before_stats_r1.q30_bases,
             quality_curves: quality_curves_r1,
+            content_curves: content_curves_r1,
+            qual_hist: qual_hist_r1,
             kmer_count: kmer_map_r1,
         },
         read2_before_filtering: Some(DetailedReadStats {
@@ -566,11 +593,39 @@ fn build_and_write_paired_end_report(args: &Args, pe_acc: PairedEndAccumulator) 
             q20_bases: before_stats_r2.q20_bases,
             q30_bases: before_stats_r2.q30_bases,
             quality_curves: quality_curves_r2,
+            content_curves: content_curves_r2,
+            qual_hist: qual_hist_r2,
             kmer_count: kmer_map_r2,
         }),
-        read1_after_filtering: None,
-        read2_after_filtering: None,
+        read1_after_filtering: Some(DetailedReadStats {
+            total_reads: after_stats_r1.total_reads,
+            total_bases: after_stats_r1.total_bases,
+            q20_bases: after_stats_r1.q20_bases,
+            q30_bases: after_stats_r1.q30_bases,
+            quality_curves: quality_curves_r1_after,
+            content_curves: content_curves_r1_after,
+            qual_hist: qual_hist_r1_after,
+            kmer_count: IndexMap::new(),
+        }),
+        read2_after_filtering: Some(DetailedReadStats {
+            total_reads: after_stats_r2.total_reads,
+            total_bases: after_stats_r2.total_bases,
+            q20_bases: after_stats_r2.q20_bases,
+            q30_bases: after_stats_r2.q30_bases,
+            quality_curves: quality_curves_r2_after,
+            content_curves: content_curves_r2_after,
+            qual_hist: qual_hist_r2_after,
+            kmer_count: IndexMap::new(),
+        }),
+        duplication: Some(DuplicationStats {
+            rate: combined_dup_rate,
+        }),
+        adapter_cutting: None, // TODO: Track adapter cutting stats
     };
+
+    // Print report to stdout (fastp-compatible format)
+    let elapsed = start_time.elapsed();
+    print_report_to_stdout(&report, args, elapsed, true);
 
     // Write JSON report
     match args.stats_format.as_str() {
@@ -604,7 +659,150 @@ fn build_and_write_paired_end_report(args: &Args, pe_acc: PairedEndAccumulator) 
         }
     }
 
+    // Generate HTML report
+    html::generate_html_report(&report, args, &args.html)
+        .context("Failed to generate HTML report")?;
+
     Ok(())
+}
+
+// STDOUT REPORTING FUNCTIONS
+
+/// Print a summary of read statistics
+fn print_read_stats(title: &str, stats: &ReadStats) {
+    println!("{title}:");
+    println!("total reads: {}", stats.total_reads);
+    println!("total bases: {}", stats.total_bases);
+    println!(
+        "Q20 bases: {}({:.4}%)",
+        stats.q20_bases,
+        stats.q20_rate * 100.0
+    );
+    println!(
+        "Q30 bases: {}({:.4}%)",
+        stats.q30_bases,
+        stats.q30_rate * 100.0
+    );
+    println!("Q40 bases: 0(0%)");
+}
+
+/// Print filtering results
+fn print_filtering_results(
+    result: &FilteringResult,
+    adapter_cutting: Option<&AdapterCuttingStats>,
+) {
+    println!("Filtering result:");
+    println!("reads passed filter: {}", result.passed_filter_reads);
+    println!(
+        "reads failed due to low quality: {}",
+        result.low_quality_reads
+    );
+    println!(
+        "reads failed due to too many N: {}",
+        result.too_many_n_reads
+    );
+    println!("reads failed due to too short: {}", result.too_short_reads);
+
+    if let Some(ac) = adapter_cutting {
+        println!("reads with adapter trimmed: {}", ac.adapter_trimmed_reads);
+        println!(
+            "bases trimmed due to adapters: {}",
+            ac.adapter_trimmed_bases
+        );
+    } else {
+        println!("reads with adapter trimmed: 0");
+        println!("bases trimmed due to adapters: 0");
+    }
+}
+
+/// Print command line reconstruction
+fn print_command_line(args: &Args, is_paired_end: bool) {
+    if is_paired_end {
+        print!("fasterp -i {} ", args.input);
+        if let Some(ref in2) = args.input2 {
+            print!("-I {in2} ");
+        }
+        print!("-o {} ", args.output);
+        if let Some(ref out2) = args.output2 {
+            print!("-O {out2} ");
+        }
+        println!("-j {}", args.json);
+    } else {
+        println!(
+            "fasterp -i {} -o {} -j {}",
+            args.input, args.output, args.json
+        );
+    }
+}
+
+/// Print full report to stdout (fastp-compatible format)
+fn print_report_to_stdout(
+    report: &FasterpReport,
+    args: &Args,
+    elapsed: std::time::Duration,
+    is_paired_end: bool,
+) {
+    // Adapter detection messages
+    if is_paired_end {
+        println!("Detecting adapter sequence for read1...");
+        println!("No adapter detected for read1");
+        println!();
+        println!("Detecting adapter sequence for read2...");
+        println!("No adapter detected for read2");
+    } else {
+        println!("Detecting adapter sequence for read1...");
+        println!("No adapter detected for read1");
+    }
+    println!();
+
+    // Before/after stats for read1
+    print_read_stats("Read1 before filtering", &report.summary.before_filtering);
+    println!();
+    print_read_stats("Read1 after filtering", &report.summary.after_filtering);
+    println!();
+
+    // If paired-end, print read2 stats
+    if is_paired_end {
+        // Note: For PE, we'd need separate read2 stats which aren't currently
+        // separated in the summary. For now, just print read1 stats.
+        // TODO: Add separate read2 before/after stats to Summary
+    }
+
+    // Filtering results
+    print_filtering_results(&report.filtering_result, report.adapter_cutting.as_ref());
+    println!();
+
+    // Duplication rate
+    if let Some(dup) = &report.duplication {
+        let qualifier = if is_paired_end {
+            ""
+        } else {
+            " (may be overestimated since this is SE data)"
+        };
+        println!("Duplication rate{}: {:.4}%", qualifier, dup.rate * 100.0);
+    }
+    println!();
+
+    // Report files
+    println!("JSON report: {}", args.json);
+    println!("HTML report: {}", args.html);
+    println!();
+
+    // Command line and version
+    print_command_line(args, is_paired_end);
+
+    // Format elapsed time more precisely
+    let time_str = if elapsed.as_secs() >= 1 {
+        format!("{:.3} seconds", elapsed.as_secs_f64())
+    } else {
+        format!("{} milliseconds", elapsed.as_millis())
+    };
+
+    println!(
+        "fasterp v{}, time used: {}",
+        env!("CARGO_PKG_VERSION"),
+        time_str
+    );
 }
 
 // MAIN FUNCTION
@@ -621,6 +819,9 @@ fn build_and_write_paired_end_report(args: &Args, pe_acc: PairedEndAccumulator) 
 /// Result: 2-4x faster on large datasets with multi-threading
 fn main() -> Result<()> {
     let args = Args::parse();
+
+    // Track start time for performance reporting
+    let start_time = std::time::Instant::now();
 
     // Determine if paired-end mode
     let is_paired_end = args.input2.is_some() || args.interleaved_in;
@@ -675,12 +876,23 @@ fn main() -> Result<()> {
         let mut trimming_config_r1 = trimming_config;
         let mut trimming_config_r2 = create_trimming_config_r2(&args);
 
-        // Apply fastp's undocumented default: trim_tail=1 for paired-end mode
-        // (only if user didn't explicitly set any tail trimming)
-        if args.trim_tail == 0 && args.trim_tail1 == 0 {
+        // Apply fastp's undocumented default: trim_tail=1 when NO trimming parameters specified
+        // This default is disabled if user specifies ANY fixed trimming parameter
+        let user_specified_trimming = args.trim_front != 0
+            || args.trim_tail != 0
+            || args.trim_front1 != 0
+            || args.trim_tail1 != 0
+            || args.trim_front2 != 0
+            || args.trim_tail2 != 0;
+
+        if !user_specified_trimming && args.trim_tail == 0 && args.trim_tail1 == 0 {
             trimming_config_r1.trim_tail_bases = 1;
         }
-        if args.trim_tail == 0 && args.trim_tail1 == 0 && args.trim_tail2 == 0 {
+        if !user_specified_trimming
+            && args.trim_tail == 0
+            && args.trim_tail1 == 0
+            && args.trim_tail2 == 0
+        {
             trimming_config_r2.trim_tail_bases = 1;
         }
 
@@ -820,7 +1032,7 @@ fn main() -> Result<()> {
         };
 
         // Build paired-end report
-        build_and_write_paired_end_report(&args, pe_acc)?;
+        build_and_write_paired_end_report(&args, pe_acc, start_time)?;
         return Ok(());
     }
 
@@ -931,14 +1143,23 @@ fn main() -> Result<()> {
     let before_stats = acc.before.to_read_stats();
     let after_stats = acc.after.to_read_stats();
     let quality_curves = acc.pos.to_quality_curves();
+    let content_curves = acc.pos.to_content_curves();
+    let qual_hist = acc.pos.to_qual_hist();
+    let quality_curves_after = acc.pos_after.to_quality_curves();
+    let content_curves_after = acc.pos_after.to_content_curves();
+    let qual_hist_after = acc.pos_after.to_qual_hist();
     let kmer_map = acc.kmer_table_to_map();
+    let kmer_map_after = acc.kmer_table_after_to_map();
 
-    let report = FastpReport {
+    // Calculate duplication rate from kmer counts
+    let duplication_rate = stats::calculate_duplication_rate(&kmer_map);
+
+    let report = FasterpReport {
         summary: Summary {
-            fastp_version: env!("CARGO_PKG_VERSION").to_string(),
+            fasterp_version: env!("CARGO_PKG_VERSION").to_string(),
             sequencing: format!("single end ({} cycles)", acc.max_cycle),
             before_filtering: before_stats.clone(),
-            after_filtering: after_stats,
+            after_filtering: after_stats.clone(),
         },
         filtering_result: FilteringResult {
             passed_filter_reads: acc.after.total_reads,
@@ -954,12 +1175,31 @@ fn main() -> Result<()> {
             q20_bases: before_stats.q20_bases,
             q30_bases: before_stats.q30_bases,
             quality_curves,
+            content_curves,
+            qual_hist,
             kmer_count: kmer_map,
         },
         read2_before_filtering: None,
-        read1_after_filtering: None,
+        read1_after_filtering: Some(DetailedReadStats {
+            total_reads: after_stats.total_reads,
+            total_bases: after_stats.total_bases,
+            q20_bases: after_stats.q20_bases,
+            q30_bases: after_stats.q30_bases,
+            quality_curves: quality_curves_after,
+            content_curves: content_curves_after,
+            qual_hist: qual_hist_after,
+            kmer_count: kmer_map_after,
+        }),
         read2_after_filtering: None,
+        duplication: Some(DuplicationStats {
+            rate: duplication_rate,
+        }),
+        adapter_cutting: None, // TODO: Track adapter cutting stats
     };
+
+    // Print report to stdout (fastp-compatible format)
+    let elapsed = start_time.elapsed();
+    print_report_to_stdout(&report, &args, elapsed, false);
 
     // Write JSON report based on stats_format
     match args.stats_format.as_str() {
@@ -995,6 +1235,10 @@ fn main() -> Result<()> {
             );
         }
     }
+
+    // Generate HTML report
+    html::generate_html_report(&report, &args, &args.html)
+        .context("Failed to generate HTML report")?;
 
     Ok(())
 }
