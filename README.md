@@ -125,7 +125,3 @@ jq '.read1_before_filtering.kmer_count | {AAAAA, TTTTT, CCCCC, GGGGG}' /tmp/fast
 #   "GGGGG": 0
 # }
 ``` 
-
-----
-
-https://github.com/OpenGene/fastp/blob/master/src/knownadapters.h

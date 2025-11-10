@@ -67,6 +67,20 @@ fn run_benchmark(input: &str, name: &str, extra_args: &[&str]) -> Option<BenchRe
     let fasterp_out = output_dir.join("fasterp_bench.fq");
     let fasterp_json = output_dir.join("fasterp_bench.json");
 
+    // 2 small warm-up runs to avoid cold-start effects
+    for _ in 0..2 {
+        let _ = Command::new("fastp")
+            .arg("-i")
+            .arg(input)
+            .arg("-o")
+            .arg(&fastp_out)
+            .arg("-j")
+            .arg(&fastp_json)
+            .args(extra_args)
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
+
     // Run fastp 3 times and take median
     let mut fastp_times = Vec::new();
     for _ in 0..3 {
@@ -146,6 +160,13 @@ fn run_benchmark(input: &str, name: &str, extra_args: &[&str]) -> Option<BenchRe
     } else {
         fasterp_times[0] // just use first if we don't have 3
     };
+
+    // Ensure outputs are identical
+    let fastp_data = std::fs::read(&fastp_out).unwrap_or_default();
+    let fasterp_data = std::fs::read(&fasterp_out).unwrap_or_default();
+    if fastp_data != fasterp_data {
+        eprintln!("  Warning: Output mismatch between fastp and fasterp for {name}");
+    }
 
     // Cleanup
     let _ = std::fs::remove_file(fastp_out);
