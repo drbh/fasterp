@@ -19,6 +19,7 @@ mod processor;
 mod simd;
 mod stats;
 mod trimming;
+mod util;
 
 use io::*;
 use pipeline::*;

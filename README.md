@@ -2,7 +2,7 @@
 
 
 **fasterp** — a Rust reimplementation of [**fastp**](https://github.com/OpenGene/fastp).
-Same interface and behavior, often **3–10× faster** but your mileage may vary depending on dataset and CPU.
+Same interface and behavior, often **>5× faster** but your mileage may vary depending on dataset and CPU.
 
 | Feature              | fastp | fasterp |
 | :------------------- | :---: | :-----: |

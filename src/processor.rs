@@ -14,6 +14,7 @@ use crate::kmer::*;
 use crate::simd;
 use crate::stats::*;
 use crate::trimming::*;
+use crate::util;
 
 /// State machine for parsing FASTQ records
 /// Handles:
@@ -43,14 +44,19 @@ pub struct FastqParser<R: BufRead> {
 
 impl<R: BufRead> FastqParser<R> {
     pub fn new(reader: R) -> Self {
+        // Pre-allocate for typical FASTQ record sizes
+        const TYPICAL_READ_LEN: usize = 150;
+        const TYPICAL_HEADER_LEN: usize = 64;
+        const TYPICAL_LINE_LEN: usize = 256;
+
         FastqParser {
             reader,
             state: ParseState::ExpectHeader,
-            header: Vec::new(),
-            sequence: Vec::new(),
-            plus: Vec::new(),
-            quality: Vec::new(),
-            line_buf: Vec::new(),
+            header: Vec::with_capacity(TYPICAL_HEADER_LEN),
+            sequence: Vec::with_capacity(TYPICAL_READ_LEN),
+            plus: Vec::with_capacity(4), // Usually just "+"
+            quality: Vec::with_capacity(TYPICAL_READ_LEN),
+            line_buf: Vec::with_capacity(TYPICAL_LINE_LEN),
             eof: false,
         }
     }
@@ -225,14 +231,24 @@ impl StreamAccumulator {
             let stats = simd::compute_stats(seq, qual, 0); // 0 = don't count unqualified for before stats
 
             self.pos.ensure_capacity(seq.len());
-            for (i, (&b, &q)) in seq.iter().zip(qual).enumerate() {
-                self.pos.total_sum[i] += (q - 33) as u64;
-                self.pos.total_cnt[i] += 1;
 
-                if let Some(bi) = base_idx(b) {
-                    self.pos.base_sum[bi][i] += (q - 33) as u64;
-                    self.pos.base_cnt[bi][i] += 1;
-                }
+            // SAFETY: We've validated seq.len() == qual.len() above, and ensured capacity
+            // Use unsafe loop to eliminate bounds checking in hot path
+            unsafe {
+                let seq_ptr = seq.as_ptr();
+                let qual_ptr = qual.as_ptr();
+                let len = seq.len();
+
+                util::loop_seq_qual_indexed(seq_ptr, qual_ptr, len, |i, b, q| {
+                    let qval = (q - 33) as u64;
+                    *self.pos.total_sum.get_unchecked_mut(i) += qval;
+                    *self.pos.total_cnt.get_unchecked_mut(i) += 1;
+
+                    if let Some(bi) = base_idx(b) {
+                        *self.pos.base_sum.get_unchecked_mut(bi).get_unchecked_mut(i) += qval;
+                        *self.pos.base_cnt.get_unchecked_mut(bi).get_unchecked_mut(i) += 1;
+                    }
+                });
             }
 
             (stats.qsum, stats.q20, stats.q30, stats.ncnt, stats.gc)
@@ -245,29 +261,39 @@ impl StreamAccumulator {
             let mut gc = 0usize;
 
             self.pos.ensure_capacity(seq.len());
-            for (i, (&b, &q)) in seq.iter().zip(qual).enumerate() {
-                let qval = (q - 33) as u32;
-                qsum += qval;
-                if q >= 53 {
-                    q20 += 1;
-                }
-                if q >= 63 {
-                    q30 += 1;
-                }
-                if b == b'N' || b == b'n' {
-                    ncnt += 1;
-                }
-                if b == b'G' || b == b'g' || b == b'C' || b == b'c' {
-                    gc += 1;
-                }
 
-                self.pos.total_sum[i] += qval as u64;
-                self.pos.total_cnt[i] += 1;
+            // SAFETY: We've validated seq.len() == qual.len() above, and ensured capacity
+            // Use unsafe loop to eliminate bounds checking in hot path
+            unsafe {
+                let seq_ptr = seq.as_ptr();
+                let qual_ptr = qual.as_ptr();
+                let len = seq.len();
 
-                if let Some(bi) = base_idx(b) {
-                    self.pos.base_sum[bi][i] += qval as u64;
-                    self.pos.base_cnt[bi][i] += 1;
-                }
+                util::loop_seq_qual_indexed(seq_ptr, qual_ptr, len, |i, b, q| {
+                    let qval = (q - 33) as u32;
+                    qsum += qval;
+                    if q >= 53 {
+                        q20 += 1;
+                    }
+                    if q >= 63 {
+                        q30 += 1;
+                    }
+                    if b == b'N' || b == b'n' {
+                        ncnt += 1;
+                    }
+                    if b == b'G' || b == b'g' || b == b'C' || b == b'c' {
+                        gc += 1;
+                    }
+
+                    *self.pos.total_sum.get_unchecked_mut(i) += qval as u64;
+                    *self.pos.total_cnt.get_unchecked_mut(i) += 1;
+
+                    if let Some(bi) = base_idx(b) {
+                        *self.pos.base_sum.get_unchecked_mut(bi).get_unchecked_mut(i) +=
+                            qval as u64;
+                        *self.pos.base_cnt.get_unchecked_mut(bi).get_unchecked_mut(i) += 1;
+                    }
+                });
             }
 
             (qsum, q20, q30, ncnt, gc)

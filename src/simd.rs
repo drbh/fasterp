@@ -57,19 +57,27 @@ pub fn compute_stats(seq: &[u8], qual: &[u8], qual_threshold: u8) -> Stats {
         if is_x86_feature_detected!("avx2") {
             return unsafe { compute_stats_avx2(seq, qual, qual_threshold) };
         }
+        // Scalar fallback for x86_64 without AVX2
+        return compute_stats_scalar(seq, qual, qual_threshold);
     }
 
     #[cfg(target_arch = "aarch64")]
     {
+        // Always use NEON on aarch64 (available on all ARM64 platforms)
         return unsafe { compute_stats_neon(seq, qual, qual_threshold) };
     }
 
-    // Scalar fallback
-    compute_stats_scalar(seq, qual, qual_threshold)
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        // Scalar fallback for other architectures
+        compute_stats_scalar(seq, qual, qual_threshold)
+    }
 }
 
 /// Scalar implementation (fallback)
+/// Used on x86_64 without AVX2 and non-x86_64/aarch64 platforms
 #[inline]
+#[allow(dead_code)]
 fn compute_stats_scalar(seq: &[u8], qual: &[u8], qual_threshold: u8) -> Stats {
     let mut qsum = 0u32;
     let mut q20 = 0usize;

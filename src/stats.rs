@@ -91,11 +91,24 @@ pub(crate) struct PositionStats {
 
 impl PositionStats {
     pub(crate) fn new() -> Self {
+        // Pre-allocate for typical read length (150bp) to avoid reallocations
+        const TYPICAL_READ_LEN: usize = 150;
+
         Self {
-            base_sum: [Vec::new(), Vec::new(), Vec::new(), Vec::new()],
-            base_cnt: [Vec::new(), Vec::new(), Vec::new(), Vec::new()],
-            total_sum: Vec::new(),
-            total_cnt: Vec::new(),
+            base_sum: [
+                Vec::with_capacity(TYPICAL_READ_LEN),
+                Vec::with_capacity(TYPICAL_READ_LEN),
+                Vec::with_capacity(TYPICAL_READ_LEN),
+                Vec::with_capacity(TYPICAL_READ_LEN),
+            ],
+            base_cnt: [
+                Vec::with_capacity(TYPICAL_READ_LEN),
+                Vec::with_capacity(TYPICAL_READ_LEN),
+                Vec::with_capacity(TYPICAL_READ_LEN),
+                Vec::with_capacity(TYPICAL_READ_LEN),
+            ],
+            total_sum: Vec::with_capacity(TYPICAL_READ_LEN),
+            total_cnt: Vec::with_capacity(TYPICAL_READ_LEN),
         }
     }
 

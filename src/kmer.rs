@@ -164,9 +164,3 @@ fn kmer_to_string_impl(code: usize) -> String {
     result.reverse();
     String::from_utf8(result).unwrap()
 }
-
-/// Convert 2-bit encoded kmer to String for JSON output (deprecated)
-#[deprecated(note = "Use kmer_to_str instead for zero-allocation")]
-pub(crate) fn kmer_to_string(code: usize) -> String {
-    kmer_to_str(code).to_string()
-}
