@@ -13,6 +13,7 @@ Same interface and behavior, often **>5× faster** but your mileage may vary dep
 | Multi-threading      |   ✓   |    ✓    |
 | gzip I/O             |   ✓   |    ✓    |
 | Kmer counting        |   ✓   |    ✓    |
+| Adapter trimming     |   ✓   |    -    |
 | Rust safety          |   -   |    ✓    |
 | SIMD acceleration    |   -   |    ✓    |
 

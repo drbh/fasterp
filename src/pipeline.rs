@@ -10,7 +10,9 @@
 use anyhow::Result;
 use crossbeam_channel::{Receiver, Sender};
 use std::collections::BTreeMap;
-use std::io::{Read, Write};
+use std::io::{BufWriter, IoSlice, Read, Write};
+use std::ops::Range;
+use std::sync::Arc;
 
 use crate::io::open_output;
 use crate::kmer::*;
@@ -23,20 +25,35 @@ use crate::trimming::*;
 ///
 /// Contains raw bytes and record positions (no String allocations)
 /// Each record is [header_start, seq_start, plus_start, qual_start] as byte offsets
+///
+/// Uses Arc to allow zero-copy sharing of buffer between workers
 #[derive(Clone)]
 pub(crate) struct Batch {
     pub id: u64,
-    pub buf: Vec<u8>,
+    pub buf: Arc<Vec<u8>>, // Shared buffer - no copying needed
     /// Each element is [header_start, seq_start, plus_start, qual_start]
     /// Lengths are implicit: header len = seq_start - header_start, etc.
     /// Quality ends at the next record's header_start (or buf.len() for last record)
     pub recs: Vec<[usize; 4]>,
 }
 
-/// Result from a worker thread
+/// A single FASTQ record represented as ranges into a shared buffer
+///
+/// Zero-copy: stores ranges instead of copying bytes
+pub(crate) struct RecordPiece {
+    pub buf: Arc<Vec<u8>>,     // Shared buffer reference
+    pub header: Range<usize>,  // Header range
+    pub seq: Range<usize>,     // Sequence range
+    pub plus: Range<usize>,    // Plus line range
+    pub qual: Range<usize>,    // Quality range
+}
+
+/// Result from a worker thread (zero-copy version)
+///
+/// Uses RecordPiece to avoid copying bytes - stores ranges instead
 pub(crate) struct WorkerResult {
     pub id: u64,
-    pub out_buf: Vec<u8>,
+    pub pieces: Vec<RecordPiece>, // Zero-copy: ranges into shared buffers
     pub before: SimpleStats,
     pub after: SimpleStats,
     pub pos: PositionStats,
@@ -158,7 +175,7 @@ pub(crate) fn producer_thread(
             if !recs.is_empty() {
                 let batch = Batch {
                     id: batch_id,
-                    buf: buffer[..complete_len].to_vec(),
+                    buf: Arc::new(buffer[..complete_len].to_vec()), // Wrap in Arc for sharing
                     recs,
                 };
                 batch_id += 1;
@@ -200,7 +217,7 @@ pub(crate) fn worker_thread(
         let mut too_many_n = 0usize;
         let mut low_quality = 0usize;
         let mut invalid = 0usize;
-        let mut out_buf = Vec::new();
+        let mut pieces = Vec::new(); // Zero-copy: store ranges instead of bytes
 
         // Process each record in the batch
         for (idx, &[h_start, s_start, p_start, q_start]) in batch.recs.iter().enumerate() {
@@ -219,9 +236,8 @@ pub(crate) fn worker_thread(
                 }
             };
 
-            let header = &batch.buf[h_start..s_start - 1];
+            // Extract slices for processing
             let seq = &batch.buf[s_start..s_end];
-            let plus = &batch.buf[p_start..p_end];
             let qual = &batch.buf[q_start..q_end];
 
             // Validate
@@ -351,15 +367,20 @@ pub(crate) fn worker_thread(
                 }
             }
 
-            // Passed - write TRIMMED read to output buffer
-            out_buf.extend_from_slice(header);
-            out_buf.push(b'\n');
-            out_buf.extend_from_slice(trimmed_seq);
-            out_buf.push(b'\n');
-            out_buf.extend_from_slice(plus);
-            out_buf.push(b'\n');
-            out_buf.extend_from_slice(trimmed_qual);
-            out_buf.push(b'\n');
+            // Passed - emit RANGES for TRIMMED read (zero-copy!)
+            // Calculate trimmed ranges relative to original buffer
+            let trimmed_seq_start = s_start + trimming_result.start_pos;
+            let trimmed_seq_end = s_start + trimming_result.end_pos;
+            let trimmed_qual_start = q_start + trimming_result.start_pos;
+            let trimmed_qual_end = q_start + trimming_result.end_pos;
+
+            pieces.push(RecordPiece {
+                buf: Arc::clone(&batch.buf), // Clone Arc, not the buffer!
+                header: h_start..s_start - 1, // Exclude newline
+                seq: trimmed_seq_start..trimmed_seq_end,
+                plus: p_start..p_end,
+                qual: trimmed_qual_start..trimmed_qual_end,
+            });
 
             // Update after stats with trimmed read
             after.add(trimmed_len, trimmed_q20, trimmed_q30, trimmed_gc);
@@ -367,7 +388,7 @@ pub(crate) fn worker_thread(
 
         let result = WorkerResult {
             id: batch.id,
-            out_buf,
+            pieces, // Zero-copy ranges instead of copied bytes
             before,
             after,
             pos,
@@ -387,19 +408,23 @@ pub(crate) fn worker_thread(
     let _ = sender.send(None);
 }
 
-/// Merger thread: write output in order and reduce stats
+/// Merger thread: write output in order and reduce stats (zero-copy vectored I/O)
 pub(crate) fn merger_thread(
     receiver: Receiver<Option<WorkerResult>>,
     output_path: String,
     num_workers: usize,
     compression_level: Option<u32>,
 ) -> Result<StreamAccumulator> {
-    let mut writer = open_output(&output_path, compression_level)?;
+    let inner_writer = open_output(&output_path, compression_level)?;
+    // Large BufWriter (16 MiB) to batch writes and reduce syscalls
+    let mut writer = BufWriter::with_capacity(16 * 1024 * 1024, inner_writer);
 
     let mut acc = StreamAccumulator::new();
     let mut next_id = 0u64;
     let mut pending: BTreeMap<u64, WorkerResult> = BTreeMap::new();
     let mut workers_done = 0;
+
+    let newline = [b'\n']; // Reusable newline for vectored I/O
 
     while workers_done < num_workers {
         match receiver.recv() {
@@ -408,8 +433,53 @@ pub(crate) fn merger_thread(
 
                 // Write all consecutive results starting from next_id
                 while let Some(result) = pending.remove(&next_id) {
-                    // Write output
-                    writer.write_all(&result.out_buf)?;
+                    // Write output using zero-copy vectored I/O
+                    for rec in &result.pieces {
+                        let b = &rec.buf;
+                        // Build IoSlice array for vectored write (no copying!)
+                        let mut iov = [
+                            IoSlice::new(&b[rec.header.clone()]),
+                            IoSlice::new(&newline),
+                            IoSlice::new(&b[rec.seq.clone()]),
+                            IoSlice::new(&newline),
+                            IoSlice::new(&b[rec.plus.clone()]),
+                            IoSlice::new(&newline),
+                            IoSlice::new(&b[rec.qual.clone()]),
+                            IoSlice::new(&newline),
+                        ];
+
+                        // Manual implementation of write_all_vectored
+                        let mut written = 0;
+                        let total: usize = iov.iter().map(|s| s.len()).sum();
+                        while written < total {
+                            let n = writer.write_vectored(&iov)?;
+                            if n == 0 {
+                                return Err(std::io::Error::new(
+                                    std::io::ErrorKind::WriteZero,
+                                    "failed to write vectored"
+                                ).into());
+                            }
+                            written += n;
+                            // Advance the slices
+                            let mut skip = n;
+                            for slice in &mut iov {
+                                let len = slice.len();
+                                if skip >= len {
+                                    skip -= len;
+                                    *slice = IoSlice::new(&[]);
+                                } else {
+                                    let data = unsafe {
+                                        std::slice::from_raw_parts(
+                                            slice.as_ptr().add(skip),
+                                            len - skip
+                                        )
+                                    };
+                                    *slice = IoSlice::new(data);
+                                    break;
+                                }
+                            }
+                        }
+                    }
 
                     // Merge stats
                     acc.before.total_reads += result.before.total_reads;
@@ -461,6 +531,8 @@ pub(crate) fn merger_thread(
         }
     }
 
-    writer.finish()?;
+    // Flush BufWriter and finish inner writer
+    writer.flush()?;
+    writer.into_inner().map_err(|e| e.into_error())?.finish()?;
     Ok(acc)
 }
