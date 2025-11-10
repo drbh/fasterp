@@ -836,6 +836,7 @@ pub(crate) fn paired_worker_thread(
     trimming_config_r1: TrimmingConfig,
     trimming_config_r2: TrimmingConfig,
     overlap_config: Option<crate::overlap::OverlapConfig>,
+    umi_config: Option<crate::umi::UmiConfig>,
 ) {
     while let Ok(Some(batch)) = receiver.recv() {
         let mut before_r1 = SimpleStats::default();
@@ -871,51 +872,130 @@ pub(crate) fn paired_worker_thread(
                 continue;
             }
 
-            // Compute stats for R1
-            let stats1 = simd::compute_stats(seq1, qual1, 0);
-            before_r1.add(seq1.len(), stats1.q20, stats1.q30, stats1.gc);
-            update_position_stats(&mut pos_r1, seq1, qual1);
-            if !no_kmer {
-                count_k5_2bit(seq1, &mut k5_r1);
+            // Extract UMI if enabled (happens BEFORE any other processing)
+            let umi_seq: Vec<u8>;
+            let (final_umi_seq1, final_umi_qual1, final_umi_seq2, final_umi_qual2);
+            let mut umi_seq1_buf;
+            let mut umi_qual1_buf;
+            let mut umi_seq2_buf;
+            let mut umi_qual2_buf;
+            let umi_extracted;
+
+            if let Some(ref cfg) = umi_config {
+                match cfg.location {
+                    crate::umi::UmiLocation::Read1 => {
+                        if let Some(extraction) = crate::umi::extract_umi(seq1, cfg) {
+                            // UMI extraction succeeded
+                            umi_seq = extraction.umi_seq;
+                            umi_seq1_buf = seq1[extraction.end_pos..].to_vec();
+                            umi_qual1_buf = qual1[extraction.end_pos..].to_vec();
+                            umi_seq2_buf = seq2.to_vec();
+                            umi_qual2_buf = qual2.to_vec();
+
+                            final_umi_seq1 = &umi_seq1_buf[..];
+                            final_umi_qual1 = &umi_qual1_buf[..];
+                            final_umi_seq2 = &umi_seq2_buf[..];
+                            final_umi_qual2 = &umi_qual2_buf[..];
+                            umi_extracted = true;
+                        } else {
+                            // UMI extraction failed - use original
+                            umi_seq = Vec::new();
+                            final_umi_seq1 = seq1;
+                            final_umi_qual1 = qual1;
+                            final_umi_seq2 = seq2;
+                            final_umi_qual2 = qual2;
+                            umi_extracted = false;
+                        }
+                    }
+                    crate::umi::UmiLocation::Read2 => {
+                        if let Some(extraction) = crate::umi::extract_umi(seq2, cfg) {
+                            // UMI extraction succeeded
+                            umi_seq = extraction.umi_seq;
+                            umi_seq1_buf = seq1.to_vec();
+                            umi_qual1_buf = qual1.to_vec();
+                            umi_seq2_buf = seq2[extraction.end_pos..].to_vec();
+                            umi_qual2_buf = qual2[extraction.end_pos..].to_vec();
+
+                            final_umi_seq1 = &umi_seq1_buf[..];
+                            final_umi_qual1 = &umi_qual1_buf[..];
+                            final_umi_seq2 = &umi_seq2_buf[..];
+                            final_umi_qual2 = &umi_qual2_buf[..];
+                            umi_extracted = true;
+                        } else {
+                            // UMI extraction failed - use original
+                            umi_seq = Vec::new();
+                            final_umi_seq1 = seq1;
+                            final_umi_qual1 = qual1;
+                            final_umi_seq2 = seq2;
+                            final_umi_qual2 = qual2;
+                            umi_extracted = false;
+                        }
+                    }
+                    _ => {
+                        // Other UMI locations not yet supported
+                        umi_seq = Vec::new();
+                        final_umi_seq1 = seq1;
+                        final_umi_qual1 = qual1;
+                        final_umi_seq2 = seq2;
+                        final_umi_qual2 = qual2;
+                        umi_extracted = false;
+                    }
+                }
+            } else {
+                // No UMI processing
+                umi_seq = Vec::new();
+                final_umi_seq1 = seq1;
+                final_umi_qual1 = qual1;
+                final_umi_seq2 = seq2;
+                final_umi_qual2 = qual2;
+                umi_extracted = false;
             }
 
-            // Compute stats for R2
-            let stats2 = simd::compute_stats(seq2, qual2, 0);
-            before_r2.add(seq2.len(), stats2.q20, stats2.q30, stats2.gc);
-            update_position_stats(&mut pos_r2, seq2, qual2);
+            // Compute stats for R1 (after UMI removal)
+            let stats1 = simd::compute_stats(final_umi_seq1, final_umi_qual1, 0);
+            before_r1.add(final_umi_seq1.len(), stats1.q20, stats1.q30, stats1.gc);
+            update_position_stats(&mut pos_r1, final_umi_seq1, final_umi_qual1);
             if !no_kmer {
-                count_k5_2bit(seq2, &mut k5_r2);
+                count_k5_2bit(final_umi_seq1, &mut k5_r1);
             }
 
-            // Apply trimming to R1
+            // Compute stats for R2 (after UMI removal)
+            let stats2 = simd::compute_stats(final_umi_seq2, final_umi_qual2, 0);
+            before_r2.add(final_umi_seq2.len(), stats2.q20, stats2.q30, stats2.gc);
+            update_position_stats(&mut pos_r2, final_umi_seq2, final_umi_qual2);
+            if !no_kmer {
+                count_k5_2bit(final_umi_seq2, &mut k5_r2);
+            }
+
+            // Apply trimming to R1 (after UMI removal)
             let trim_result1 = if trimming_config_r1.is_enabled() {
-                trim_read(seq1, qual1, &trimming_config_r1)
+                trim_read(final_umi_seq1, final_umi_qual1, &trimming_config_r1)
             } else {
                 TrimmingResult {
                     start_pos: 0,
-                    end_pos: seq1.len(),
+                    end_pos: final_umi_seq1.len(),
                     poly_g_trimmed: 0,
                     poly_x_trimmed: 0,
                 }
             };
 
-            // Apply trimming to R2
+            // Apply trimming to R2 (after UMI removal)
             let trim_result2 = if trimming_config_r2.is_enabled() {
-                trim_read(seq2, qual2, &trimming_config_r2)
+                trim_read(final_umi_seq2, final_umi_qual2, &trimming_config_r2)
             } else {
                 TrimmingResult {
                     start_pos: 0,
-                    end_pos: seq2.len(),
+                    end_pos: final_umi_seq2.len(),
                     poly_g_trimmed: 0,
                     poly_x_trimmed: 0,
                 }
             };
 
-            // Get trimmed sequences
-            let trimmed_seq1 = &seq1[trim_result1.start_pos..trim_result1.end_pos];
-            let trimmed_qual1 = &qual1[trim_result1.start_pos..trim_result1.end_pos];
-            let trimmed_seq2 = &seq2[trim_result2.start_pos..trim_result2.end_pos];
-            let trimmed_qual2 = &qual2[trim_result2.start_pos..trim_result2.end_pos];
+            // Get trimmed sequences (from UMI-processed sequences)
+            let trimmed_seq1 = &final_umi_seq1[trim_result1.start_pos..trim_result1.end_pos];
+            let trimmed_qual1 = &final_umi_qual1[trim_result1.start_pos..trim_result1.end_pos];
+            let trimmed_seq2 = &final_umi_seq2[trim_result2.start_pos..trim_result2.end_pos];
+            let trimmed_qual2 = &final_umi_qual2[trim_result2.start_pos..trim_result2.end_pos];
 
             // Apply base correction using overlap analysis (if enabled)
             let (final_seq1, final_qual1, final_seq2, final_qual2);
@@ -1041,16 +1121,26 @@ pub(crate) fn paired_worker_thread(
             let [h1_start, s1_start, p1_start, q1_start] = rec1;
             let [h2_start, s2_start, p2_start, q2_start] = rec2;
 
-            // When correction is enabled, we need to create new buffers with corrected data
+            // When correction or UMI is enabled, we need to create new buffers with modified data
             // Otherwise, use zero-copy with ranges into original buffer
-            let (r1_piece, r2_piece) = if overlap_config.is_some() {
-                // Correction was enabled - create new buffers with corrected sequences
+            let (r1_piece, r2_piece) = if overlap_config.is_some() || umi_config.is_some() {
+                // Correction or UMI was enabled - create new buffers
                 let mut r1_buf = Vec::new();
                 let mut r2_buf = Vec::new();
 
                 // Build R1 buffer: header + '\n' + seq + '\n' + plus + '\n' + qual + '\n'
                 let r1_header_start = 0;
+                // Add original header
                 r1_buf.extend_from_slice(&batch.buf_r1[h1_start..s1_start - 1]);
+                // Add UMI to header if extracted
+                if umi_extracted {
+                    if let Some(ref cfg) = umi_config {
+                        r1_buf.push(b':');
+                        r1_buf.extend_from_slice(cfg.prefix.as_bytes());
+                        r1_buf.push(b'_');
+                        r1_buf.extend_from_slice(&umi_seq);
+                    }
+                }
                 let r1_header_end = r1_buf.len();
                 r1_buf.push(b'\n');
                 let r1_seq_start = r1_buf.len();
@@ -1068,7 +1158,17 @@ pub(crate) fn paired_worker_thread(
 
                 // Build R2 buffer
                 let r2_header_start = 0;
+                // Add original header
                 r2_buf.extend_from_slice(&batch.buf_r2[h2_start..s2_start - 1]);
+                // Add UMI to header if extracted
+                if umi_extracted {
+                    if let Some(ref cfg) = umi_config {
+                        r2_buf.push(b':');
+                        r2_buf.extend_from_slice(cfg.prefix.as_bytes());
+                        r2_buf.push(b'_');
+                        r2_buf.extend_from_slice(&umi_seq);
+                    }
+                }
                 let r2_header_end = r2_buf.len();
                 r2_buf.push(b'\n');
                 let r2_seq_start = r2_buf.len();

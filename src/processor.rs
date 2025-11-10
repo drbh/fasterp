@@ -589,6 +589,7 @@ pub(crate) fn process_paired_fastq_stream<R1: BufRead, R2: BufRead, W1: Write, W
     trimming_config_r1: &TrimmingConfig,
     trimming_config_r2: &TrimmingConfig,
     overlap_config: Option<&crate::overlap::OverlapConfig>,
+    umi_config: Option<&crate::umi::UmiConfig>,
 ) -> Result<PairedEndAccumulator> {
     let mut acc = PairedEndAccumulator::new();
     let mut parser1 = FastqParser::new(reader1);
@@ -611,33 +612,166 @@ pub(crate) fn process_paired_fastq_stream<R1: BufRead, R2: BufRead, W1: Write, W
                     continue;
                 }
 
-                // Track max cycle lengths
-                if seq1.len() > acc.max_cycle_r1 {
-                    acc.max_cycle_r1 = seq1.len();
-                }
-                if seq2.len() > acc.max_cycle_r2 {
-                    acc.max_cycle_r2 = seq2.len();
+                // Extract UMI if enabled (happens BEFORE any other processing)
+                let (final_header1, final_header2, final_seq1, final_qual1, final_seq2, final_qual2);
+                let mut header1_with_umi;
+                let mut header2_with_umi;
+                let mut seq1_after_umi;
+                let mut qual1_after_umi;
+                let mut seq2_after_umi;
+                let mut qual2_after_umi;
+
+                if let Some(umi_cfg) = umi_config {
+                    match umi_cfg.location {
+                        crate::umi::UmiLocation::Read1 => {
+                            // Extract UMI from read1
+                            if let Some(extraction) = crate::umi::extract_umi(&seq1, umi_cfg) {
+                                // Add UMI to both headers
+                                header1_with_umi = crate::umi::add_umi_to_header(
+                                    &header1,
+                                    &extraction.umi_seq,
+                                    &umi_cfg.prefix,
+                                );
+                                header2_with_umi = crate::umi::add_umi_to_header(
+                                    &header2,
+                                    &extraction.umi_seq,
+                                    &umi_cfg.prefix,
+                                );
+
+                                // Trim UMI from read1 sequence and quality
+                                seq1_after_umi = seq1[extraction.end_pos..].to_vec();
+                                qual1_after_umi = qual1[extraction.end_pos..].to_vec();
+                                seq2_after_umi = seq2.to_vec();
+                                qual2_after_umi = qual2.to_vec();
+
+                                final_header1 = &header1_with_umi[..];
+                                final_header2 = &header2_with_umi[..];
+                                final_seq1 = &seq1_after_umi[..];
+                                final_qual1 = &qual1_after_umi[..];
+                                final_seq2 = &seq2_after_umi[..];
+                                final_qual2 = &qual2_after_umi[..];
+                            } else {
+                                // UMI extraction failed - use original (convert to owned for consistency)
+                                header1_with_umi = header1.to_vec();
+                                header2_with_umi = header2.to_vec();
+                                seq1_after_umi = seq1.to_vec();
+                                qual1_after_umi = qual1.to_vec();
+                                seq2_after_umi = seq2.to_vec();
+                                qual2_after_umi = qual2.to_vec();
+
+                                final_header1 = &header1_with_umi[..];
+                                final_header2 = &header2_with_umi[..];
+                                final_seq1 = &seq1_after_umi[..];
+                                final_qual1 = &qual1_after_umi[..];
+                                final_seq2 = &seq2_after_umi[..];
+                                final_qual2 = &qual2_after_umi[..];
+                            }
+                        }
+                        crate::umi::UmiLocation::Read2 => {
+                            // Extract UMI from read2
+                            if let Some(extraction) = crate::umi::extract_umi(&seq2, umi_cfg) {
+                                // Add UMI to both headers
+                                header1_with_umi = crate::umi::add_umi_to_header(
+                                    &header1,
+                                    &extraction.umi_seq,
+                                    &umi_cfg.prefix,
+                                );
+                                header2_with_umi = crate::umi::add_umi_to_header(
+                                    &header2,
+                                    &extraction.umi_seq,
+                                    &umi_cfg.prefix,
+                                );
+
+                                // Trim UMI from read2 sequence and quality
+                                seq1_after_umi = seq1.to_vec();
+                                qual1_after_umi = qual1.to_vec();
+                                seq2_after_umi = seq2[extraction.end_pos..].to_vec();
+                                qual2_after_umi = qual2[extraction.end_pos..].to_vec();
+
+                                final_header1 = &header1_with_umi[..];
+                                final_header2 = &header2_with_umi[..];
+                                final_seq1 = &seq1_after_umi[..];
+                                final_qual1 = &qual1_after_umi[..];
+                                final_seq2 = &seq2_after_umi[..];
+                                final_qual2 = &qual2_after_umi[..];
+                            } else {
+                                // UMI extraction failed - use original (convert to owned for consistency)
+                                header1_with_umi = header1.to_vec();
+                                header2_with_umi = header2.to_vec();
+                                seq1_after_umi = seq1.to_vec();
+                                qual1_after_umi = qual1.to_vec();
+                                seq2_after_umi = seq2.to_vec();
+                                qual2_after_umi = qual2.to_vec();
+
+                                final_header1 = &header1_with_umi[..];
+                                final_header2 = &header2_with_umi[..];
+                                final_seq1 = &seq1_after_umi[..];
+                                final_qual1 = &qual1_after_umi[..];
+                                final_seq2 = &seq2_after_umi[..];
+                                final_qual2 = &qual2_after_umi[..];
+                            }
+                        }
+                        _ => {
+                            // Other UMI locations not yet supported - use original
+                            header1_with_umi = header1.to_vec();
+                            header2_with_umi = header2.to_vec();
+                            seq1_after_umi = seq1.to_vec();
+                            qual1_after_umi = qual1.to_vec();
+                            seq2_after_umi = seq2.to_vec();
+                            qual2_after_umi = qual2.to_vec();
+
+                            final_header1 = &header1_with_umi[..];
+                            final_header2 = &header2_with_umi[..];
+                            final_seq1 = &seq1_after_umi[..];
+                            final_qual1 = &qual1_after_umi[..];
+                            final_seq2 = &seq2_after_umi[..];
+                            final_qual2 = &qual2_after_umi[..];
+                        }
+                    }
+                } else {
+                    // No UMI processing - use original (convert to owned for consistency)
+                    header1_with_umi = header1.to_vec();
+                    header2_with_umi = header2.to_vec();
+                    seq1_after_umi = seq1.to_vec();
+                    qual1_after_umi = qual1.to_vec();
+                    seq2_after_umi = seq2.to_vec();
+                    qual2_after_umi = qual2.to_vec();
+
+                    final_header1 = &header1_with_umi[..];
+                    final_header2 = &header2_with_umi[..];
+                    final_seq1 = &seq1_after_umi[..];
+                    final_qual1 = &qual1_after_umi[..];
+                    final_seq2 = &seq2_after_umi[..];
+                    final_qual2 = &qual2_after_umi[..];
                 }
 
-                // Process read1 statistics (before filtering)
+                // Track max cycle lengths (use final sequences after UMI removal)
+                if final_seq1.len() > acc.max_cycle_r1 {
+                    acc.max_cycle_r1 = final_seq1.len();
+                }
+                if final_seq2.len() > acc.max_cycle_r2 {
+                    acc.max_cycle_r2 = final_seq2.len();
+                }
+
+                // Process read1 statistics (before filtering, after UMI removal)
                 let stats1 =
-                    process_read_stats(&seq1, &qual1, &mut acc.pos_r1, &mut acc.kmer_table_r1)?;
+                    process_read_stats(final_seq1, final_qual1, &mut acc.pos_r1, &mut acc.kmer_table_r1)?;
                 acc.before_r1
-                    .add(seq1.len(), stats1.q20, stats1.q30, stats1.gc);
+                    .add(final_seq1.len(), stats1.q20, stats1.q30, stats1.gc);
 
-                // Process read2 statistics (before filtering)
+                // Process read2 statistics (before filtering, after UMI removal)
                 let stats2 =
-                    process_read_stats(&seq2, &qual2, &mut acc.pos_r2, &mut acc.kmer_table_r2)?;
+                    process_read_stats(final_seq2, final_qual2, &mut acc.pos_r2, &mut acc.kmer_table_r2)?;
                 acc.before_r2
-                    .add(seq2.len(), stats2.q20, stats2.q30, stats2.gc);
+                    .add(final_seq2.len(), stats2.q20, stats2.q30, stats2.gc);
 
-                // Apply trimming to both reads
+                // Apply trimming to both reads (using sequences after UMI removal)
                 let trim_result1 = if trimming_config_r1.is_enabled() {
-                    trim_read(&seq1, &qual1, trimming_config_r1)
+                    trim_read(final_seq1, final_qual1, trimming_config_r1)
                 } else {
                     TrimmingResult {
                         start_pos: 0,
-                        end_pos: seq1.len(),
+                        end_pos: final_seq1.len(),
                         poly_g_trimmed: 0,
                         poly_x_trimmed: 0,
                     }
@@ -646,72 +780,72 @@ pub(crate) fn process_paired_fastq_stream<R1: BufRead, R2: BufRead, W1: Write, W
                 let trim_result2 = if trimming_config_r2.is_enabled() {
                     // Use adapter_seq_r2 for read2 if available
                     let adapter_r2 = trimming_config_r2.adapter_config.adapter_seq_r2.as_deref();
-                    trim_read_with_adapter(&seq2, &qual2, trimming_config_r2, adapter_r2)
+                    trim_read_with_adapter(final_seq2, final_qual2, trimming_config_r2, adapter_r2)
                 } else {
                     TrimmingResult {
                         start_pos: 0,
-                        end_pos: seq2.len(),
+                        end_pos: final_seq2.len(),
                         poly_g_trimmed: 0,
                         poly_x_trimmed: 0,
                     }
                 };
 
-                let trimmed_seq1 = &seq1[trim_result1.start_pos..trim_result1.end_pos];
-                let trimmed_qual1 = &qual1[trim_result1.start_pos..trim_result1.end_pos];
-                let trimmed_seq2 = &seq2[trim_result2.start_pos..trim_result2.end_pos];
-                let trimmed_qual2 = &qual2[trim_result2.start_pos..trim_result2.end_pos];
+                let trimmed_seq1 = &final_seq1[trim_result1.start_pos..trim_result1.end_pos];
+                let trimmed_qual1 = &final_qual1[trim_result1.start_pos..trim_result1.end_pos];
+                let trimmed_seq2 = &final_seq2[trim_result2.start_pos..trim_result2.end_pos];
+                let trimmed_qual2 = &final_qual2[trim_result2.start_pos..trim_result2.end_pos];
 
                 // Apply base correction using overlap analysis (if enabled)
-                let (final_seq1, final_qual1, final_seq2, final_qual2);
-                let mut seq1_corrected;
-                let mut qual1_corrected;
-                let mut seq2_corrected;
-                let mut qual2_corrected;
+                let (corrected_seq1, corrected_qual1, corrected_seq2, corrected_qual2);
+                let mut seq1_corrected_buf;
+                let mut qual1_corrected_buf;
+                let mut seq2_corrected_buf;
+                let mut qual2_corrected_buf;
 
                 if let Some(config) = overlap_config {
                     // Create mutable copies for correction
-                    seq1_corrected = trimmed_seq1.to_vec();
-                    qual1_corrected = trimmed_qual1.to_vec();
-                    seq2_corrected = trimmed_seq2.to_vec();
-                    qual2_corrected = trimmed_qual2.to_vec();
+                    seq1_corrected_buf = trimmed_seq1.to_vec();
+                    qual1_corrected_buf = trimmed_qual1.to_vec();
+                    seq2_corrected_buf = trimmed_seq2.to_vec();
+                    qual2_corrected_buf = trimmed_qual2.to_vec();
 
                     // Detect overlap and correct mismatches
                     if let Some(overlap) =
-                        crate::overlap::detect_overlap(&seq1_corrected, &seq2_corrected, config)
+                        crate::overlap::detect_overlap(&seq1_corrected_buf, &seq2_corrected_buf, config)
                     {
                         let _correction_stats = crate::overlap::correct_by_overlap(
-                            &mut seq1_corrected,
-                            &mut qual1_corrected,
-                            &mut seq2_corrected,
-                            &mut qual2_corrected,
+                            &mut seq1_corrected_buf,
+                            &mut qual1_corrected_buf,
+                            &mut seq2_corrected_buf,
+                            &mut qual2_corrected_buf,
                             &overlap,
                         );
                         // TODO: Track correction statistics in accumulator
                     }
 
-                    final_seq1 = &seq1_corrected[..];
-                    final_qual1 = &qual1_corrected[..];
-                    final_seq2 = &seq2_corrected[..];
-                    final_qual2 = &qual2_corrected[..];
+                    corrected_seq1 = &seq1_corrected_buf[..];
+                    corrected_qual1 = &qual1_corrected_buf[..];
+                    corrected_seq2 = &seq2_corrected_buf[..];
+                    corrected_qual2 = &qual2_corrected_buf[..];
                 } else {
                     // No correction - use trimmed sequences directly
-                    final_seq1 = trimmed_seq1;
-                    final_qual1 = trimmed_qual1;
-                    final_seq2 = trimmed_seq2;
-                    final_qual2 = trimmed_qual2;
+                    corrected_seq1 = trimmed_seq1;
+                    corrected_qual1 = trimmed_qual1;
+                    corrected_seq2 = trimmed_seq2;
+                    corrected_qual2 = trimmed_qual2;
                 }
 
                 // Check if either read is too short
-                if final_seq1.len() < min_len || final_seq2.len() < min_len {
+                if corrected_seq1.len() < min_len || corrected_seq2.len() < min_len {
                     acc.too_short += 1;
                     continue;
                 }
 
-                // Recompute stats for final reads (after trimming and correction)
+                // Recompute stats for final reads (after UMI removal, trimming and correction)
                 let trimmed_stats1 =
-                    simd::compute_stats(final_seq1, final_qual1, qualified_quality_phred);
+                    simd::compute_stats(corrected_seq1, corrected_qual1, qualified_quality_phred);
                 let trimmed_stats2 =
-                    simd::compute_stats(final_seq2, final_qual2, qualified_quality_phred);
+                    simd::compute_stats(corrected_seq2, corrected_qual2, qualified_quality_phred);
 
                 // Check N-base filter for both reads
                 if trimmed_stats1.ncnt > n_limit || trimmed_stats2.ncnt > n_limit {
@@ -722,15 +856,15 @@ pub(crate) fn process_paired_fastq_stream<R1: BufRead, R2: BufRead, W1: Write, W
                 // Check unqualified percent for both reads
                 let mut fail_quality = false;
                 if qualified_quality_phred > 0 {
-                    if final_seq1.len() > 0
+                    if corrected_seq1.len() > 0
                         && 100 * trimmed_stats1.unqualified
-                            > unqualified_percent_limit * final_seq1.len()
+                            > unqualified_percent_limit * corrected_seq1.len()
                     {
                         fail_quality = true;
                     }
-                    if final_seq2.len() > 0
+                    if corrected_seq2.len() > 0
                         && 100 * trimmed_stats2.unqualified
-                            > unqualified_percent_limit * final_seq2.len()
+                            > unqualified_percent_limit * corrected_seq2.len()
                     {
                         fail_quality = true;
                     }
@@ -738,14 +872,14 @@ pub(crate) fn process_paired_fastq_stream<R1: BufRead, R2: BufRead, W1: Write, W
 
                 // Check average quality for both reads
                 if average_qual > 0 {
-                    if final_seq1.len() > 0 {
-                        let mean_qual1 = trimmed_stats1.qsum as f64 / final_seq1.len() as f64;
+                    if corrected_seq1.len() > 0 {
+                        let mean_qual1 = trimmed_stats1.qsum as f64 / corrected_seq1.len() as f64;
                         if mean_qual1 < average_qual as f64 {
                             fail_quality = true;
                         }
                     }
-                    if final_seq2.len() > 0 {
-                        let mean_qual2 = trimmed_stats2.qsum as f64 / final_seq2.len() as f64;
+                    if corrected_seq2.len() > 0 {
+                        let mean_qual2 = trimmed_stats2.qsum as f64 / corrected_seq2.len() as f64;
                         if mean_qual2 < average_qual as f64 {
                             fail_quality = true;
                         }
@@ -760,14 +894,14 @@ pub(crate) fn process_paired_fastq_stream<R1: BufRead, R2: BufRead, W1: Write, W
                 // Check low complexity for both reads
                 if low_complexity_filter {
                     let mut fail_complexity = false;
-                    if final_seq1.len() > 0 {
-                        let complexity1 = calculate_complexity(final_seq1);
+                    if corrected_seq1.len() > 0 {
+                        let complexity1 = calculate_complexity(corrected_seq1);
                         if complexity1 < complexity_threshold {
                             fail_complexity = true;
                         }
                     }
-                    if final_seq2.len() > 0 {
-                        let complexity2 = calculate_complexity(final_seq2);
+                    if corrected_seq2.len() > 0 {
+                        let complexity2 = calculate_complexity(corrected_seq2);
                         if complexity2 < complexity_threshold {
                             fail_complexity = true;
                         }
@@ -779,26 +913,26 @@ pub(crate) fn process_paired_fastq_stream<R1: BufRead, R2: BufRead, W1: Write, W
                     }
                 }
 
-                // Both reads passed - write them
-                writeln!(writer1, "{}", std::str::from_utf8(&header1)?)?;
-                writeln!(writer1, "{}", std::str::from_utf8(final_seq1)?)?;
+                // Both reads passed - write them (with UMI-modified headers if applicable)
+                writeln!(writer1, "{}", std::str::from_utf8(final_header1)?)?;
+                writeln!(writer1, "{}", std::str::from_utf8(corrected_seq1)?)?;
                 writeln!(writer1, "{}", std::str::from_utf8(&plus1)?)?;
-                writeln!(writer1, "{}", std::str::from_utf8(final_qual1)?)?;
+                writeln!(writer1, "{}", std::str::from_utf8(corrected_qual1)?)?;
 
-                writeln!(writer2, "{}", std::str::from_utf8(&header2)?)?;
-                writeln!(writer2, "{}", std::str::from_utf8(final_seq2)?)?;
+                writeln!(writer2, "{}", std::str::from_utf8(final_header2)?)?;
+                writeln!(writer2, "{}", std::str::from_utf8(corrected_seq2)?)?;
                 writeln!(writer2, "{}", std::str::from_utf8(&plus2)?)?;
-                writeln!(writer2, "{}", std::str::from_utf8(final_qual2)?)?;
+                writeln!(writer2, "{}", std::str::from_utf8(corrected_qual2)?)?;
 
                 // Update "after" stats
                 acc.after_r1.add(
-                    final_seq1.len(),
+                    corrected_seq1.len(),
                     trimmed_stats1.q20,
                     trimmed_stats1.q30,
                     trimmed_stats1.gc,
                 );
                 acc.after_r2.add(
-                    final_seq2.len(),
+                    corrected_seq2.len(),
                     trimmed_stats2.q20,
                     trimmed_stats2.q30,
                     trimmed_stats2.gc,

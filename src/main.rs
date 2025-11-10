@@ -21,6 +21,7 @@ mod processor;
 mod simd;
 mod stats;
 mod trimming;
+mod umi;
 mod util;
 
 use io::*;
@@ -216,6 +217,26 @@ struct Args {
     /// Maximum allowed difference percentage (0-100) (default: 20)
     #[arg(long, default_value = "20")]
     overlap_diff_percent_limit: usize,
+
+    /// Enable UMI preprocessing
+    #[arg(long)]
+    umi: bool,
+
+    /// UMI location: read1/read2/index1/index2/per_read/per_index (default: read1)
+    #[arg(long, default_value = "read1")]
+    umi_loc: String,
+
+    /// UMI length (required when --umi is enabled)
+    #[arg(long, default_value = "0")]
+    umi_len: usize,
+
+    /// Prefix in read name for UMI (default: UMI)
+    #[arg(long, default_value = "UMI")]
+    umi_prefix: String,
+
+    /// Skip N bases before UMI
+    #[arg(long, default_value = "0")]
+    umi_skip: usize,
 }
 
 // Helper function to create TrimmingConfig from CLI args
@@ -326,6 +347,35 @@ fn create_overlap_config(args: &Args) -> overlap::OverlapConfig {
         max_diff: args.overlap_diff_limit,
         max_diff_percent: args.overlap_diff_percent_limit,
     }
+}
+
+// Helper function to create UmiConfig from CLI args
+fn create_umi_config(args: &Args) -> Result<umi::UmiConfig> {
+    if !args.umi {
+        return Ok(umi::UmiConfig::default());
+    }
+
+    if args.umi_len == 0 {
+        anyhow::bail!("UMI length (--umi-len) must be specified when --umi is enabled");
+    }
+
+    let location = match args.umi_loc.as_str() {
+        "read1" => umi::UmiLocation::Read1,
+        "read2" => umi::UmiLocation::Read2,
+        "index1" => umi::UmiLocation::Index1,
+        "index2" => umi::UmiLocation::Index2,
+        "per_read" => umi::UmiLocation::PerRead,
+        "per_index" => umi::UmiLocation::PerIndex,
+        _ => anyhow::bail!("Invalid UMI location: {}. Must be one of: read1, read2, index1, index2, per_read, per_index", args.umi_loc),
+    };
+
+    Ok(umi::UmiConfig {
+        enabled: true,
+        location,
+        length: args.umi_len,
+        prefix: args.umi_prefix.clone(),
+        skip: args.umi_skip,
+    })
 }
 
 // Helper function to build and write paired-end report
@@ -525,6 +575,13 @@ fn main() -> Result<()> {
         None
     };
 
+    // Create UMI configuration from CLI args
+    let umi_config = if args.umi {
+        Some(create_umi_config(&args)?)
+    } else {
+        None
+    };
+
     // Process based on mode (single-end or paired-end)
     if is_paired_end {
         // PAIRED-END MODE
@@ -570,6 +627,7 @@ fn main() -> Result<()> {
                 &trimming_config_r1,
                 &trimming_config_r2,
                 overlap_config.as_ref(),
+                umi_config.as_ref(),
             )?;
 
             writer1.finish()?;
@@ -613,6 +671,7 @@ fn main() -> Result<()> {
                 let trimming_config_r1_clone = trimming_config_r1.clone();
                 let trimming_config_r2_clone = trimming_config_r2.clone();
                 let overlap_config_clone = overlap_config.clone();
+                let umi_config_clone = umi_config.clone();
 
                 let worker = thread::spawn(move || {
                     paired_worker_thread(
@@ -629,6 +688,7 @@ fn main() -> Result<()> {
                         trimming_config_r1_clone,
                         trimming_config_r2_clone,
                         overlap_config_clone,
+                        umi_config_clone,
                     )
                 });
                 workers.push(worker);

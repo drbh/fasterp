@@ -4475,3 +4475,224 @@ fn test_base_correction_disabled_by_default() {
         without_c_content.lines().count()
     );
 }
+
+#[test]
+fn test_umi_extraction_read1_paired_end() {
+    use std::io::Write;
+
+    let temp_dir = TempDir::new().unwrap();
+
+    // Create test input files with UMI in read1
+    let r1_input = temp_dir.path().join("umi_R1.fq");
+    let r2_input = temp_dir.path().join("umi_R2.fq");
+    let r1_output = temp_dir.path().join("out_R1.fq");
+    let r2_output = temp_dir.path().join("out_R2.fq");
+
+    // Read1 has 8bp UMI at start: ACGTACGT (30bp sequences + 30bp quality)
+    let r1_content = "@read1\nACGTACGTAAAAAAAAAAAAAAAAAAAAAA\n+\nIIIIIIIIIIIIIIIIIIIIIIIIIIIIII\n@read2\nTTGGCCAACCCCCCCCCCCCCCCCCCCCCC\n+\nIIIIIIIIIIIIIIIIIIIIIIIIIIIIII\n";
+    let r2_content = "@read1\nGGCCAATTGGGGGGGGGGGGGGGGGGGGGG\n+\nIIIIIIIIIIIIIIIIIIIIIIIIIIIIII\n@read2\nCGATCGATTTTTTTTTTTTTTTTTTTTTTT\n+\nIIIIIIIIIIIIIIIIIIIIIIIIIIIIII\n";
+
+    fs::write(&r1_input, r1_content).unwrap();
+    fs::write(&r2_input, r2_content).unwrap();
+
+    // Run fasterp with UMI extraction
+    let status = Command::new(cargo_bin("fasterp"))
+        .arg("-i").arg(&r1_input)
+        .arg("-I").arg(&r2_input)
+        .arg("-o").arg(&r1_output)
+        .arg("-O").arg(&r2_output)
+        .arg("--umi")
+        .arg("--umi-len").arg("8")
+        .arg("--umi-loc").arg("read1")
+        .arg("--disable-length-filtering")
+        .arg("--threads").arg("1") // Test single-threaded first
+        .status()
+        .expect("Failed to run fasterp");
+
+    assert!(status.success());
+
+    // Verify output
+    let r1_out = fs::read_to_string(&r1_output).unwrap();
+    let r2_out = fs::read_to_string(&r2_output).unwrap();
+
+    // Check that UMI was added to headers
+    assert!(r1_out.contains("@read1:UMI_ACGTACGT"), "R1 header should contain UMI");
+    assert!(r1_out.contains("@read2:UMI_TTGGCCAA"), "R1 header should contain UMI for read2");
+    assert!(r2_out.contains("@read1:UMI_ACGTACGT"), "R2 header should contain UMI");
+    assert!(r2_out.contains("@read2:UMI_TTGGCCAA"), "R2 header should contain UMI for read2");
+
+    // Check that UMI was removed from R1 sequences (8bp removed)
+    // Original read1 R1: ACGTACGTAAAAAAAAAAAAAAAAAAAAA (30bp)
+    // After UMI removal: AAAAAAAAAAAAAAAAAAAAA (22bp)
+    assert!(r1_out.contains("AAAAAAAAAAAAAAAAAAAAA"), "R1 sequence should have UMI removed");
+
+    // R2 should be unchanged (UMI from R1) - 30bp
+    assert!(r2_out.contains("GGCCAATTGGGGGGGGGGGGGGGGGGGGG"), "R2 sequence should be unchanged");
+}
+
+#[test]
+fn test_umi_extraction_read2_paired_end() {
+    use std::io::Write;
+
+    let temp_dir = TempDir::new().unwrap();
+
+    // Create test input files with UMI in read2
+    let r1_input = temp_dir.path().join("umi_R1.fq");
+    let r2_input = temp_dir.path().join("umi_R2.fq");
+    let r1_output = temp_dir.path().join("out_R1.fq");
+    let r2_output = temp_dir.path().join("out_R2.fq");
+
+    let r1_content = "@read1\nGGCCAATTGGGGGGGGGGGGGGGGGGGGGG\n+\nIIIIIIIIIIIIIIIIIIIIIIIIIIIIII\n";
+    // Read2 has 6bp UMI at start: ACGTAC (6bp UMI + 24bp sequence = 30bp total)
+    let r2_content = "@read1\nACGTACAAAAAAAAAAAAAAAAAAAAAAAA\n+\nIIIIIIIIIIIIIIIIIIIIIIIIIIIIII\n";
+
+    fs::write(&r1_input, r1_content).unwrap();
+    fs::write(&r2_input, r2_content).unwrap();
+
+    // Run fasterp with UMI extraction from read2
+    let status = Command::new(cargo_bin("fasterp"))
+        .arg("-i").arg(&r1_input)
+        .arg("-I").arg(&r2_input)
+        .arg("-o").arg(&r1_output)
+        .arg("-O").arg(&r2_output)
+        .arg("--umi")
+        .arg("--umi-len").arg("6")
+        .arg("--umi-loc").arg("read2")
+        .arg("--disable-length-filtering")
+        .arg("--disable-trim-tail")
+        .arg("--threads").arg("1")
+        .status()
+        .expect("Failed to run fasterp");
+
+    assert!(status.success());
+
+    // Verify output
+    let r1_out = fs::read_to_string(&r1_output).unwrap();
+    let r2_out = fs::read_to_string(&r2_output).unwrap();
+
+    // Check that UMI was added to both headers
+    assert!(r1_out.contains("@read1:UMI_ACGTAC"), "R1 header should contain UMI from R2");
+    assert!(r2_out.contains("@read1:UMI_ACGTAC"), "R2 header should contain UMI");
+
+    // R1 should be unchanged (UMI from R2) - 30bp
+    assert!(r1_out.contains("GGCCAATTGGGGGGGGGGGGGGGGGGGGG"), "R1 sequence should be unchanged");
+
+    // R2 should have UMI removed (6bp): 30bp -> 24bp
+    assert!(r2_out.contains("AAAAAAAAAAAAAAAAAAAAAAAA"), "R2 sequence should have UMI removed");
+}
+
+#[test]
+fn test_umi_multithreaded_consistency() {
+    use std::io::Write;
+
+    let temp_dir = TempDir::new().unwrap();
+
+    // Create test input files
+    let r1_input = temp_dir.path().join("umi_R1.fq");
+    let r2_input = temp_dir.path().join("umi_R2.fq");
+    let r1_single = temp_dir.path().join("out_single_R1.fq");
+    let r2_single = temp_dir.path().join("out_single_R2.fq");
+    let r1_multi = temp_dir.path().join("out_multi_R1.fq");
+    let r2_multi = temp_dir.path().join("out_multi_R2.fq");
+
+    // Create test data with multiple reads (30bp each)
+    let r1_content = "@read1\nACGTACGTAAAAAAAAAAAAAAAAAAAAAA\n+\nIIIIIIIIIIIIIIIIIIIIIIIIIIIIII\n@read2\nTTGGCCAACCCCCCCCCCCCCCCCCCCCCC\n+\nIIIIIIIIIIIIIIIIIIIIIIIIIIIIII\n@read3\nGATCGATCGGGGGGGGGGGGGGGGGGGGGG\n+\nIIIIIIIIIIIIIIIIIIIIIIIIIIIIII\n";
+    let r2_content = "@read1\nGGCCAATTGGGGGGGGGGGGGGGGGGGGGG\n+\nIIIIIIIIIIIIIIIIIIIIIIIIIIIIII\n@read2\nCGATCGATTTTTTTTTTTTTTTTTTTTTTT\n+\nIIIIIIIIIIIIIIIIIIIIIIIIIIIIII\n@read3\nTATATATATTTTTTTTTTTTTTTTTTTTTT\n+\nIIIIIIIIIIIIIIIIIIIIIIIIIIIIII\n";
+
+    fs::write(&r1_input, r1_content).unwrap();
+    fs::write(&r2_input, r2_content).unwrap();
+
+    // Run with single thread
+    let status = Command::new(cargo_bin("fasterp"))
+        .arg("-i").arg(&r1_input)
+        .arg("-I").arg(&r2_input)
+        .arg("-o").arg(&r1_single)
+        .arg("-O").arg(&r2_single)
+        .arg("--umi")
+        .arg("--umi-len").arg("8")
+        .arg("--umi-loc").arg("read1")
+        .arg("--disable-length-filtering")
+        .arg("--threads").arg("1")
+        .status()
+        .expect("Failed to run fasterp single-threaded");
+    assert!(status.success());
+
+    // Run with multiple threads
+    let status = Command::new(cargo_bin("fasterp"))
+        .arg("-i").arg(&r1_input)
+        .arg("-I").arg(&r2_input)
+        .arg("-o").arg(&r1_multi)
+        .arg("-O").arg(&r2_multi)
+        .arg("--umi")
+        .arg("--umi-len").arg("8")
+        .arg("--umi-loc").arg("read1")
+        .arg("--disable-length-filtering")
+        .arg("--threads").arg("4")
+        .status()
+        .expect("Failed to run fasterp multi-threaded");
+    assert!(status.success());
+
+    // Compare outputs - should be identical
+    let r1_single_content = fs::read_to_string(&r1_single).unwrap();
+    let r1_multi_content = fs::read_to_string(&r1_multi).unwrap();
+    let r2_single_content = fs::read_to_string(&r2_single).unwrap();
+    let r2_multi_content = fs::read_to_string(&r2_multi).unwrap();
+
+    assert_eq!(r1_single_content, r1_multi_content, "R1 outputs should match between single and multi-threaded");
+    assert_eq!(r2_single_content, r2_multi_content, "R2 outputs should match between single and multi-threaded");
+
+    // Verify UMI was extracted correctly
+    assert!(r1_single_content.contains("@read1:UMI_ACGTACGT"));
+    assert!(r1_single_content.contains("@read2:UMI_TTGGCCAA"));
+    assert!(r1_single_content.contains("@read3:UMI_GATCGATC"));
+}
+
+#[test]
+fn test_umi_with_trimming_and_filtering() {
+    use std::io::Write;
+
+    let temp_dir = TempDir::new().unwrap();
+
+    // Create test input files
+    let r1_input = temp_dir.path().join("umi_R1.fq");
+    let r2_input = temp_dir.path().join("umi_R2.fq");
+    let r1_output = temp_dir.path().join("out_R1.fq");
+    let r2_output = temp_dir.path().join("out_R2.fq");
+
+    // Read with UMI + poly-G tail that should be trimmed (30bp total)
+    let r1_content = "@read1\nACGTACGTAAAAAAAAAAGGGGGGGGGGGG\n+\nIIIIIIIIIIIIIIIIIIIIIIIIIIIIII\n";
+    let r2_content = "@read1\nCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC\n+\nIIIIIIIIIIIIIIIIIIIIIIIIIIIIII\n";
+
+    fs::write(&r1_input, r1_content).unwrap();
+    fs::write(&r2_input, r2_content).unwrap();
+
+    // Run with UMI and poly-G trimming
+    let status = Command::new(cargo_bin("fasterp"))
+        .arg("-i").arg(&r1_input)
+        .arg("-I").arg(&r2_input)
+        .arg("-o").arg(&r1_output)
+        .arg("-O").arg(&r2_output)
+        .arg("--umi")
+        .arg("--umi-len").arg("8")
+        .arg("--umi-loc").arg("read1")
+        .arg("--trim-poly-g")
+        .arg("--disable-length-filtering")
+        .arg("--threads").arg("1")
+        .status()
+        .expect("Failed to run fasterp");
+
+    assert!(status.success());
+
+    // Verify output
+    let r1_out = fs::read_to_string(&r1_output).unwrap();
+
+    // Check UMI was added
+    assert!(r1_out.contains("@read1:UMI_ACGTACGT"));
+
+    // Check that both UMI (8bp) AND poly-G tail were removed
+    // Original: ACGTACGTAAAAAAAAAA GGGGGGGGGGGG (30bp)
+    // After UMI: AAAAAAAAAA GGGGGGGGGGGG (22bp)
+    // After poly-G trim: AAAAAAAAAA (10bp A's, poly-G removed)
+    assert!(r1_out.contains("AAAAAAAAAA"));
+    assert!(!r1_out.contains("GGGGGGGGGGGG"), "Poly-G tail should be trimmed");
+}
