@@ -4118,3 +4118,360 @@ fn test_multithreaded_pe_low_complexity() {
 
     compare_json_outputs(&PathBuf::from(single_json), &PathBuf::from(multi_json));
 }
+
+// ============================================================================
+// Base Correction Tests (PE Overlap)
+// ============================================================================
+
+#[test]
+fn test_base_correction_basic_functionality() {
+    let temp_dir = TempDir::new().unwrap();
+
+    let output_r1 = temp_dir.path().join("corrected_R1.fq");
+    let output_r2 = temp_dir.path().join("corrected_R2.fq");
+    let output_json = temp_dir.path().join("corrected.json");
+
+    // Run fasterp with base correction enabled
+    let status = Command::new(cargo_bin("fasterp"))
+        .arg("-i")
+        .arg(test_data_path("overlap_R1.fq"))
+        .arg("-I")
+        .arg(test_data_path("overlap_R2.fq"))
+        .arg("-o")
+        .arg(&output_r1)
+        .arg("-O")
+        .arg(&output_r2)
+        .arg("-j")
+        .arg(&output_json)
+        .arg("-c") // Enable base correction
+        .arg("-t")
+        .arg("1")
+        .status()
+        .expect("Failed to run fasterp with correction");
+    assert!(status.success());
+
+    // Verify outputs exist and have content
+    assert!(output_r1.exists(), "R1 output doesn't exist");
+    assert!(output_r2.exists(), "R2 output doesn't exist");
+
+    let r1_content = fs::read_to_string(&output_r1).unwrap();
+    let r2_content = fs::read_to_string(&output_r2).unwrap();
+
+    // Should have processed all 5 read pairs
+    assert_eq!(r1_content.lines().count(), 20); // 5 reads * 4 lines each
+    assert_eq!(r2_content.lines().count(), 20);
+}
+
+#[test]
+fn test_base_correction_matches_fastp() {
+    let temp_dir = TempDir::new().unwrap();
+
+    // Use actual paired-end test data
+    let fastp_r1 = temp_dir.path().join("fastp_corrected_R1.fq");
+    let fastp_r2 = temp_dir.path().join("fastp_corrected_R2.fq");
+    let fastp_json = temp_dir.path().join("fastp_corrected.json");
+
+    let fasterp_r1 = temp_dir.path().join("fasterp_corrected_R1.fq");
+    let fasterp_r2 = temp_dir.path().join("fasterp_corrected_R2.fq");
+    let fasterp_json = temp_dir.path().join("fasterp_corrected.json");
+
+    // Run fastp with correction
+    let status = Command::new("fastp")
+        .arg("-i")
+        .arg(test_data_path("pe_small_R1.fq"))
+        .arg("-I")
+        .arg(test_data_path("pe_small_R2.fq"))
+        .arg("-o")
+        .arg(&fastp_r1)
+        .arg("-O")
+        .arg(&fastp_r2)
+        .arg("-j")
+        .arg(&fastp_json)
+        .arg("-c") // Enable base correction
+        .arg("-t")
+        .arg("1")
+        .stderr(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .status()
+        .expect("Failed to run fastp with correction");
+    assert!(status.success(), "fastp with correction failed");
+
+    // Run fasterp with correction
+    let status = Command::new(cargo_bin("fasterp"))
+        .arg("-i")
+        .arg(test_data_path("pe_small_R1.fq"))
+        .arg("-I")
+        .arg(test_data_path("pe_small_R2.fq"))
+        .arg("-o")
+        .arg(&fasterp_r1)
+        .arg("-O")
+        .arg(&fasterp_r2)
+        .arg("-j")
+        .arg(&fasterp_json)
+        .arg("-c") // Enable base correction
+        .arg("-t")
+        .arg("1")
+        .status()
+        .expect("Failed to run fasterp with correction");
+    assert!(status.success(), "fasterp with correction failed");
+
+    // Compare R1 outputs
+    let fastp_r1_content = fs::read_to_string(&fastp_r1).unwrap();
+    let fasterp_r1_content = fs::read_to_string(&fasterp_r1).unwrap();
+    assert_eq!(
+        fastp_r1_content, fasterp_r1_content,
+        "R1 outputs with correction don't match"
+    );
+
+    // Compare R2 outputs
+    let fastp_r2_content = fs::read_to_string(&fastp_r2).unwrap();
+    let fasterp_r2_content = fs::read_to_string(&fasterp_r2).unwrap();
+    assert_eq!(
+        fastp_r2_content, fasterp_r2_content,
+        "R2 outputs with correction don't match"
+    );
+
+    // Compare JSON reports
+    compare_json_outputs(&fastp_json, &fasterp_json);
+}
+
+#[test]
+fn test_base_correction_multithreaded() {
+    let temp_dir = TempDir::new().unwrap();
+
+    let single_r1 = temp_dir.path().join("single_R1.fq");
+    let single_r2 = temp_dir.path().join("single_R2.fq");
+    let single_json = temp_dir.path().join("single.json");
+
+    let multi_r1 = temp_dir.path().join("multi_R1.fq");
+    let multi_r2 = temp_dir.path().join("multi_R2.fq");
+    let multi_json = temp_dir.path().join("multi.json");
+
+    // Run single-threaded with correction
+    let status = Command::new(cargo_bin("fasterp"))
+        .arg("-i")
+        .arg(test_data_path("pe_medium_R1.fq"))
+        .arg("-I")
+        .arg(test_data_path("pe_medium_R2.fq"))
+        .arg("-o")
+        .arg(&single_r1)
+        .arg("-O")
+        .arg(&single_r2)
+        .arg("-j")
+        .arg(&single_json)
+        .arg("-c")
+        .arg("-t")
+        .arg("1")
+        .status()
+        .expect("Failed to run single-threaded with correction");
+    assert!(status.success());
+
+    // Run multi-threaded with correction
+    let status = Command::new(cargo_bin("fasterp"))
+        .arg("-i")
+        .arg(test_data_path("pe_medium_R1.fq"))
+        .arg("-I")
+        .arg(test_data_path("pe_medium_R2.fq"))
+        .arg("-o")
+        .arg(&multi_r1)
+        .arg("-O")
+        .arg(&multi_r2)
+        .arg("-j")
+        .arg(&multi_json)
+        .arg("-c")
+        .arg("-t")
+        .arg("4")
+        .status()
+        .expect("Failed to run multi-threaded with correction");
+    assert!(status.success());
+
+    // Compare outputs - should be identical
+    let single_r1_content = fs::read_to_string(&single_r1).unwrap();
+    let multi_r1_content = fs::read_to_string(&multi_r1).unwrap();
+    assert_eq!(
+        single_r1_content, multi_r1_content,
+        "R1 outputs differ between single and multi-threaded correction"
+    );
+
+    let single_r2_content = fs::read_to_string(&single_r2).unwrap();
+    let multi_r2_content = fs::read_to_string(&multi_r2).unwrap();
+    assert_eq!(
+        single_r2_content, multi_r2_content,
+        "R2 outputs differ between single and multi-threaded correction"
+    );
+
+    compare_json_outputs(&single_json, &multi_json);
+}
+
+#[test]
+fn test_base_correction_custom_parameters() {
+    let temp_dir = TempDir::new().unwrap();
+
+    let output_r1 = temp_dir.path().join("custom_R1.fq");
+    let output_r2 = temp_dir.path().join("custom_R2.fq");
+    let output_json = temp_dir.path().join("custom.json");
+
+    // Run with custom overlap parameters
+    let status = Command::new(cargo_bin("fasterp"))
+        .arg("-i")
+        .arg(test_data_path("pe_small_R1.fq"))
+        .arg("-I")
+        .arg(test_data_path("pe_small_R2.fq"))
+        .arg("-o")
+        .arg(&output_r1)
+        .arg("-O")
+        .arg(&output_r2)
+        .arg("-j")
+        .arg(&output_json)
+        .arg("-c")
+        .arg("--overlap-len-require")
+        .arg("20")
+        .arg("--overlap-diff-limit")
+        .arg("3")
+        .arg("--overlap-diff-percent-limit")
+        .arg("15")
+        .arg("-t")
+        .arg("1")
+        .status()
+        .expect("Failed to run with custom parameters");
+    assert!(status.success());
+
+    // Verify outputs exist
+    assert!(output_r1.exists());
+    assert!(output_r2.exists());
+    assert!(output_json.exists());
+}
+
+#[test]
+fn test_base_correction_with_filtering() {
+    let temp_dir = TempDir::new().unwrap();
+
+    let fastp_r1 = temp_dir.path().join("fastp_filter_R1.fq");
+    let fastp_r2 = temp_dir.path().join("fastp_filter_R2.fq");
+    let fastp_json = temp_dir.path().join("fastp_filter.json");
+
+    let fasterp_r1 = temp_dir.path().join("fasterp_filter_R1.fq");
+    let fasterp_r2 = temp_dir.path().join("fasterp_filter_R2.fq");
+    let fasterp_json = temp_dir.path().join("fasterp_filter.json");
+
+    // Run fastp with correction + filtering
+    let status = Command::new("fastp")
+        .arg("-i")
+        .arg(test_data_path("pe_medium_R1.fq"))
+        .arg("-I")
+        .arg(test_data_path("pe_medium_R2.fq"))
+        .arg("-o")
+        .arg(&fastp_r1)
+        .arg("-O")
+        .arg(&fastp_r2)
+        .arg("-j")
+        .arg(&fastp_json)
+        .arg("-c") // Enable correction
+        .arg("-l")
+        .arg("20") // Length filter
+        .arg("-q")
+        .arg("15") // Quality filter
+        .arg("-t")
+        .arg("1")
+        .stderr(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .status()
+        .expect("Failed to run fastp");
+    assert!(status.success());
+
+    // Run fasterp with correction + filtering
+    let status = Command::new(cargo_bin("fasterp"))
+        .arg("-i")
+        .arg(test_data_path("pe_medium_R1.fq"))
+        .arg("-I")
+        .arg(test_data_path("pe_medium_R2.fq"))
+        .arg("-o")
+        .arg(&fasterp_r1)
+        .arg("-O")
+        .arg(&fasterp_r2)
+        .arg("-j")
+        .arg(&fasterp_json)
+        .arg("-c") // Enable correction
+        .arg("-l")
+        .arg("20") // Length filter
+        .arg("-q")
+        .arg("15") // Quality filter
+        .arg("-t")
+        .arg("1")
+        .status()
+        .expect("Failed to run fasterp");
+    assert!(status.success());
+
+    // Compare outputs
+    let fastp_r1_content = fs::read_to_string(&fastp_r1).unwrap();
+    let fasterp_r1_content = fs::read_to_string(&fasterp_r1).unwrap();
+    assert_eq!(
+        fastp_r1_content, fasterp_r1_content,
+        "R1 outputs with correction+filtering don't match"
+    );
+
+    let fastp_r2_content = fs::read_to_string(&fastp_r2).unwrap();
+    let fasterp_r2_content = fs::read_to_string(&fasterp_r2).unwrap();
+    assert_eq!(
+        fastp_r2_content, fasterp_r2_content,
+        "R2 outputs with correction+filtering don't match"
+    );
+
+    compare_json_outputs(&fastp_json, &fasterp_json);
+}
+
+#[test]
+fn test_base_correction_disabled_by_default() {
+    let temp_dir = TempDir::new().unwrap();
+
+    let with_c_r1 = temp_dir.path().join("with_c_R1.fq");
+    let with_c_r2 = temp_dir.path().join("with_c_R2.fq");
+    let without_c_r1 = temp_dir.path().join("without_c_R1.fq");
+    let without_c_r2 = temp_dir.path().join("without_c_R2.fq");
+
+    // Run WITH -c flag
+    let status = Command::new(cargo_bin("fasterp"))
+        .arg("-i")
+        .arg(test_data_path("overlap_R1.fq"))
+        .arg("-I")
+        .arg(test_data_path("overlap_R2.fq"))
+        .arg("-o")
+        .arg(&with_c_r1)
+        .arg("-O")
+        .arg(&with_c_r2)
+        .arg("-c")
+        .arg("-t")
+        .arg("1")
+        .status()
+        .expect("Failed to run with -c");
+    assert!(status.success());
+
+    // Run WITHOUT -c flag
+    let status = Command::new(cargo_bin("fasterp"))
+        .arg("-i")
+        .arg(test_data_path("overlap_R1.fq"))
+        .arg("-I")
+        .arg(test_data_path("overlap_R2.fq"))
+        .arg("-o")
+        .arg(&without_c_r1)
+        .arg("-O")
+        .arg(&without_c_r2)
+        .arg("-t")
+        .arg("1")
+        .status()
+        .expect("Failed to run without -c");
+    assert!(status.success());
+
+    // Read outputs - they should be the same since our test data has intentional errors
+    // that should only be corrected with -c flag
+    let with_c_content = fs::read_to_string(&with_c_r1).unwrap();
+    let without_c_content = fs::read_to_string(&without_c_r1).unwrap();
+
+    // Both should produce output, but content should be the same (no correction without -c)
+    assert!(with_c_r1.exists());
+    assert!(without_c_r1.exists());
+    assert_eq!(
+        with_c_content.lines().count(),
+        without_c_content.lines().count()
+    );
+}

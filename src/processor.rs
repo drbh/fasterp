@@ -588,6 +588,7 @@ pub(crate) fn process_paired_fastq_stream<R1: BufRead, R2: BufRead, W1: Write, W
     complexity_threshold: usize,
     trimming_config_r1: &TrimmingConfig,
     trimming_config_r2: &TrimmingConfig,
+    overlap_config: Option<&crate::overlap::OverlapConfig>,
 ) -> Result<PairedEndAccumulator> {
     let mut acc = PairedEndAccumulator::new();
     let mut parser1 = FastqParser::new(reader1);
@@ -660,17 +661,57 @@ pub(crate) fn process_paired_fastq_stream<R1: BufRead, R2: BufRead, W1: Write, W
                 let trimmed_seq2 = &seq2[trim_result2.start_pos..trim_result2.end_pos];
                 let trimmed_qual2 = &qual2[trim_result2.start_pos..trim_result2.end_pos];
 
+                // Apply base correction using overlap analysis (if enabled)
+                let (final_seq1, final_qual1, final_seq2, final_qual2);
+                let mut seq1_corrected;
+                let mut qual1_corrected;
+                let mut seq2_corrected;
+                let mut qual2_corrected;
+
+                if let Some(config) = overlap_config {
+                    // Create mutable copies for correction
+                    seq1_corrected = trimmed_seq1.to_vec();
+                    qual1_corrected = trimmed_qual1.to_vec();
+                    seq2_corrected = trimmed_seq2.to_vec();
+                    qual2_corrected = trimmed_qual2.to_vec();
+
+                    // Detect overlap and correct mismatches
+                    if let Some(overlap) =
+                        crate::overlap::detect_overlap(&seq1_corrected, &seq2_corrected, config)
+                    {
+                        let _correction_stats = crate::overlap::correct_by_overlap(
+                            &mut seq1_corrected,
+                            &mut qual1_corrected,
+                            &mut seq2_corrected,
+                            &mut qual2_corrected,
+                            &overlap,
+                        );
+                        // TODO: Track correction statistics in accumulator
+                    }
+
+                    final_seq1 = &seq1_corrected[..];
+                    final_qual1 = &qual1_corrected[..];
+                    final_seq2 = &seq2_corrected[..];
+                    final_qual2 = &qual2_corrected[..];
+                } else {
+                    // No correction - use trimmed sequences directly
+                    final_seq1 = trimmed_seq1;
+                    final_qual1 = trimmed_qual1;
+                    final_seq2 = trimmed_seq2;
+                    final_qual2 = trimmed_qual2;
+                }
+
                 // Check if either read is too short
-                if trimmed_seq1.len() < min_len || trimmed_seq2.len() < min_len {
+                if final_seq1.len() < min_len || final_seq2.len() < min_len {
                     acc.too_short += 1;
                     continue;
                 }
 
-                // Recompute stats for trimmed reads
+                // Recompute stats for final reads (after trimming and correction)
                 let trimmed_stats1 =
-                    simd::compute_stats(trimmed_seq1, trimmed_qual1, qualified_quality_phred);
+                    simd::compute_stats(final_seq1, final_qual1, qualified_quality_phred);
                 let trimmed_stats2 =
-                    simd::compute_stats(trimmed_seq2, trimmed_qual2, qualified_quality_phred);
+                    simd::compute_stats(final_seq2, final_qual2, qualified_quality_phred);
 
                 // Check N-base filter for both reads
                 if trimmed_stats1.ncnt > n_limit || trimmed_stats2.ncnt > n_limit {
@@ -681,15 +722,15 @@ pub(crate) fn process_paired_fastq_stream<R1: BufRead, R2: BufRead, W1: Write, W
                 // Check unqualified percent for both reads
                 let mut fail_quality = false;
                 if qualified_quality_phred > 0 {
-                    if trimmed_seq1.len() > 0
+                    if final_seq1.len() > 0
                         && 100 * trimmed_stats1.unqualified
-                            > unqualified_percent_limit * trimmed_seq1.len()
+                            > unqualified_percent_limit * final_seq1.len()
                     {
                         fail_quality = true;
                     }
-                    if trimmed_seq2.len() > 0
+                    if final_seq2.len() > 0
                         && 100 * trimmed_stats2.unqualified
-                            > unqualified_percent_limit * trimmed_seq2.len()
+                            > unqualified_percent_limit * final_seq2.len()
                     {
                         fail_quality = true;
                     }
@@ -697,14 +738,14 @@ pub(crate) fn process_paired_fastq_stream<R1: BufRead, R2: BufRead, W1: Write, W
 
                 // Check average quality for both reads
                 if average_qual > 0 {
-                    if trimmed_seq1.len() > 0 {
-                        let mean_qual1 = trimmed_stats1.qsum as f64 / trimmed_seq1.len() as f64;
+                    if final_seq1.len() > 0 {
+                        let mean_qual1 = trimmed_stats1.qsum as f64 / final_seq1.len() as f64;
                         if mean_qual1 < average_qual as f64 {
                             fail_quality = true;
                         }
                     }
-                    if trimmed_seq2.len() > 0 {
-                        let mean_qual2 = trimmed_stats2.qsum as f64 / trimmed_seq2.len() as f64;
+                    if final_seq2.len() > 0 {
+                        let mean_qual2 = trimmed_stats2.qsum as f64 / final_seq2.len() as f64;
                         if mean_qual2 < average_qual as f64 {
                             fail_quality = true;
                         }
@@ -719,14 +760,14 @@ pub(crate) fn process_paired_fastq_stream<R1: BufRead, R2: BufRead, W1: Write, W
                 // Check low complexity for both reads
                 if low_complexity_filter {
                     let mut fail_complexity = false;
-                    if trimmed_seq1.len() > 0 {
-                        let complexity1 = calculate_complexity(trimmed_seq1);
+                    if final_seq1.len() > 0 {
+                        let complexity1 = calculate_complexity(final_seq1);
                         if complexity1 < complexity_threshold {
                             fail_complexity = true;
                         }
                     }
-                    if trimmed_seq2.len() > 0 {
-                        let complexity2 = calculate_complexity(trimmed_seq2);
+                    if final_seq2.len() > 0 {
+                        let complexity2 = calculate_complexity(final_seq2);
                         if complexity2 < complexity_threshold {
                             fail_complexity = true;
                         }
@@ -740,24 +781,24 @@ pub(crate) fn process_paired_fastq_stream<R1: BufRead, R2: BufRead, W1: Write, W
 
                 // Both reads passed - write them
                 writeln!(writer1, "{}", std::str::from_utf8(&header1)?)?;
-                writeln!(writer1, "{}", std::str::from_utf8(trimmed_seq1)?)?;
+                writeln!(writer1, "{}", std::str::from_utf8(final_seq1)?)?;
                 writeln!(writer1, "{}", std::str::from_utf8(&plus1)?)?;
-                writeln!(writer1, "{}", std::str::from_utf8(trimmed_qual1)?)?;
+                writeln!(writer1, "{}", std::str::from_utf8(final_qual1)?)?;
 
                 writeln!(writer2, "{}", std::str::from_utf8(&header2)?)?;
-                writeln!(writer2, "{}", std::str::from_utf8(trimmed_seq2)?)?;
+                writeln!(writer2, "{}", std::str::from_utf8(final_seq2)?)?;
                 writeln!(writer2, "{}", std::str::from_utf8(&plus2)?)?;
-                writeln!(writer2, "{}", std::str::from_utf8(trimmed_qual2)?)?;
+                writeln!(writer2, "{}", std::str::from_utf8(final_qual2)?)?;
 
                 // Update "after" stats
                 acc.after_r1.add(
-                    trimmed_seq1.len(),
+                    final_seq1.len(),
                     trimmed_stats1.q20,
                     trimmed_stats1.q30,
                     trimmed_stats1.gc,
                 );
                 acc.after_r2.add(
-                    trimmed_seq2.len(),
+                    final_seq2.len(),
                     trimmed_stats2.q20,
                     trimmed_stats2.q30,
                     trimmed_stats2.gc,

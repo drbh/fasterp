@@ -835,6 +835,7 @@ pub(crate) fn paired_worker_thread(
     no_kmer: bool,
     trimming_config_r1: TrimmingConfig,
     trimming_config_r2: TrimmingConfig,
+    overlap_config: Option<crate::overlap::OverlapConfig>,
 ) {
     while let Ok(Some(batch)) = receiver.recv() {
         let mut before_r1 = SimpleStats::default();
@@ -916,17 +917,57 @@ pub(crate) fn paired_worker_thread(
             let trimmed_seq2 = &seq2[trim_result2.start_pos..trim_result2.end_pos];
             let trimmed_qual2 = &qual2[trim_result2.start_pos..trim_result2.end_pos];
 
+            // Apply base correction using overlap analysis (if enabled)
+            let (final_seq1, final_qual1, final_seq2, final_qual2);
+            let mut seq1_corrected;
+            let mut qual1_corrected;
+            let mut seq2_corrected;
+            let mut qual2_corrected;
+
+            if let Some(ref config) = overlap_config {
+                // Create mutable copies for correction
+                seq1_corrected = trimmed_seq1.to_vec();
+                qual1_corrected = trimmed_qual1.to_vec();
+                seq2_corrected = trimmed_seq2.to_vec();
+                qual2_corrected = trimmed_qual2.to_vec();
+
+                // Detect overlap and correct mismatches
+                if let Some(overlap) =
+                    crate::overlap::detect_overlap(&seq1_corrected, &seq2_corrected, config)
+                {
+                    let _correction_stats = crate::overlap::correct_by_overlap(
+                        &mut seq1_corrected,
+                        &mut qual1_corrected,
+                        &mut seq2_corrected,
+                        &mut qual2_corrected,
+                        &overlap,
+                    );
+                    // TODO: Track correction statistics
+                }
+
+                final_seq1 = &seq1_corrected[..];
+                final_qual1 = &qual1_corrected[..];
+                final_seq2 = &seq2_corrected[..];
+                final_qual2 = &qual2_corrected[..];
+            } else {
+                // No correction - use trimmed sequences directly
+                final_seq1 = trimmed_seq1;
+                final_qual1 = trimmed_qual1;
+                final_seq2 = trimmed_seq2;
+                final_qual2 = trimmed_qual2;
+            }
+
             // Check length filter (EITHER read too short = BOTH fail)
-            if trimmed_seq1.len() < min_len || trimmed_seq2.len() < min_len {
+            if final_seq1.len() < min_len || final_seq2.len() < min_len {
                 too_short += 1;
                 continue;
             }
 
-            // Recompute stats for trimmed reads
+            // Recompute stats for final reads (after trimming and correction)
             let trimmed_stats1 =
-                simd::compute_stats(trimmed_seq1, trimmed_qual1, qualified_quality_phred);
+                simd::compute_stats(final_seq1, final_qual1, qualified_quality_phred);
             let trimmed_stats2 =
-                simd::compute_stats(trimmed_seq2, trimmed_qual2, qualified_quality_phred);
+                simd::compute_stats(final_seq2, final_qual2, qualified_quality_phred);
 
             // Check N limit (EITHER read too many N = BOTH fail)
             if trimmed_stats1.ncnt > n_limit || trimmed_stats2.ncnt > n_limit {
@@ -937,16 +978,16 @@ pub(crate) fn paired_worker_thread(
             // Check unqualified percent (EITHER read fails = BOTH fail)
             let mut fail_quality = false;
             if qualified_quality_phred > 0 {
-                if trimmed_seq1.len() > 0 {
+                if final_seq1.len() > 0 {
                     if 100 * trimmed_stats1.unqualified
-                        > unqualified_percent_limit * trimmed_seq1.len()
+                        > unqualified_percent_limit * final_seq1.len()
                     {
                         fail_quality = true;
                     }
                 }
-                if trimmed_seq2.len() > 0 {
+                if final_seq2.len() > 0 {
                     if 100 * trimmed_stats2.unqualified
-                        > unqualified_percent_limit * trimmed_seq2.len()
+                        > unqualified_percent_limit * final_seq2.len()
                     {
                         fail_quality = true;
                     }
@@ -955,14 +996,14 @@ pub(crate) fn paired_worker_thread(
 
             // Check average quality (EITHER read fails = BOTH fail)
             if average_qual > 0 {
-                if trimmed_seq1.len() > 0 {
-                    let mean_qual1 = trimmed_stats1.qsum as f64 / trimmed_seq1.len() as f64;
+                if final_seq1.len() > 0 {
+                    let mean_qual1 = trimmed_stats1.qsum as f64 / final_seq1.len() as f64;
                     if mean_qual1 < average_qual as f64 {
                         fail_quality = true;
                     }
                 }
-                if trimmed_seq2.len() > 0 {
-                    let mean_qual2 = trimmed_stats2.qsum as f64 / trimmed_seq2.len() as f64;
+                if final_seq2.len() > 0 {
+                    let mean_qual2 = trimmed_stats2.qsum as f64 / final_seq2.len() as f64;
                     if mean_qual2 < average_qual as f64 {
                         fail_quality = true;
                     }
@@ -977,14 +1018,14 @@ pub(crate) fn paired_worker_thread(
             // Check low complexity (EITHER read fails = BOTH fail)
             if low_complexity_filter {
                 let mut fail_complexity = false;
-                if trimmed_seq1.len() > 0 {
-                    let complexity1 = calculate_complexity(trimmed_seq1);
+                if final_seq1.len() > 0 {
+                    let complexity1 = calculate_complexity(final_seq1);
                     if complexity1 < complexity_threshold {
                         fail_complexity = true;
                     }
                 }
-                if trimmed_seq2.len() > 0 {
-                    let complexity2 = calculate_complexity(trimmed_seq2);
+                if final_seq2.len() > 0 {
+                    let complexity2 = calculate_complexity(final_seq2);
                     if complexity2 < complexity_threshold {
                         fail_complexity = true;
                     }
@@ -1000,42 +1041,112 @@ pub(crate) fn paired_worker_thread(
             let [h1_start, s1_start, p1_start, q1_start] = rec1;
             let [h2_start, s2_start, p2_start, q2_start] = rec2;
 
-            let trimmed_seq1_start = s1_start + trim_result1.start_pos;
-            let trimmed_seq1_end = s1_start + trim_result1.end_pos;
-            let trimmed_qual1_start = q1_start + trim_result1.start_pos;
-            let trimmed_qual1_end = q1_start + trim_result1.end_pos;
+            // When correction is enabled, we need to create new buffers with corrected data
+            // Otherwise, use zero-copy with ranges into original buffer
+            let (r1_piece, r2_piece) = if overlap_config.is_some() {
+                // Correction was enabled - create new buffers with corrected sequences
+                let mut r1_buf = Vec::new();
+                let mut r2_buf = Vec::new();
 
-            let trimmed_seq2_start = s2_start + trim_result2.start_pos;
-            let trimmed_seq2_end = s2_start + trim_result2.end_pos;
-            let trimmed_qual2_start = q2_start + trim_result2.start_pos;
-            let trimmed_qual2_end = q2_start + trim_result2.end_pos;
+                // Build R1 buffer: header + '\n' + seq + '\n' + plus + '\n' + qual + '\n'
+                let r1_header_start = 0;
+                r1_buf.extend_from_slice(&batch.buf_r1[h1_start..s1_start - 1]);
+                let r1_header_end = r1_buf.len();
+                r1_buf.push(b'\n');
+                let r1_seq_start = r1_buf.len();
+                r1_buf.extend_from_slice(final_seq1);
+                let r1_seq_end = r1_buf.len();
+                r1_buf.push(b'\n');
+                let r1_plus_start = r1_buf.len();
+                r1_buf.extend_from_slice(&batch.buf_r1[p1_start..q1_start - 1]);
+                let r1_plus_end = r1_buf.len();
+                r1_buf.push(b'\n');
+                let r1_qual_start = r1_buf.len();
+                r1_buf.extend_from_slice(final_qual1);
+                let r1_qual_end = r1_buf.len();
+                r1_buf.push(b'\n');
+
+                // Build R2 buffer
+                let r2_header_start = 0;
+                r2_buf.extend_from_slice(&batch.buf_r2[h2_start..s2_start - 1]);
+                let r2_header_end = r2_buf.len();
+                r2_buf.push(b'\n');
+                let r2_seq_start = r2_buf.len();
+                r2_buf.extend_from_slice(final_seq2);
+                let r2_seq_end = r2_buf.len();
+                r2_buf.push(b'\n');
+                let r2_plus_start = r2_buf.len();
+                r2_buf.extend_from_slice(&batch.buf_r2[p2_start..q2_start - 1]);
+                let r2_plus_end = r2_buf.len();
+                r2_buf.push(b'\n');
+                let r2_qual_start = r2_buf.len();
+                r2_buf.extend_from_slice(final_qual2);
+                let r2_qual_end = r2_buf.len();
+                r2_buf.push(b'\n');
+
+                let r1_arc = Arc::new(r1_buf);
+                let r2_arc = Arc::new(r2_buf);
+
+                (
+                    RecordPiece {
+                        buf: r1_arc,
+                        header: r1_header_start..r1_header_end,
+                        seq: r1_seq_start..r1_seq_end,
+                        plus: r1_plus_start..r1_plus_end,
+                        qual: r1_qual_start..r1_qual_end,
+                    },
+                    RecordPiece {
+                        buf: r2_arc,
+                        header: r2_header_start..r2_header_end,
+                        seq: r2_seq_start..r2_seq_end,
+                        plus: r2_plus_start..r2_plus_end,
+                        qual: r2_qual_start..r2_qual_end,
+                    },
+                )
+            } else {
+                // No correction - use zero-copy with ranges into original buffer
+                let trimmed_seq1_start = s1_start + trim_result1.start_pos;
+                let trimmed_seq1_end = s1_start + trim_result1.end_pos;
+                let trimmed_qual1_start = q1_start + trim_result1.start_pos;
+                let trimmed_qual1_end = q1_start + trim_result1.end_pos;
+
+                let trimmed_seq2_start = s2_start + trim_result2.start_pos;
+                let trimmed_seq2_end = s2_start + trim_result2.end_pos;
+                let trimmed_qual2_start = q2_start + trim_result2.start_pos;
+                let trimmed_qual2_end = q2_start + trim_result2.end_pos;
+
+                (
+                    RecordPiece {
+                        buf: batch.buf_r1.clone(),
+                        header: h1_start..s1_start - 1,
+                        seq: trimmed_seq1_start..trimmed_seq1_end,
+                        plus: p1_start..q1_start - 1,
+                        qual: trimmed_qual1_start..trimmed_qual1_end,
+                    },
+                    RecordPiece {
+                        buf: batch.buf_r2.clone(),
+                        header: h2_start..s2_start - 1,
+                        seq: trimmed_seq2_start..trimmed_seq2_end,
+                        plus: p2_start..q2_start - 1,
+                        qual: trimmed_qual2_start..trimmed_qual2_end,
+                    },
+                )
+            };
 
             pieces.push(PairedRecordPiece {
-                r1: RecordPiece {
-                    buf: batch.buf_r1.clone(),
-                    header: h1_start..s1_start - 1,
-                    seq: trimmed_seq1_start..trimmed_seq1_end,
-                    plus: p1_start..q1_start - 1,
-                    qual: trimmed_qual1_start..trimmed_qual1_end,
-                },
-                r2: RecordPiece {
-                    buf: batch.buf_r2.clone(),
-                    header: h2_start..s2_start - 1,
-                    seq: trimmed_seq2_start..trimmed_seq2_end,
-                    plus: p2_start..q2_start - 1,
-                    qual: trimmed_qual2_start..trimmed_qual2_end,
-                },
+                r1: r1_piece,
+                r2: r2_piece,
             });
 
             // Update "after" stats for BOTH reads
             after_r1.add(
-                trimmed_seq1.len(),
+                final_seq1.len(),
                 trimmed_stats1.q20,
                 trimmed_stats1.q30,
                 trimmed_stats1.gc,
             );
             after_r2.add(
-                trimmed_seq2.len(),
+                final_seq2.len(),
                 trimmed_stats2.q20,
                 trimmed_stats2.q30,
                 trimmed_stats2.gc,

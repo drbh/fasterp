@@ -15,6 +15,7 @@ use std::thread;
 mod adapter;
 mod io;
 mod kmer;
+mod overlap;
 mod pipeline;
 mod processor;
 mod simd;
@@ -199,6 +200,22 @@ struct Args {
     /// Enable adapter auto-detection for paired-end (use PE overlap)
     #[arg(long = "detect_adapter_for_pe")]
     detect_adapter_for_pe: bool,
+
+    /// Enable base correction using overlap analysis for paired-end data
+    #[arg(short = 'c', long)]
+    correction: bool,
+
+    /// Minimum overlap length required for correction (default: 30)
+    #[arg(long, default_value = "30")]
+    overlap_len_require: usize,
+
+    /// Maximum allowed differences in overlap region (default: 5)
+    #[arg(long, default_value = "5")]
+    overlap_diff_limit: usize,
+
+    /// Maximum allowed difference percentage (0-100) (default: 20)
+    #[arg(long, default_value = "20")]
+    overlap_diff_percent_limit: usize,
 }
 
 // Helper function to create TrimmingConfig from CLI args
@@ -299,6 +316,15 @@ fn create_trimming_config_r2(args: &Args) -> TrimmingConfig {
         enable_poly_x: args.trim_poly_x,
         poly_min_len: args.poly_g_min_len,
         adapter_config,
+    }
+}
+
+// Helper function to create OverlapConfig from CLI args
+fn create_overlap_config(args: &Args) -> overlap::OverlapConfig {
+    overlap::OverlapConfig {
+        min_overlap_len: args.overlap_len_require,
+        max_diff: args.overlap_diff_limit,
+        max_diff_percent: args.overlap_diff_percent_limit,
     }
 }
 
@@ -492,6 +518,13 @@ fn main() -> Result<()> {
     // Create trimming configuration from CLI args
     let trimming_config = create_trimming_config(&args);
 
+    // Create overlap configuration from CLI args (for base correction)
+    let overlap_config = if args.correction {
+        Some(create_overlap_config(&args))
+    } else {
+        None
+    };
+
     // Process based on mode (single-end or paired-end)
     if is_paired_end {
         // PAIRED-END MODE
@@ -536,6 +569,7 @@ fn main() -> Result<()> {
                 args.complexity_threshold,
                 &trimming_config_r1,
                 &trimming_config_r2,
+                overlap_config.as_ref(),
             )?;
 
             writer1.finish()?;
@@ -578,6 +612,7 @@ fn main() -> Result<()> {
                 let no_kmer = args.no_kmer;
                 let trimming_config_r1_clone = trimming_config_r1.clone();
                 let trimming_config_r2_clone = trimming_config_r2.clone();
+                let overlap_config_clone = overlap_config.clone();
 
                 let worker = thread::spawn(move || {
                     paired_worker_thread(
@@ -593,6 +628,7 @@ fn main() -> Result<()> {
                         no_kmer,
                         trimming_config_r1_clone,
                         trimming_config_r2_clone,
+                        overlap_config_clone,
                     )
                 });
                 workers.push(worker);
