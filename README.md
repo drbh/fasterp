@@ -30,14 +30,15 @@ Same interface and behavior, often **>5× faster** but your mileage may vary dep
 | Auto-detection adapters       |   ✓   |       -       |
 | HTML reports                  |   ✓   | NOT SUPPORTED |
 | Low complexity filtering      |   ✓   |       ✓       |
-| Base correction (PE overlap)  |   ✓   |       -       |
-| UMI processing                |   ✓   |       -       |
-| Deduplication                 |   ✓   |       -       |
-| Output splitting              |   ✓   |       -       |
+| Base correction (PE overlap)  |   ✓   |       ✓       |
+| UMI processing                |   ✓   |       ✓       |
+| Deduplication                 |   ✓   |       ✓       |
+| Output splitting              |   ✓   |       ✓       |
 | Read merging                  |   ✓   |       -       |
-| Failed read output            |   ✓   |       -       |
-| Rust memory safety            |   -   |       ✓       |
+| Rust memory safety (mostly)   |   -   |       ✓       |
 | SIMD acceleration (AVX2/NEON) |   -   |       ✓       |
+| Minimal memory usage          |   -   |       ✓       |
+| Few dependencies              |   -   |       ✓       |
 | 5-10× faster performance      |   -   |       ✓       |
 
 
@@ -87,7 +88,7 @@ With quality trimming (10k reads):
 `fasterp` produces identical output to `fastp` and can replace it directly in existing workflows.
 Integration tests confirm equivalence across datasets (`cargo test`), and all checks run automatically in CI.
 
-See [integration tests](tests/integration_tests.rs) for ~40 examples comparing the inputs and outputs of both tools, these can be run locally via `cargo test` for verification.
+See [integration tests](tests/integration_tests.rs) for ~90 tests comparing the inputs and outputs of both tools, these can be run locally via `cargo test` for verification.
 
 ## Sanity Check
 
@@ -124,3 +125,7 @@ jq '.read1_before_filtering.kmer_count | {AAAAA, TTTTT, CCCCC, GGGGG}' /tmp/fast
 #   "GGGGG": 0
 # }
 ``` 
+
+----
+
+https://github.com/OpenGene/fastp/blob/master/src/knownadapters.h

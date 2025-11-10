@@ -4929,3 +4929,303 @@ fn test_dedup_multithreaded_consistency() {
         "Multi-threaded should have 3 unique records (12 lines)"
     );
 }
+
+// ============================================================
+// OUTPUT SPLITTING TESTS
+// ============================================================
+
+#[test]
+fn test_split_by_lines_basic() {
+    let temp_dir = TempDir::new().unwrap();
+
+    // Create test data with 500 reads (2000 lines total)
+    let input_fq = temp_dir.path().join("input.fq");
+    let mut content = String::new();
+    for i in 1..=500 {
+        content.push_str(&format!(
+            "@read{}\nACGTACGTACGTACGTACGTACGTACGTACGA\n+\nIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII\n",
+            i
+        ));
+    }
+    fs::write(&input_fq, content).unwrap();
+
+    let output_base = temp_dir.path().join("output.fq");
+
+    // Split by 1000 lines (250 records per file, minimum allowed)
+    let status = Command::new(cargo_bin("fasterp"))
+        .arg("-i")
+        .arg(&input_fq)
+        .arg("-o")
+        .arg(&output_base)
+        .arg("--split-by-lines")
+        .arg("1000")
+        .arg("--disable-length-filtering")
+        .arg("--disable-trim-tail")
+        .status()
+        .expect("Failed to run fasterp");
+    assert!(status.success());
+
+    // Verify split files were created (should create 2 files: 1000 + 1000 lines)
+    let file1 = temp_dir.path().join("0001.output.fq");
+    let file2 = temp_dir.path().join("0002.output.fq");
+
+    assert!(file1.exists(), "First split file should exist");
+    assert!(file2.exists(), "Second split file should exist");
+
+    // Verify line counts
+    let content1 = fs::read_to_string(&file1).unwrap();
+    let content2 = fs::read_to_string(&file2).unwrap();
+
+    assert_eq!(
+        content1.lines().count(),
+        1000,
+        "File 1 should have 1000 lines"
+    );
+    assert_eq!(
+        content2.lines().count(),
+        1000,
+        "File 2 should have 1000 lines"
+    );
+}
+
+#[test]
+fn test_split_by_lines_two_reads_per_file() {
+    let temp_dir = TempDir::new().unwrap();
+
+    // Create test data with 1000 reads (4000 lines)
+    let input_fq = temp_dir.path().join("input.fq");
+    let mut content = String::new();
+    for i in 1..=1000 {
+        content.push_str(&format!(
+            "@read{}\nACGTACGTACGTACGTACGTACGTACGTACGA\n+\nIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII\n",
+            i
+        ));
+    }
+    fs::write(&input_fq, content).unwrap();
+
+    let output_base = temp_dir.path().join("output.fq");
+
+    // Split by 2000 lines (500 records per file)
+    let status = Command::new(cargo_bin("fasterp"))
+        .arg("-i")
+        .arg(&input_fq)
+        .arg("-o")
+        .arg(&output_base)
+        .arg("--split-by-lines")
+        .arg("2000")
+        .arg("--disable-length-filtering")
+        .arg("--disable-trim-tail")
+        .status()
+        .expect("Failed to run fasterp");
+    assert!(status.success());
+
+    // Verify split files
+    let file1 = temp_dir.path().join("0001.output.fq");
+    let file2 = temp_dir.path().join("0002.output.fq");
+
+    assert!(file1.exists());
+    assert!(file2.exists());
+
+    // Each file should have 500 reads (2000 lines)
+    assert_eq!(fs::read_to_string(&file1).unwrap().lines().count(), 2000);
+    assert_eq!(fs::read_to_string(&file2).unwrap().lines().count(), 2000);
+}
+
+#[test]
+fn test_split_custom_prefix_digits() {
+    let temp_dir = TempDir::new().unwrap();
+
+    // Create test data with 500 reads (2000 lines)
+    let input_fq = temp_dir.path().join("input.fq");
+    let mut content = String::new();
+    for i in 1..=500 {
+        content.push_str(&format!(
+            "@read{}\nACGTACGTACGTACGTACGTACGTACGTACGA\n+\nIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII\n",
+            i
+        ));
+    }
+    fs::write(&input_fq, content).unwrap();
+
+    let output_base = temp_dir.path().join("output.fq");
+
+    // Split with 2-digit padding
+    let status = Command::new(cargo_bin("fasterp"))
+        .arg("-i")
+        .arg(&input_fq)
+        .arg("-o")
+        .arg(&output_base)
+        .arg("--split-by-lines")
+        .arg("1000")
+        .arg("--split-prefix-digits")
+        .arg("2")
+        .arg("--disable-length-filtering")
+        .arg("--disable-trim-tail")
+        .status()
+        .expect("Failed to run fasterp");
+    assert!(status.success());
+
+    // Verify files use 2-digit prefix
+    let file1 = temp_dir.path().join("01.output.fq");
+    let file2 = temp_dir.path().join("02.output.fq");
+
+    assert!(
+        file1.exists(),
+        "File with 2-digit prefix should exist: 01.output.fq"
+    );
+    assert!(
+        file2.exists(),
+        "File with 2-digit prefix should exist: 02.output.fq"
+    );
+}
+
+#[test]
+fn test_split_no_padding() {
+    let temp_dir = TempDir::new().unwrap();
+
+    // Create test data with 250 reads (1000 lines)
+    let input_fq = temp_dir.path().join("input.fq");
+    let mut content = String::new();
+    for i in 1..=250 {
+        content.push_str(&format!(
+            "@read{}\nACGTACGTACGTACGTACGTACGTACGTACGA\n+\nIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII\n",
+            i
+        ));
+    }
+    fs::write(&input_fq, content).unwrap();
+
+    let output_base = temp_dir.path().join("output.fq");
+
+    // Split with no padding (0)
+    let status = Command::new(cargo_bin("fasterp"))
+        .arg("-i")
+        .arg(&input_fq)
+        .arg("-o")
+        .arg(&output_base)
+        .arg("--split-by-lines")
+        .arg("1000")
+        .arg("--split-prefix-digits")
+        .arg("0")
+        .arg("--disable-length-filtering")
+        .arg("--disable-trim-tail")
+        .status()
+        .expect("Failed to run fasterp");
+    assert!(status.success());
+
+    // Verify file uses no padding
+    let file1 = temp_dir.path().join("1.output.fq");
+    assert!(
+        file1.exists(),
+        "File with no padding should exist: 1.output.fq"
+    );
+}
+
+#[test]
+fn test_split_paired_end() {
+    let temp_dir = TempDir::new().unwrap();
+
+    // Create test data for R1 and R2 with 500 reads each (2000 lines)
+    let r1_input = temp_dir.path().join("r1.fq");
+    let r2_input = temp_dir.path().join("r2.fq");
+
+    let mut r1_content = String::new();
+    let mut r2_content = String::new();
+    for i in 1..=500 {
+        r1_content.push_str(&format!(
+            "@read{}/1\nACGTACGTACGTACGTACGTACGTACGTACGA\n+\nIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII\n",
+            i
+        ));
+        r2_content.push_str(&format!(
+            "@read{}/2\nTTTTAAAACCCCGGGGTTTTAAAACCCCGGGT\n+\nIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII\n",
+            i
+        ));
+    }
+    fs::write(&r1_input, r1_content).unwrap();
+    fs::write(&r2_input, r2_content).unwrap();
+
+    let r1_output = temp_dir.path().join("r1_out.fq");
+    let r2_output = temp_dir.path().join("r2_out.fq");
+
+    // Split paired-end by 1000 lines
+    let status = Command::new(cargo_bin("fasterp"))
+        .arg("-i")
+        .arg(&r1_input)
+        .arg("-I")
+        .arg(&r2_input)
+        .arg("-o")
+        .arg(&r1_output)
+        .arg("-O")
+        .arg(&r2_output)
+        .arg("--split-by-lines")
+        .arg("1000")
+        .arg("--disable-length-filtering")
+        .arg("--disable-trim-tail")
+        .status()
+        .expect("Failed to run fasterp");
+    assert!(status.success());
+
+    // Verify split files for both R1 and R2
+    let r1_file1 = temp_dir.path().join("0001.r1_out.fq");
+    let r1_file2 = temp_dir.path().join("0002.r1_out.fq");
+    let r2_file1 = temp_dir.path().join("0001.r2_out.fq");
+    let r2_file2 = temp_dir.path().join("0002.r2_out.fq");
+
+    assert!(r1_file1.exists(), "R1 file 1 should exist");
+    assert!(r1_file2.exists(), "R1 file 2 should exist");
+    assert!(r2_file1.exists(), "R2 file 1 should exist");
+    assert!(r2_file2.exists(), "R2 file 2 should exist");
+
+    // Verify line counts
+    assert_eq!(fs::read_to_string(&r1_file1).unwrap().lines().count(), 1000);
+    assert_eq!(fs::read_to_string(&r1_file2).unwrap().lines().count(), 1000);
+    assert_eq!(fs::read_to_string(&r2_file1).unwrap().lines().count(), 1000);
+    assert_eq!(fs::read_to_string(&r2_file2).unwrap().lines().count(), 1000);
+}
+
+#[test]
+fn test_split_multithreaded() {
+    let temp_dir = TempDir::new().unwrap();
+
+    // Create test data with 600 reads (2400 lines)
+    let input_fq = temp_dir.path().join("input.fq");
+    let mut content = String::new();
+    for i in 1..=600 {
+        content.push_str(&format!(
+            "@read{}\nACGTACGTACGTACGTACGTACGTACGTACGA\n+\nIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII\n",
+            i
+        ));
+    }
+    fs::write(&input_fq, content).unwrap();
+
+    let output_base = temp_dir.path().join("output.fq");
+
+    // Split by 1000 lines with multiple threads
+    let status = Command::new(cargo_bin("fasterp"))
+        .arg("-i")
+        .arg(&input_fq)
+        .arg("-o")
+        .arg(&output_base)
+        .arg("--split-by-lines")
+        .arg("1000")
+        .arg("--threads")
+        .arg("4")
+        .arg("--disable-length-filtering")
+        .arg("--disable-trim-tail")
+        .status()
+        .expect("Failed to run fasterp");
+    assert!(status.success());
+
+    // Verify split files were created
+    let file1 = temp_dir.path().join("0001.output.fq");
+    let file2 = temp_dir.path().join("0002.output.fq");
+    let file3 = temp_dir.path().join("0003.output.fq");
+
+    assert!(file1.exists());
+    assert!(file2.exists());
+    assert!(file3.exists());
+
+    // Verify total lines across all files = 2400 (600 reads * 4 lines)
+    let total_lines = fs::read_to_string(&file1).unwrap().lines().count()
+        + fs::read_to_string(&file2).unwrap().lines().count()
+        + fs::read_to_string(&file3).unwrap().lines().count();
+    assert_eq!(total_lines, 2400, "Total lines should equal original input");
+}

@@ -20,6 +20,7 @@ mod overlap;
 mod pipeline;
 mod processor;
 mod simd;
+mod split;
 mod stats;
 mod trimming;
 mod umi;
@@ -246,6 +247,18 @@ struct Args {
     /// Deduplication accuracy (1-6). Higher = more memory but fewer false positives (default: 5)
     #[arg(long, default_value = "5")]
     dedup_accuracy: u8,
+
+    /// Split output by limiting total number of files (2-999). Cannot be used with --split-by-lines
+    #[arg(short = 's', long, conflicts_with = "split_by_lines")]
+    split: Option<usize>,
+
+    /// Split output by limiting lines per file (>=1000). Cannot be used with --split
+    #[arg(short = 'S', long, conflicts_with = "split")]
+    split_by_lines: Option<usize>,
+
+    /// Digits for file number padding (1-10, default: 4). 0 to disable padding
+    #[arg(short = 'd', long, default_value = "4")]
+    split_prefix_digits: usize,
 }
 
 // Helper function to create TrimmingConfig from CLI args
@@ -404,6 +417,40 @@ fn create_dedup_config(args: &Args) -> Result<dedup::DedupConfig> {
     Ok(dedup::DedupConfig {
         enabled: true,
         accuracy: args.dedup_accuracy,
+    })
+}
+
+// Helper function to create SplitConfig from CLI args
+fn create_split_config(args: &Args) -> Result<split::SplitConfig> {
+    // Validate split parameters
+    if let Some(num_files) = args.split {
+        if num_files < 2 || num_files > 999 {
+            anyhow::bail!("Split file number must be between 2 and 999");
+        }
+    }
+
+    if let Some(lines) = args.split_by_lines {
+        if lines < 1000 {
+            anyhow::bail!("Split by lines must be at least 1000");
+        }
+    }
+
+    if args.split_prefix_digits > 10 {
+        anyhow::bail!("Split prefix digits must be between 0 and 10");
+    }
+
+    // Determine split mode
+    let mode = if let Some(num_files) = args.split {
+        split::SplitMode::ByFiles(num_files)
+    } else if let Some(lines) = args.split_by_lines {
+        split::SplitMode::ByLines(lines)
+    } else {
+        split::SplitMode::None
+    };
+
+    Ok(split::SplitConfig {
+        mode,
+        prefix_digits: args.split_prefix_digits,
     })
 }
 
@@ -618,6 +665,9 @@ fn main() -> Result<()> {
         None
     };
 
+    // Create split configuration from CLI args
+    let split_config = create_split_config(&args)?;
+
     // Process based on mode (single-end or paired-end)
     if is_paired_end {
         // PAIRED-END MODE
@@ -645,8 +695,16 @@ fn main() -> Result<()> {
             // SINGLE-THREADED PAIRED-END MODE
             let reader1 = open_input(&args.input)?;
             let reader2 = open_input(args.input2.as_ref().unwrap())?;
-            let mut writer1 = open_output(&args.output, args.compression_level)?;
-            let mut writer2 = open_output(args.output2.as_ref().unwrap(), args.compression_level)?;
+
+            // Create split writers
+            let compression = args.compression_level.unwrap_or(6);
+            let mut writer1 =
+                split::SplitWriter::new(&args.output, split_config.clone(), compression)?;
+            let mut writer2 = split::SplitWriter::new(
+                args.output2.as_ref().unwrap(),
+                split_config.clone(),
+                compression,
+            )?;
 
             let pe_acc = process_paired_fastq_stream(
                 reader1,
@@ -741,6 +799,7 @@ fn main() -> Result<()> {
             let output_path1 = args.output.clone();
             let output_path2 = args.output2.as_ref().unwrap().clone();
             let compression_level = args.compression_level;
+            let split_config_clone = split_config.clone();
             let merger = thread::spawn(move || {
                 paired_merger_thread(
                     result_rx,
@@ -748,6 +807,7 @@ fn main() -> Result<()> {
                     output_path2,
                     num_threads,
                     compression_level,
+                    split_config_clone,
                 )
             });
 
@@ -775,7 +835,10 @@ fn main() -> Result<()> {
     let acc = if num_threads == 1 {
         // SINGLE-THREADED MODE: use streaming approach with new parser
         let reader = open_input(&args.input)?;
-        let mut writer = open_output(&args.output, args.compression_level)?;
+
+        // Create split writer
+        let compression = args.compression_level.unwrap_or(6);
+        let mut writer = split::SplitWriter::new(&args.output, split_config.clone(), compression)?;
 
         let acc = process_fastq_stream(
             reader,
@@ -845,8 +908,15 @@ fn main() -> Result<()> {
         // Spawn merger thread
         let output_path = args.output.clone();
         let compression_level = args.compression_level;
+        let split_config_clone = split_config.clone();
         let merger = thread::spawn(move || {
-            merger_thread(result_rx, output_path, num_threads, compression_level)
+            merger_thread(
+                result_rx,
+                output_path,
+                num_threads,
+                compression_level,
+                split_config_clone,
+            )
         });
 
         // Wait for all threads

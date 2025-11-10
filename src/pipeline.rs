@@ -500,10 +500,11 @@ pub(crate) fn merger_thread(
     output_path: String,
     num_workers: usize,
     compression_level: Option<u32>,
+    split_config: crate::split::SplitConfig,
 ) -> Result<StreamAccumulator> {
-    let inner_writer = open_output(&output_path, compression_level)?;
-    // Large BufWriter (16 MiB) to batch writes and reduce syscalls
-    let mut writer = BufWriter::with_capacity(16 * 1024 * 1024, inner_writer);
+    // Create split writer (OutputWriter already has buffering, so no need for additional BufWriter)
+    let compression = compression_level.unwrap_or(6);
+    let mut writer = crate::split::SplitWriter::new(&output_path, split_config, compression)?;
 
     let mut acc = StreamAccumulator::new();
     let mut next_id = 0u64;
@@ -619,9 +620,8 @@ pub(crate) fn merger_thread(
         }
     }
 
-    // Flush BufWriter and finish inner writer
-    writer.flush()?;
-    writer.into_inner().map_err(|e| e.into_error())?.finish()?;
+    // Finish split writer
+    writer.finish()?;
     Ok(acc)
 }
 
@@ -1360,11 +1360,15 @@ pub(crate) fn paired_merger_thread(
     output2_path: String,
     num_workers: usize,
     compression_level: Option<u32>,
+    split_config: crate::split::SplitConfig,
 ) -> Result<crate::processor::PairedEndAccumulator> {
     use std::io::Write;
 
-    let mut writer1 = open_output(&output1_path, compression_level)?;
-    let mut writer2 = open_output(&output2_path, compression_level)?;
+    // Create split writers
+    let compression = compression_level.unwrap_or(6);
+    let mut writer1 =
+        crate::split::SplitWriter::new(&output1_path, split_config.clone(), compression)?;
+    let mut writer2 = crate::split::SplitWriter::new(&output2_path, split_config, compression)?;
 
     let mut acc = crate::processor::PairedEndAccumulator::new();
     let mut next_id = 0u64;
