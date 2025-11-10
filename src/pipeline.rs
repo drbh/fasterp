@@ -135,6 +135,7 @@ pub(crate) struct PairedWorkerResult {
     pub low_quality: usize,
     pub low_complexity: usize,
     pub invalid: usize,
+    pub duplicated: usize,
 }
 
 /// Producer thread: read blocks and parse into batches
@@ -837,7 +838,19 @@ pub(crate) fn paired_worker_thread(
     trimming_config_r2: TrimmingConfig,
     overlap_config: Option<crate::overlap::OverlapConfig>,
     umi_config: Option<crate::umi::UmiConfig>,
+    dedup_config: Option<crate::dedup::DedupConfig>,
 ) {
+    // Initialize dedup tracker if deduplication is enabled
+    let mut dedup_tracker = if let Some(ref cfg) = dedup_config {
+        if cfg.enabled {
+            Some(crate::dedup::DedupTracker::new(cfg.accuracy))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
     while let Ok(Some(batch)) = receiver.recv() {
         let mut before_r1 = SimpleStats::default();
         let mut after_r1 = SimpleStats::default();
@@ -854,6 +867,7 @@ pub(crate) fn paired_worker_thread(
         let mut low_quality = 0usize;
         let mut low_complexity = 0usize;
         let mut invalid = 0usize;
+        let mut duplicated = 0usize;
         let mut pieces = Vec::new();
 
         // Process each pair
@@ -1117,6 +1131,15 @@ pub(crate) fn paired_worker_thread(
                 }
             }
 
+            // Check for duplicates if deduplication is enabled
+            if let Some(ref mut tracker) = dedup_tracker {
+                if tracker.is_duplicate_pe(final_seq1, final_seq2) {
+                    // This is a duplicate - skip it
+                    duplicated += 1;
+                    continue;
+                }
+            }
+
             // BOTH reads passed - emit ranges for BOTH
             let [h1_start, s1_start, p1_start, q1_start] = rec1;
             let [h2_start, s2_start, p2_start, q2_start] = rec2;
@@ -1269,6 +1292,7 @@ pub(crate) fn paired_worker_thread(
             low_quality,
             low_complexity,
             invalid,
+            duplicated,
         };
 
         if sender.send(Some(result)).is_err() {
@@ -1509,6 +1533,7 @@ pub(crate) fn paired_merger_thread(
                     acc.low_quality += result.low_quality;
                     acc.low_complexity += result.low_complexity;
                     acc.invalid += result.invalid;
+                    acc.duplicated += result.duplicated;
 
                     if result.pos_r1.total_sum.len() > acc.max_cycle_r1 {
                         acc.max_cycle_r1 = result.pos_r1.total_sum.len();

@@ -109,6 +109,8 @@ pub struct UmiStats {
     pub umi_extracted: usize,
     /// Reads where UMI extraction failed (too short)
     pub umi_failed: usize,
+    /// Reads removed as duplicates (if deduplication enabled)
+    pub duplicates_removed: usize,
 }
 
 impl UmiStats {
@@ -125,10 +127,15 @@ impl UmiStats {
         }
     }
 
+    pub fn record_duplicate(&mut self) {
+        self.duplicates_removed += 1;
+    }
+
     pub fn merge(&mut self, other: &UmiStats) {
         self.total_reads += other.total_reads;
         self.umi_extracted += other.umi_extracted;
         self.umi_failed += other.umi_failed;
+        self.duplicates_removed += other.duplicates_removed;
     }
 
     pub fn extraction_rate(&self) -> f64 {
@@ -136,6 +143,14 @@ impl UmiStats {
             0.0
         } else {
             (self.umi_extracted as f64 / self.total_reads as f64) * 100.0
+        }
+    }
+
+    pub fn duplication_rate(&self) -> f64 {
+        if self.total_reads == 0 {
+            0.0
+        } else {
+            (self.duplicates_removed as f64 / self.total_reads as f64) * 100.0
         }
     }
 }
@@ -270,12 +285,14 @@ mod tests {
             total_reads: 100,
             umi_extracted: 95,
             umi_failed: 5,
+            duplicates_removed: 0,
         };
 
         let stats2 = UmiStats {
             total_reads: 50,
             umi_extracted: 48,
             umi_failed: 2,
+            duplicates_removed: 0,
         };
 
         stats1.merge(&stats2);
@@ -283,6 +300,7 @@ mod tests {
         assert_eq!(stats1.total_reads, 150);
         assert_eq!(stats1.umi_extracted, 143);
         assert_eq!(stats1.umi_failed, 7);
+        assert_eq!(stats1.duplicates_removed, 0);
     }
 
     #[test]
@@ -291,6 +309,7 @@ mod tests {
             total_reads: 100,
             umi_extracted: 95,
             umi_failed: 5,
+            duplicates_removed: 0,
         };
 
         assert_eq!(stats.extraction_rate(), 95.0);

@@ -13,6 +13,7 @@ use std::io::{BufWriter, Write};
 use std::thread;
 
 mod adapter;
+mod dedup;
 mod io;
 mod kmer;
 mod overlap;
@@ -237,6 +238,14 @@ struct Args {
     /// Skip N bases before UMI
     #[arg(long, default_value = "0")]
     umi_skip: usize,
+
+    /// Enable deduplication to remove duplicate reads (fastp compatible)
+    #[arg(short = 'D', long)]
+    dedup: bool,
+
+    /// Deduplication accuracy (1-6). Higher = more memory but fewer false positives (default: 5)
+    #[arg(long, default_value = "5")]
+    dedup_accuracy: u8,
 }
 
 // Helper function to create TrimmingConfig from CLI args
@@ -366,7 +375,10 @@ fn create_umi_config(args: &Args) -> Result<umi::UmiConfig> {
         "index2" => umi::UmiLocation::Index2,
         "per_read" => umi::UmiLocation::PerRead,
         "per_index" => umi::UmiLocation::PerIndex,
-        _ => anyhow::bail!("Invalid UMI location: {}. Must be one of: read1, read2, index1, index2, per_read, per_index", args.umi_loc),
+        _ => anyhow::bail!(
+            "Invalid UMI location: {}. Must be one of: read1, read2, index1, index2, per_read, per_index",
+            args.umi_loc
+        ),
     };
 
     Ok(umi::UmiConfig {
@@ -375,6 +387,23 @@ fn create_umi_config(args: &Args) -> Result<umi::UmiConfig> {
         length: args.umi_len,
         prefix: args.umi_prefix.clone(),
         skip: args.umi_skip,
+    })
+}
+
+// Helper function to create DedupConfig from CLI args
+fn create_dedup_config(args: &Args) -> Result<dedup::DedupConfig> {
+    if !args.dedup {
+        return Ok(dedup::DedupConfig::default());
+    }
+
+    // Validate accuracy level
+    if args.dedup_accuracy < 1 || args.dedup_accuracy > 6 {
+        anyhow::bail!("Deduplication accuracy must be between 1 and 6 (default: 5)");
+    }
+
+    Ok(dedup::DedupConfig {
+        enabled: true,
+        accuracy: args.dedup_accuracy,
     })
 }
 
@@ -582,6 +611,13 @@ fn main() -> Result<()> {
         None
     };
 
+    // Create deduplication configuration from CLI args
+    let dedup_config = if args.dedup {
+        Some(create_dedup_config(&args)?)
+    } else {
+        None
+    };
+
     // Process based on mode (single-end or paired-end)
     if is_paired_end {
         // PAIRED-END MODE
@@ -628,6 +664,7 @@ fn main() -> Result<()> {
                 &trimming_config_r2,
                 overlap_config.as_ref(),
                 umi_config.as_ref(),
+                dedup_config.as_ref(),
             )?;
 
             writer1.finish()?;
@@ -672,6 +709,7 @@ fn main() -> Result<()> {
                 let trimming_config_r2_clone = trimming_config_r2.clone();
                 let overlap_config_clone = overlap_config.clone();
                 let umi_config_clone = umi_config.clone();
+                let dedup_config_clone = dedup_config.clone();
 
                 let worker = thread::spawn(move || {
                     paired_worker_thread(
@@ -689,6 +727,7 @@ fn main() -> Result<()> {
                         trimming_config_r2_clone,
                         overlap_config_clone,
                         umi_config_clone,
+                        dedup_config_clone,
                     )
                 });
                 workers.push(worker);

@@ -218,6 +218,7 @@ pub(crate) struct PairedEndAccumulator {
     pub low_quality: usize,
     pub low_complexity: usize,
     pub invalid: usize,
+    pub duplicated: usize,
     pub max_cycle_r1: usize,
     pub max_cycle_r2: usize,
 }
@@ -499,6 +500,7 @@ impl PairedEndAccumulator {
             low_quality: 0,
             low_complexity: 0,
             invalid: 0,
+            duplicated: 0,
             max_cycle_r1: 0,
             max_cycle_r2: 0,
         }
@@ -590,10 +592,22 @@ pub(crate) fn process_paired_fastq_stream<R1: BufRead, R2: BufRead, W1: Write, W
     trimming_config_r2: &TrimmingConfig,
     overlap_config: Option<&crate::overlap::OverlapConfig>,
     umi_config: Option<&crate::umi::UmiConfig>,
+    dedup_config: Option<&crate::dedup::DedupConfig>,
 ) -> Result<PairedEndAccumulator> {
     let mut acc = PairedEndAccumulator::new();
     let mut parser1 = FastqParser::new(reader1);
     let mut parser2 = FastqParser::new(reader2);
+
+    // Initialize dedup tracker if deduplication is enabled
+    let mut dedup_tracker = if let Some(cfg) = dedup_config {
+        if cfg.enabled {
+            Some(crate::dedup::DedupTracker::new(cfg.accuracy))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
 
     loop {
         let record1 = parser1.next_record()?;
@@ -613,7 +627,14 @@ pub(crate) fn process_paired_fastq_stream<R1: BufRead, R2: BufRead, W1: Write, W
                 }
 
                 // Extract UMI if enabled (happens BEFORE any other processing)
-                let (final_header1, final_header2, final_seq1, final_qual1, final_seq2, final_qual2);
+                let (
+                    final_header1,
+                    final_header2,
+                    final_seq1,
+                    final_qual1,
+                    final_seq2,
+                    final_qual2,
+                );
                 let mut header1_with_umi;
                 let mut header2_with_umi;
                 let mut seq1_after_umi;
@@ -754,14 +775,22 @@ pub(crate) fn process_paired_fastq_stream<R1: BufRead, R2: BufRead, W1: Write, W
                 }
 
                 // Process read1 statistics (before filtering, after UMI removal)
-                let stats1 =
-                    process_read_stats(final_seq1, final_qual1, &mut acc.pos_r1, &mut acc.kmer_table_r1)?;
+                let stats1 = process_read_stats(
+                    final_seq1,
+                    final_qual1,
+                    &mut acc.pos_r1,
+                    &mut acc.kmer_table_r1,
+                )?;
                 acc.before_r1
                     .add(final_seq1.len(), stats1.q20, stats1.q30, stats1.gc);
 
                 // Process read2 statistics (before filtering, after UMI removal)
-                let stats2 =
-                    process_read_stats(final_seq2, final_qual2, &mut acc.pos_r2, &mut acc.kmer_table_r2)?;
+                let stats2 = process_read_stats(
+                    final_seq2,
+                    final_qual2,
+                    &mut acc.pos_r2,
+                    &mut acc.kmer_table_r2,
+                )?;
                 acc.before_r2
                     .add(final_seq2.len(), stats2.q20, stats2.q30, stats2.gc);
 
@@ -810,9 +839,11 @@ pub(crate) fn process_paired_fastq_stream<R1: BufRead, R2: BufRead, W1: Write, W
                     qual2_corrected_buf = trimmed_qual2.to_vec();
 
                     // Detect overlap and correct mismatches
-                    if let Some(overlap) =
-                        crate::overlap::detect_overlap(&seq1_corrected_buf, &seq2_corrected_buf, config)
-                    {
+                    if let Some(overlap) = crate::overlap::detect_overlap(
+                        &seq1_corrected_buf,
+                        &seq2_corrected_buf,
+                        config,
+                    ) {
                         let _correction_stats = crate::overlap::correct_by_overlap(
                             &mut seq1_corrected_buf,
                             &mut qual1_corrected_buf,
@@ -909,6 +940,15 @@ pub(crate) fn process_paired_fastq_stream<R1: BufRead, R2: BufRead, W1: Write, W
 
                     if fail_complexity {
                         acc.low_complexity += 1;
+                        continue;
+                    }
+                }
+
+                // Check for duplicates if deduplication is enabled
+                if let Some(ref mut tracker) = dedup_tracker {
+                    if tracker.is_duplicate_pe(corrected_seq1, corrected_seq2) {
+                        // This is a duplicate - skip it
+                        acc.duplicated += 1;
                         continue;
                     }
                 }
