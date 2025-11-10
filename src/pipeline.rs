@@ -21,6 +21,30 @@ use crate::simd;
 use crate::stats::*;
 use crate::trimming::*;
 
+/// Calculate sequence complexity as percentage of bases different from next base
+///
+/// Complexity is defined as: (count of positions where base[i] != base[i+1]) / (length - 1) * 100
+/// This matches fastp's low complexity filter algorithm.
+///
+/// Returns complexity percentage (0-100)
+#[inline]
+fn calculate_complexity(seq: &[u8]) -> usize {
+    if seq.len() <= 1 {
+        return 100; // Single base or empty is considered max complexity
+    }
+
+    let mut different_count = 0;
+    for i in 0..seq.len() - 1 {
+        if seq[i] != seq[i + 1] {
+            different_count += 1;
+        }
+    }
+
+    // Calculate percentage: (different_count / (len - 1)) * 100
+    // Use integer math to avoid floating point
+    (different_count * 100) / (seq.len() - 1)
+}
+
 /// A batch of FASTQ records parsed from a buffer
 ///
 /// Contains raw bytes and record positions (no String allocations)
@@ -62,6 +86,7 @@ pub(crate) struct WorkerResult {
     pub too_short: usize,
     pub too_many_n: usize,
     pub low_quality: usize,
+    pub low_complexity: usize,
     pub invalid: usize,
 }
 
@@ -205,6 +230,8 @@ pub(crate) fn worker_thread(
     qualified_quality_phred: u8,
     unqualified_percent_limit: usize,
     average_qual: u8,
+    low_complexity_filter: bool,
+    complexity_threshold: usize,
     no_kmer: bool,
     trimming_config: TrimmingConfig,
 ) {
@@ -216,6 +243,7 @@ pub(crate) fn worker_thread(
         let mut too_short = 0usize;
         let mut too_many_n = 0usize;
         let mut low_quality = 0usize;
+        let mut low_complexity = 0usize;
         let mut invalid = 0usize;
         let mut pieces = Vec::new(); // Zero-copy: store ranges instead of bytes
 
@@ -367,6 +395,15 @@ pub(crate) fn worker_thread(
                 }
             }
 
+            // Check low complexity (fastp -y/-Y logic)
+            if low_complexity_filter && trimmed_len > 0 {
+                let complexity = calculate_complexity(trimmed_seq);
+                if complexity < complexity_threshold {
+                    low_complexity += 1;
+                    continue;
+                }
+            }
+
             // Passed - emit RANGES for TRIMMED read (zero-copy!)
             // Calculate trimmed ranges relative to original buffer
             let trimmed_seq_start = s_start + trimming_result.start_pos;
@@ -396,6 +433,7 @@ pub(crate) fn worker_thread(
             too_short,
             too_many_n,
             low_quality,
+            low_complexity,
             invalid,
         };
 
@@ -515,6 +553,7 @@ pub(crate) fn merger_thread(
                     acc.too_short += result.too_short;
                     acc.too_many_n += result.too_many_n;
                     acc.low_quality += result.low_quality;
+                    acc.low_complexity += result.low_complexity;
                     acc.invalid += result.invalid;
 
                     // Track max cycle

@@ -16,6 +16,30 @@ use crate::stats::*;
 use crate::trimming::*;
 use crate::util;
 
+/// Calculate sequence complexity as percentage of bases different from next base
+///
+/// Complexity is defined as: (count of positions where base[i] != base[i+1]) / (length - 1) * 100
+/// This matches fastp's low complexity filter algorithm.
+///
+/// Returns complexity percentage (0-100)
+#[inline]
+fn calculate_complexity(seq: &[u8]) -> usize {
+    if seq.len() <= 1 {
+        return 100; // Single base or empty is considered max complexity
+    }
+
+    let mut different_count = 0;
+    for i in 0..seq.len() - 1 {
+        if seq[i] != seq[i + 1] {
+            different_count += 1;
+        }
+    }
+
+    // Calculate percentage: (different_count / (len - 1)) * 100
+    // Use integer math to avoid floating point
+    (different_count * 100) / (seq.len() - 1)
+}
+
 /// State machine for parsing FASTQ records
 /// Handles:
 /// - Multiline sequences/qualities (wrapped lines)
@@ -172,6 +196,7 @@ pub(crate) struct StreamAccumulator {
     pub too_short: usize,
     pub too_many_n: usize,
     pub low_quality: usize,
+    pub low_complexity: usize,
     pub invalid: usize,
     pub max_cycle: usize,
 }
@@ -191,6 +216,7 @@ pub(crate) struct PairedEndAccumulator {
     pub too_short: usize,
     pub too_many_n: usize,
     pub low_quality: usize,
+    pub low_complexity: usize,
     pub invalid: usize,
     pub max_cycle_r1: usize,
     pub max_cycle_r2: usize,
@@ -206,6 +232,7 @@ impl StreamAccumulator {
             too_short: 0,
             too_many_n: 0,
             low_quality: 0,
+            low_complexity: 0,
             invalid: 0,
             max_cycle: 0,
         }
@@ -231,6 +258,8 @@ impl StreamAccumulator {
         qualified_quality_phred: u8,
         unqualified_percent_limit: usize,
         average_qual: u8,
+        low_complexity_filter: bool,
+        complexity_threshold: usize,
         trimming_config: &TrimmingConfig,
         writer: &mut impl Write,
     ) -> Result<()> {
@@ -416,6 +445,15 @@ impl StreamAccumulator {
             }
         }
 
+        // Check low complexity (fastp -y/-Y logic)
+        if low_complexity_filter && trimmed_len > 0 {
+            let complexity = calculate_complexity(trimmed_seq);
+            if complexity < complexity_threshold {
+                self.low_complexity += 1;
+                return Ok(());
+            }
+        }
+
         // Record passed - write trimmed version
         writeln!(writer, "{}", std::str::from_utf8(header)?)?;
         writeln!(writer, "{}", std::str::from_utf8(trimmed_seq)?)?;
@@ -459,6 +497,7 @@ impl PairedEndAccumulator {
             too_short: 0,
             too_many_n: 0,
             low_quality: 0,
+            low_complexity: 0,
             invalid: 0,
             max_cycle_r1: 0,
             max_cycle_r2: 0,
@@ -502,6 +541,8 @@ pub(crate) fn process_fastq_stream<R: BufRead, W: Write>(
     qualified_quality_phred: u8,
     unqualified_percent_limit: usize,
     average_qual: u8,
+    low_complexity_filter: bool,
+    complexity_threshold: usize,
     trimming_config: &TrimmingConfig,
 ) -> Result<StreamAccumulator> {
     let mut acc = StreamAccumulator::new();
@@ -519,6 +560,8 @@ pub(crate) fn process_fastq_stream<R: BufRead, W: Write>(
             qualified_quality_phred,
             unqualified_percent_limit,
             average_qual,
+            low_complexity_filter,
+            complexity_threshold,
             trimming_config,
             writer,
         )?;
@@ -541,6 +584,8 @@ pub(crate) fn process_paired_fastq_stream<R1: BufRead, R2: BufRead, W1: Write, W
     qualified_quality_phred: u8,
     unqualified_percent_limit: usize,
     average_qual: u8,
+    low_complexity_filter: bool,
+    complexity_threshold: usize,
     trimming_config_r1: &TrimmingConfig,
     trimming_config_r2: &TrimmingConfig,
 ) -> Result<PairedEndAccumulator> {
@@ -669,6 +714,28 @@ pub(crate) fn process_paired_fastq_stream<R1: BufRead, R2: BufRead, W1: Write, W
                 if fail_quality {
                     acc.low_quality += 1;
                     continue;
+                }
+
+                // Check low complexity for both reads
+                if low_complexity_filter {
+                    let mut fail_complexity = false;
+                    if trimmed_seq1.len() > 0 {
+                        let complexity1 = calculate_complexity(trimmed_seq1);
+                        if complexity1 < complexity_threshold {
+                            fail_complexity = true;
+                        }
+                    }
+                    if trimmed_seq2.len() > 0 {
+                        let complexity2 = calculate_complexity(trimmed_seq2);
+                        if complexity2 < complexity_threshold {
+                            fail_complexity = true;
+                        }
+                    }
+
+                    if fail_complexity {
+                        acc.low_complexity += 1;
+                        continue;
+                    }
                 }
 
                 // Both reads passed - write them

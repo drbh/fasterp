@@ -63,6 +63,10 @@ struct Args {
     #[arg(short = 'l', long, default_value = "15")]
     length_required: usize,
 
+    /// Disable length filtering (fastp compatibility)
+    #[arg(short = 'L', long)]
+    disable_length_filtering: bool,
+
     /// Maximum length limit - trim reads longer than this (default: 0 = disabled)
     #[arg(short = 'b', long, default_value = "0")]
     max_len: usize,
@@ -82,6 +86,14 @@ struct Args {
     /// Max number of N bases allowed (default: 5)
     #[arg(short = 'n', long, default_value = "5")]
     n_base_limit: usize,
+
+    /// Enable low complexity filter
+    #[arg(short = 'y', long)]
+    low_complexity_filter: bool,
+
+    /// Complexity threshold (0-100). Default 30 means 30% complexity required (fastp compatibility)
+    #[arg(short = 'Y', long, default_value = "30")]
+    complexity_threshold: usize,
 
     /// JSON report file (default: fastp.json)
     #[arg(short = 'j', long, default_value = "fastp.json")]
@@ -383,6 +395,7 @@ fn build_and_write_paired_end_report(args: &Args, pe_acc: PairedEndAccumulator) 
             // Count both R1 and R2 reads to match fastp's behavior
             passed_filter_reads: pe_acc.after_r1.total_reads + pe_acc.after_r2.total_reads,
             low_quality_reads: pe_acc.low_quality,
+            low_complexity_reads: pe_acc.low_complexity,
             too_many_n_reads: pe_acc.too_many_n,
             too_short_reads: pe_acc.too_short,
             too_long_reads: 0,
@@ -507,16 +520,21 @@ fn main() -> Result<()> {
         let mut writer1 = open_output(&args.output, args.compression_level)?;
         let mut writer2 = open_output(args.output2.as_ref().unwrap(), args.compression_level)?;
 
+        // Apply disable_length_filtering flag
+        let min_len = if args.disable_length_filtering { 0 } else { args.length_required };
+
         let pe_acc = process_paired_fastq_stream(
             reader1,
             reader2,
             &mut writer1,
             &mut writer2,
-            args.length_required,
+            min_len,
             args.n_base_limit,
             args.qualified_quality_phred,
             args.unqualified_percent_limit,
             args.average_qual,
+            args.low_complexity_filter,
+            args.complexity_threshold,
             &trimming_config_r1,
             &trimming_config_r2,
         )?;
@@ -530,6 +548,9 @@ fn main() -> Result<()> {
     }
 
     // SINGLE-END MODE
+    // Apply disable_length_filtering flag
+    let min_len = if args.disable_length_filtering { 0 } else { args.length_required };
+
     let acc = if num_threads == 1 {
         // SINGLE-THREADED MODE: use streaming approach with new parser
         let reader = open_input(&args.input)?;
@@ -538,11 +559,13 @@ fn main() -> Result<()> {
         let acc = process_fastq_stream(
             reader,
             &mut writer,
-            args.length_required,
+            min_len,
             args.n_base_limit,
             args.qualified_quality_phred,
             args.unqualified_percent_limit,
             args.average_qual,
+            args.low_complexity_filter,
+            args.complexity_threshold,
             &trimming_config,
         )?;
 
@@ -566,11 +589,13 @@ fn main() -> Result<()> {
         for _ in 0..num_threads {
             let batch_rx_clone = batch_rx.clone();
             let result_tx_clone = result_tx.clone();
-            let min_len = args.length_required;
+            let min_len_for_worker = min_len;
             let n_limit = args.n_base_limit;
             let qualified_qual = args.qualified_quality_phred;
             let unqualified_pct = args.unqualified_percent_limit;
             let avg_qual = args.average_qual;
+            let low_complexity = args.low_complexity_filter;
+            let complexity_thresh = args.complexity_threshold;
             let no_kmer = args.no_kmer;
             let trimming_config_clone = trimming_config.clone();
 
@@ -578,11 +603,13 @@ fn main() -> Result<()> {
                 worker_thread(
                     batch_rx_clone,
                     result_tx_clone,
-                    min_len,
+                    min_len_for_worker,
                     n_limit,
                     qualified_qual,
                     unqualified_pct,
                     avg_qual,
+                    low_complexity,
+                    complexity_thresh,
                     no_kmer,
                     trimming_config_clone,
                 )
@@ -625,6 +652,7 @@ fn main() -> Result<()> {
         filtering_result: FilteringResult {
             passed_filter_reads: acc.after.total_reads,
             low_quality_reads: acc.low_quality,
+            low_complexity_reads: acc.low_complexity,
             too_many_n_reads: acc.too_many_n,
             too_short_reads: acc.too_short,
             too_long_reads: 0,

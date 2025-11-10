@@ -64,6 +64,7 @@ pub(crate) struct Summary {
 pub(crate) struct FilteringResult {
     pub passed_filter_reads: usize,
     pub low_quality_reads: usize,
+    pub low_complexity_reads: usize,
     #[serde(rename = "too_many_N_reads")]
     pub too_many_n_reads: usize,
     pub too_short_reads: usize,
