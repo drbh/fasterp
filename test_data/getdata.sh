@@ -133,6 +133,72 @@ create_pe_files 10000 "pe_medium_R1.fq" "pe_medium_R2.fq"
 create_pe_files 10000 "pe_10k_R1.fq" "pe_10k_R2.fq"
 create_pe_files 100000 "pe_large_R1.fq" "pe_large_R2.fq"
 
+# Function to create adapter trimming test file
+create_adapter_test_file() {
+    echo ""
+    echo "Generating adapter_trim_test.fastq with embedded adapters..."
+
+    local output="adapter_trim_test.fastq"
+    local adapter="CTGTCTCTTATACACATCTCCGAGCCCACGAGAC"
+    local total_reads=1000
+    local reads_with_adapters=50
+
+    # Function to generate random DNA sequence
+    random_dna() {
+        local length=$1
+        local seq=""
+        local bases="ACGT"
+        for ((i=0; i<length; i++)); do
+            seq="${seq}${bases:$((RANDOM % 4)):1}"
+        done
+        echo "$seq"
+    }
+
+    # Clear output file
+    > "$output"
+
+    for i in $(seq 1 $total_reads); do
+        # Read header
+        echo "@read_${i}" >> "$output"
+
+        # Decide if this read should have an adapter
+        if [ $i -le $reads_with_adapters ]; then
+            # Generate read with adapter at various positions
+            insert_pos=$((50 + RANDOM % 80))  # Random position between 50-130
+            prefix=$(random_dna $insert_pos)
+
+            # Calculate how much adapter to include (partial or full)
+            remaining=$((150 - insert_pos))
+            adapter_len=${#adapter}
+            if [ $remaining -lt $adapter_len ]; then
+                # Partial adapter at the end
+                adapter_part="${adapter:0:$remaining}"
+                seq="${prefix}${adapter_part}"
+            else
+                # Full adapter + some random bases
+                suffix_len=$((150 - insert_pos - adapter_len))
+                suffix=$(random_dna $suffix_len)
+                seq="${prefix}${adapter}${suffix}"
+            fi
+        else
+            # Regular read without adapter
+            seq=$(random_dna 150)
+        fi
+
+        echo "$seq" >> "$output"
+        echo "+" >> "$output"
+
+        # Quality string (all high quality)
+        qual=$(printf 'I%.0s' $(seq 1 ${#seq}))
+        echo "$qual" >> "$output"
+    done
+
+    echo "  Created $output with $total_reads reads ($reads_with_adapters with adapters)"
+}
+
+# Create adapter trimming test file
+create_adapter_test_file
+
 echo ""
 echo "All test data files created successfully!"
 echo ""
@@ -144,3 +210,6 @@ ls -lh overlap_*.fq
 echo ""
 echo "Standard paired-end files:"
 ls -lh pe_*.fq
+echo ""
+echo "Adapter test file:"
+ls -lh adapter_trim_test.fastq

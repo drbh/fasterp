@@ -9,7 +9,19 @@ test_data/bench_*.fq
 test_data/xlarge_*.fq
 test_data/xxlarge_*.fq
 test_data/xxxlarge_*.fq
+test_data/adapter_trim_test.fastq
 
 .todo
 fasterp.json
 R1.fq
+*.trace
+fastp
+
+bulk_bottom.fastq
+bulk_bottom.fastq.gz
+comp.sh
+
+fastq_preprocessor_test
+SRR27128759
+download_ena_fastq.py
+fasterp.html

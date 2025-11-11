@@ -5571,15 +5571,35 @@ fn test_adapter_auto_detection_se() {
     // Create test reads with adapter contamination
     // Need at least 10,000 reads for adapter detection (fastp's requirement)
     let mut test_data = String::new();
-    let sequence = "ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGT"; // 100bp
-    let full_sequence = format!("{sequence}{adapter_seq}"); // 100bp + 35bp = 135bp
-    let quality = "I".repeat(full_sequence.len()); // Match the sequence length exactly
+
+    // Generate deterministic varied DNA sequences
+    let bases = ['A', 'C', 'G', 'T'];
 
     for i in 0..10000 {
         test_data.push_str(&format!("@read_{i}\n"));
-        test_data.push_str(&full_sequence);
-        test_data.push_str("\n+\n");
-        test_data.push_str(&quality);
+
+        // Vary the sequence before adapter to make it more realistic
+        // 70% of reads will have adapters at varying positions
+        if i < 7000 {
+            // Generate sequence of varying length (80-120bp) with deterministic pattern
+            let seq_len = 80 + (i % 40);
+            let sequence: String = (0..seq_len).map(|j| bases[(i + j) % 4]).collect();
+
+            let full_sequence = format!("{}{}", sequence, adapter_seq);
+            let quality = "I".repeat(full_sequence.len());
+
+            test_data.push_str(&full_sequence);
+            test_data.push_str("\n+\n");
+            test_data.push_str(&quality);
+        } else {
+            // Remaining 30% without adapters (normal reads)
+            let sequence: String = (0..150).map(|j| bases[(i + j) % 4]).collect();
+            let quality = "I".repeat(150);
+
+            test_data.push_str(&sequence);
+            test_data.push_str("\n+\n");
+            test_data.push_str(&quality);
+        }
         test_data.push('\n');
     }
     fs::write(&test_input, test_data).unwrap();
@@ -5627,27 +5647,35 @@ fn test_adapter_auto_detection_se() {
     let content_with_detection = fs::read_to_string(&output_with_detection).unwrap();
     let content_without_detection = fs::read_to_string(&output_without_detection).unwrap();
 
-    // Parse first read from each output to check sequence length
-    let lines_with: Vec<&str> = content_with_detection.lines().collect();
-    let lines_without: Vec<&str> = content_without_detection.lines().collect();
+    // Count total bases in both outputs to verify adapter trimming happened
+    let total_bases_with: usize = content_with_detection
+        .lines()
+        .enumerate()
+        .filter(|(i, _)| i % 4 == 1) // Only sequence lines
+        .map(|(_, line)| line.len())
+        .sum();
 
-    let seq_with_detection = lines_with[1];
-    let seq_without_detection = lines_without[1];
+    let total_bases_without: usize = content_without_detection
+        .lines()
+        .enumerate()
+        .filter(|(i, _)| i % 4 == 1) // Only sequence lines
+        .map(|(_, line)| line.len())
+        .sum();
 
-    // With detection, adapter should be trimmed, so sequence should be shorter
+    // With detection, adapters should be trimmed, so total bases should be significantly less
     assert!(
-        seq_with_detection.len() < seq_without_detection.len(),
-        "Adapter trimming should reduce sequence length. With detection: {} bp, without: {} bp",
-        seq_with_detection.len(),
-        seq_without_detection.len()
+        total_bases_with < total_bases_without,
+        "Adapter trimming should reduce total bases. With detection: {} bp, without: {} bp",
+        total_bases_with,
+        total_bases_without
     );
 
-    // Sequence with detection should be approximately 100bp (original sequence without adapter)
-    // Allow some tolerance for quality trimming
+    // Expect at least 200,000 bases to be trimmed (7000 reads * ~30bp adapter each)
+    let bases_trimmed = total_bases_without - total_bases_with;
     assert!(
-        seq_with_detection.len() >= 95 && seq_with_detection.len() <= 105,
-        "Expected trimmed sequence to be ~100bp, got {} bp",
-        seq_with_detection.len()
+        bases_trimmed > 200_000,
+        "Expected significant adapter trimming (>200k bases), got {} bases trimmed",
+        bases_trimmed
     );
 
     // Read JSON to verify adapter was reported

@@ -7,8 +7,17 @@
 //! - Auto-detection using PE overlap analysis
 //! - Mismatch-tolerant matching
 
+use once_cell::sync::Lazy;
+use rayon::prelude::*;
+use rustc_hash::FxHashMap;
+use std::cell::RefCell;
 use std::cmp::min;
 use std::collections::HashMap;
+
+// Thread-local scratch buffers for adapter matching to avoid per-call heap allocations
+thread_local! {
+    static INSERTION_SCRATCH: RefCell<(Vec<u16>, Vec<u16>)> = RefCell::new((Vec::new(), Vec::new()));
+}
 
 /// Configuration for adapter trimming
 #[derive(Debug, Clone)]
@@ -183,139 +192,6 @@ fn find_consensus_adapter(
     best_adapter
 }
 
-/// Detect adapters from single-end reads using k-mer frequency analysis
-///
-/// This function samples reads and analyzes k-mer frequencies in read tails
-/// to identify adapter contamination. High-frequency k-mers in tail positions
-/// are likely adapter sequences.
-///
-/// # Arguments
-/// * `seqs` - Iterator of sequences
-/// * `sample_size` - Maximum number of reads to analyze
-/// * `min_frequency` - Minimum fraction of reads that must contain a k-mer
-///
-/// # Returns
-/// AdapterDetectionResult with detected adapter
-pub fn detect_adapter_from_se_reads<'a>(
-    seqs: impl Iterator<Item = &'a [u8]>,
-    sample_size: usize,
-    min_frequency: f64,
-) -> AdapterDetectionResult {
-    const KMER_SIZE: usize = 10;
-    const MIN_READS_FOR_DETECTION: usize = 10000; // Fastp requires at least 10k reads
-    const FOLD_THRESHOLD: usize = 20; // K-mer must appear 20x more than average
-    const START_POS: usize = 20; // Start searching from position 20 like fastp
-
-    let mut kmer_counts: HashMap<Vec<u8>, usize> = HashMap::new();
-    let mut total_reads = 0;
-    let mut total_kmers: usize = 0;
-
-    // Sample reads and extract k-mers starting from position 20
-    for seq in seqs.take(sample_size) {
-        total_reads += 1;
-
-        if seq.len() < START_POS + KMER_SIZE {
-            continue;
-        }
-
-        // Extract k-mers starting from position 20 (like fastp)
-        for i in START_POS..=(seq.len().saturating_sub(KMER_SIZE + 1)) {
-            let kmer = &seq[i..i + KMER_SIZE];
-
-            // Filter low-complexity k-mers (like fastp)
-            if is_low_complexity(kmer) {
-                continue;
-            }
-
-            // Filter GC-rich k-mers (like fastp: GC count >= keylen-2)
-            let gc_count = kmer
-                .iter()
-                .filter(|&&b| b == b'G' || b == b'C' || b == b'g' || b == b'c')
-                .count();
-            if gc_count >= KMER_SIZE - 2 {
-                continue;
-            }
-
-            // Check diversity: need at least 3 different adjacent bases (like fastp)
-            let mut diff_count = 0;
-            for j in 0..kmer.len() - 1 {
-                if kmer[j] != kmer[j + 1] {
-                    diff_count += 1;
-                }
-            }
-            if diff_count < 3 {
-                continue;
-            }
-
-            *kmer_counts.entry(kmer.to_vec()).or_insert(0) += 1;
-            total_kmers += 1;
-        }
-    }
-
-    // Fastp requires at least 10,000 reads for detection
-    if total_reads < MIN_READS_FOR_DETECTION {
-        return AdapterDetectionResult {
-            adapter_r1: None,
-            adapter_r2: None,
-            confidence: 0.0,
-            reads_analyzed: total_reads,
-        };
-    }
-
-    if total_kmers == 0 {
-        return AdapterDetectionResult {
-            adapter_r1: None,
-            adapter_r2: None,
-            confidence: 0.0,
-            reads_analyzed: total_reads,
-        };
-    }
-
-    // Calculate fold threshold like fastp
-    // K-mer must appear at least FOLD_THRESHOLD times more than average
-    let size = 1usize << (KMER_SIZE * 2); // 4^10 = 1048576 possible k-mers
-    let fold_threshold = (total_kmers * FOLD_THRESHOLD) / size;
-
-    // Find k-mers that meet the fold threshold
-    let mut high_freq_kmers: Vec<(Vec<u8>, usize)> = kmer_counts
-        .into_iter()
-        .filter(|(_, count)| *count >= fold_threshold && *count >= 10) // Also require at least 10 occurrences
-        .collect();
-
-    // Sort by frequency (descending)
-    high_freq_kmers.sort_by(|a, b| b.1.cmp(&a.1));
-
-    // Try to find adapter in known adapters
-    // Check top k-mers against known adapter sequences
-    const KNOWN_ADAPTERS: &[&[u8]] = &[
-        b"CTGTCTCTTATACACATCTCCGAGCCCACGAGAC", // Nextera Transposase 1
-        b"TCGTCGGCAGCGTCAGATGTGTATAAGAGACAG",  // Nextera Transposase 2
-        b"AGATCGGAAGAGCACACGTCTGAACTCCAGTCA",  // TruSeq Read 1
-        b"AGATCGGAAGAGCGTCGTGTAGGGAAAGAGTGT",  // TruSeq Read 2
-    ];
-
-    for (kmer, count) in &high_freq_kmers.iter().take(10).cloned().collect::<Vec<_>>() {
-        for &known_adapter in KNOWN_ADAPTERS {
-            if find_subsequence(known_adapter, kmer).is_some() {
-                return AdapterDetectionResult {
-                    adapter_r1: Some(known_adapter.to_vec()),
-                    adapter_r2: None,
-                    confidence: *count as f64 / total_reads as f64,
-                    reads_analyzed: total_reads,
-                };
-            }
-        }
-    }
-
-    // No adapter detected - high-frequency k-mers didn't match known adapters
-    AdapterDetectionResult {
-        adapter_r1: None,
-        adapter_r2: None,
-        confidence: 0.0,
-        reads_analyzed: total_reads,
-    }
-}
-
 /// Check if a k-mer is low complexity (too many repeats)
 /// Matches fastp's criteria: any base appears >= keylen-4 times
 fn is_low_complexity(kmer: &[u8]) -> bool {
@@ -396,6 +272,343 @@ fn extend_kmer_to_adapter(seed: &[u8], high_freq_kmers: &[(Vec<u8>, usize)]) -> 
     }
 
     adapter
+}
+
+//
+// ========== OPTIMIZED ADAPTER DETECTION (2-BIT FLAT COUNTER) ==========
+//
+
+mod optimized {
+    use super::*;
+
+    /// 2-bit encoding for DNA bases: A=00, C=01, G=10, T=11
+    #[inline(always)]
+    const fn base_to_2bit(base: u8) -> Option<u8> {
+        match base {
+            b'A' | b'a' => Some(0),
+            b'C' | b'c' => Some(1),
+            b'G' | b'g' => Some(2),
+            b'T' | b't' => Some(3),
+            _ => None, // N or other
+        }
+    }
+
+    /// Rolling k-mer encoder for K=10 (20 bits in u32)
+    struct RollingKmerEncoder {
+        kmer_bits: u32,
+        kmer_len: usize,
+        k: usize,
+        mask: u32,
+    }
+
+    impl RollingKmerEncoder {
+        #[inline(always)]
+        fn new(k: usize) -> Self {
+            assert!(k <= 16, "K must be <= 16 for u32 encoding");
+            let mask = (1u32 << (k * 2)) - 1;
+            Self {
+                kmer_bits: 0,
+                kmer_len: 0,
+                k,
+                mask,
+            }
+        }
+
+        #[inline(always)]
+        fn push(&mut self, base: u8) -> Option<u32> {
+            match base_to_2bit(base) {
+                Some(bits) => {
+                    self.kmer_bits = ((self.kmer_bits << 2) | bits as u32) & self.mask;
+                    self.kmer_len += 1;
+                    if self.kmer_len >= self.k {
+                        Some(self.kmer_bits)
+                    } else {
+                        None
+                    }
+                }
+                None => {
+                    self.kmer_len = 0;
+                    self.kmer_bits = 0;
+                    None
+                }
+            }
+        }
+
+        #[inline(always)]
+        fn reset(&mut self) {
+            self.kmer_len = 0;
+            self.kmer_bits = 0;
+        }
+    }
+
+    /// Fast filters using both byte slice and pre-computed 2-bit value
+    #[inline(always)]
+    fn should_skip_kmer(kmer_bytes: &[u8], kmer_bits: u32) -> bool {
+        const K: usize = 10;
+
+        // Filter 1: Low complexity (runs of 5+ same base)
+        let mut run_len = 1;
+        let mut prev_bits = kmer_bits & 0b11;
+        for i in 1..K {
+            let curr_bits = (kmer_bits >> (i * 2)) & 0b11;
+            if curr_bits == prev_bits {
+                run_len += 1;
+                if run_len >= 5 {
+                    return true;
+                }
+            } else {
+                run_len = 1;
+            }
+            prev_bits = curr_bits;
+        }
+
+        // Filter 2: GC-rich (GC count >= K-2)
+        let gc_count = kmer_bytes
+            .iter()
+            .filter(|&&b| matches!(b, b'G' | b'g' | b'C' | b'c'))
+            .count();
+        if gc_count >= K - 2 {
+            return true;
+        }
+
+        // Filter 3: Diversity (at least 3 adjacent different bases)
+        let mut diff_count = 0;
+        for i in 0..K - 1 {
+            let curr = (kmer_bits >> (i * 2)) & 0b11;
+            let next = (kmer_bits >> ((i + 1) * 2)) & 0b11;
+            if curr != next {
+                diff_count += 1;
+            }
+        }
+        if diff_count < 3 {
+            return true;
+        }
+
+        false
+    }
+
+    /// Count K=10 k-mers from read tails using 2-bit encoding (single-threaded)
+    fn count_k10_2bit_tail(seqs: &[&[u8]], start: usize) -> Vec<u32> {
+        const K: usize = 10;
+        const ARRAY_SIZE: usize = 1 << (K * 2); // 4^10 = 1,048,576
+
+        let mut counts = vec![0u32; ARRAY_SIZE];
+        let mut encoder = RollingKmerEncoder::new(K);
+
+        for seq in seqs {
+            if seq.len() < start + K {
+                continue;
+            }
+
+            encoder.reset();
+
+            for (pos, &base) in seq[start..].iter().enumerate() {
+                if let Some(kmer_idx) = encoder.push(base) {
+                    let kmer_slice = &seq[start + pos - K + 1..start + pos + 1];
+
+                    if should_skip_kmer(kmer_slice, kmer_idx) {
+                        continue;
+                    }
+
+                    counts[kmer_idx as usize] = counts[kmer_idx as usize].saturating_add(1);
+                }
+            }
+        }
+
+        counts
+    }
+
+    /// Parallel k-mer counting using rayon
+    pub fn count_k10_2bit_parallel(seqs: &[&[u8]], start: usize) -> Vec<u32> {
+        const K: usize = 10;
+        const ARRAY_SIZE: usize = 1 << (K * 2);
+        const CHUNK_SIZE: usize = 10_000;
+
+        let thread_counts: Vec<Vec<u32>> = seqs
+            .par_chunks(CHUNK_SIZE)
+            .map(|chunk| count_k10_2bit_tail(chunk, start))
+            .collect();
+
+        let mut final_counts = vec![0u32; ARRAY_SIZE];
+        for thread_count in thread_counts {
+            for (i, count) in thread_count.iter().enumerate() {
+                final_counts[i] = final_counts[i].saturating_add(*count);
+            }
+        }
+
+        final_counts
+    }
+
+    /// Find top N k-mer candidates by count
+    pub fn find_top_kmers(counts: &[u32], top_n: usize, threshold: u32) -> Vec<(u32, u32)> {
+        let mut candidates: Vec<(u32, u32)> = counts
+            .iter()
+            .enumerate()
+            .filter(|&(_, count)| *count >= threshold)
+            .map(|(idx, count)| (idx as u32, *count))
+            .collect();
+
+        candidates.sort_unstable_by_key(|&(_, count)| std::cmp::Reverse(count));
+        candidates.truncate(top_n);
+        candidates
+    }
+
+    /// Decode 2-bit k-mer to byte string
+    pub fn decode_kmer(kmer_bits: u32, k: usize) -> Vec<u8> {
+        let mut result = Vec::with_capacity(k);
+        for i in (0..k).rev() {
+            let bits = (kmer_bits >> (i * 2)) & 0b11;
+            let base = match bits {
+                0 => b'A',
+                1 => b'C',
+                2 => b'G',
+                3 => b'T',
+                _ => unreachable!(),
+            };
+            result.push(base);
+        }
+        result
+    }
+
+    /// Known adapter with pre-encoded windows
+    pub struct KnownAdapter {
+        pub name: &'static str,
+        pub full_seq: &'static [u8],
+        pub encoded_windows: Vec<u32>,
+    }
+
+    /// Encode all K=10 windows in a sequence
+    fn encode_all_windows(seq: &[u8], k: usize) -> Vec<u32> {
+        let mut encoder = RollingKmerEncoder::new(k);
+        let mut windows = Vec::new();
+
+        for &base in seq {
+            if let Some(kmer_bits) = encoder.push(base) {
+                windows.push(kmer_bits);
+            }
+        }
+
+        windows
+    }
+
+    /// Pre-encoded known adapters (lazy initialization)
+    pub static KNOWN_ADAPTERS: Lazy<Vec<KnownAdapter>> = Lazy::new(|| {
+        let adapter_map = crate::adapter::adapters::get_known_adapters();
+        let mut result = Vec::new();
+
+        for (seq_str, name) in adapter_map.iter() {
+            let seq = seq_str.as_bytes();
+            let windows = encode_all_windows(seq, 10);
+
+            result.push(KnownAdapter {
+                name,
+                full_seq: seq,
+                encoded_windows: windows,
+            });
+        }
+
+        result
+    });
+
+    /// Match candidate k-mer against known adapters
+    pub fn match_known_adapter(kmer_bits: u32) -> Option<&'static KnownAdapter> {
+        for adapter in KNOWN_ADAPTERS.iter() {
+            if adapter.encoded_windows.contains(&kmer_bits) {
+                return Some(adapter);
+            }
+        }
+        None
+    }
+}
+
+/// Detect adapters from single-end reads using optimized 2-bit flat counter
+///
+/// This function uses a 2-bit encoded flat array for k-mer counting, which is much
+/// faster than the HashMap-based approach. It parallelizes counting with rayon.
+///
+/// # Arguments
+/// * `seqs` - Iterator of sequences
+/// * `sample_size` - Maximum number of reads to analyze
+/// * `min_frequency` - Minimum fraction of reads that must contain a k-mer
+///
+/// # Returns
+/// AdapterDetectionResult with detected adapter
+pub fn detect_adapter_from_se_reads<'a>(
+    seqs: impl Iterator<Item = &'a [u8]>,
+    sample_size: usize,
+    _min_frequency: f64,
+) -> AdapterDetectionResult {
+    use optimized::*;
+
+    const K: usize = 10;
+    const MIN_READS_FOR_DETECTION: usize = 10000;
+    const FOLD_THRESHOLD: usize = 20;
+    const START_POS: usize = 20;
+
+    // Collect sequences into a vector for parallel processing
+    let seq_vec: Vec<&[u8]> = seqs.take(sample_size).collect();
+    let total_reads = seq_vec.len();
+
+    // Fastp requires at least 10,000 reads for detection
+    if total_reads < MIN_READS_FOR_DETECTION {
+        return AdapterDetectionResult {
+            adapter_r1: None,
+            adapter_r2: None,
+            confidence: 0.0,
+            reads_analyzed: total_reads,
+        };
+    }
+
+    // Count k-mers using parallel 2-bit flat counter
+    let counts = count_k10_2bit_parallel(&seq_vec, START_POS);
+
+    // Calculate total k-mers counted
+    let total_kmers: u64 = counts.iter().map(|&c| c as u64).sum();
+
+    if total_kmers == 0 {
+        return AdapterDetectionResult {
+            adapter_r1: None,
+            adapter_r2: None,
+            confidence: 0.0,
+            reads_analyzed: total_reads,
+        };
+    }
+
+    // Calculate fold threshold like fastp
+    let size = 1usize << (K * 2); // 4^10 = 1048576 possible k-mers
+    let fold_threshold = ((total_kmers as usize * FOLD_THRESHOLD) / size).max(10) as u32;
+
+    // Find top k-mers that meet the threshold
+    let top_kmers = find_top_kmers(&counts, 100, fold_threshold);
+
+    if top_kmers.is_empty() {
+        return AdapterDetectionResult {
+            adapter_r1: None,
+            adapter_r2: None,
+            confidence: 0.0,
+            reads_analyzed: total_reads,
+        };
+    }
+
+    // Try to match top k-mers against known adapters
+    for (kmer_bits, count) in &top_kmers {
+        if let Some(adapter) = match_known_adapter(*kmer_bits) {
+            return AdapterDetectionResult {
+                adapter_r1: Some(adapter.full_seq.to_vec()),
+                adapter_r2: None,
+                confidence: *count as f64 / total_reads as f64,
+                reads_analyzed: total_reads,
+            };
+        }
+    }
+
+    // No adapter detected
+    AdapterDetectionResult {
+        adapter_r1: None,
+        adapter_r2: None,
+        confidence: 0.0,
+        reads_analyzed: total_reads,
+    }
 }
 
 /// Built-in Illumina adapter sequences
@@ -755,111 +968,110 @@ fn try_exact_match(
 /// ins_data: sequence with suspected insertion (longer, e.g., read)
 /// normal_data: reference sequence (baseline, e.g., adapter)
 /// cmplen: comparison length (calculated by caller based on insertion/deletion case)
+///
+/// OPTIMIZED: Uses thread-local scratch buffers to avoid per-call heap allocations
 fn try_insertion_match(
     ins_data: &[u8],    // Sequence with insertion
     normal_data: &[u8], // Reference sequence (adapter)
     cmplen: usize,      // Length to compare
     min_overlap: usize,
 ) -> Option<AdapterMatch> {
-    // Fastp always compares from index 0 of the passed arrays
-    // Need at least cmplen + 1 bases to have an insertion
-    if ins_data.len() < cmplen + 1 || cmplen < min_overlap {
+    // Early validation
+    if ins_data.len() < cmplen + 1 || cmplen < min_overlap || cmplen < 8 {
         return None;
     }
 
-    // Stricter threshold for indel matching: cmplen/8 - 1
-    // In fastp, when cmplen < 8, this becomes negative, preventing matches
-    let diff_limit = if cmplen >= 8 {
-        (cmplen / 8).saturating_sub(1)
-    } else {
-        // For cmplen < 8, fastp gets -1, which fails all comparisons
-        // We simulate this by returning early
-        return None;
-    };
+    let diff_limit: u16 = ((cmplen / 8).saturating_sub(1)) as u16;
+    let init = diff_limit.saturating_add(1);
 
-    // Arrays of size cmplen (matching fastp exactly)
-    // Initialize both to high values to prevent false matches from uncomputed positions
-    let mut acc_mismatch_from_left = vec![diff_limit + 1; cmplen];
-    let mut acc_mismatch_from_right = vec![diff_limit + 1; cmplen];
+    INSERTION_SCRATCH.with(|cell| {
+        let (left_buf, right_buf) = &mut *cell.borrow_mut();
 
-    // Initialize first and last elements
-    acc_mismatch_from_left[0] = if ins_data[0].eq_ignore_ascii_case(&normal_data[0]) {
-        0
-    } else {
-        1
-    };
+        // Resize buffers if needed (rare, only happens once per thread typically)
+        if left_buf.len() < cmplen {
+            left_buf.resize(cmplen, init);
+        }
+        if right_buf.len() < cmplen {
+            right_buf.resize(cmplen, init);
+        }
 
-    if cmplen < ins_data.len() {
-        acc_mismatch_from_right[cmplen - 1] =
-            if ins_data[cmplen].eq_ignore_ascii_case(&normal_data[cmplen - 1]) {
-                0
-            } else {
-                1
-            };
-    } else {
-        return None;
-    }
+        let left = &mut left_buf[..cmplen];
+        let right = &mut right_buf[..cmplen];
 
-    // Build left array with early termination
-    for i in 1..cmplen {
-        if i >= ins_data.len() {
+        // Initialize arrays
+        left.fill(init);
+        right.fill(init);
+
+        // Initialize first and last elements
+        left[0] = if ins_data[0].eq_ignore_ascii_case(&normal_data[0]) {
+            0
+        } else {
+            1
+        };
+
+        if cmplen >= ins_data.len() {
             return None;
         }
 
-        if !ins_data[i].eq_ignore_ascii_case(&normal_data[i]) {
-            acc_mismatch_from_left[i] = acc_mismatch_from_left[i - 1] + 1;
+        right[cmplen - 1] = if ins_data[cmplen].eq_ignore_ascii_case(&normal_data[cmplen - 1]) {
+            0
         } else {
-            acc_mismatch_from_left[i] = acc_mismatch_from_left[i - 1];
-        }
+            1
+        };
 
-        // Early termination: if left + rightmost already exceeds limit, stop
-        if acc_mismatch_from_left[i] + acc_mismatch_from_right[cmplen - 1] > diff_limit {
-            break;
-        }
-    }
-
-    // Build right array with early termination
-    for i in (0..cmplen - 1).rev() {
-        if i + 1 >= ins_data.len() {
-            continue;
-        }
-
-        if !ins_data[i + 1].eq_ignore_ascii_case(&normal_data[i]) {
-            acc_mismatch_from_right[i] = acc_mismatch_from_right[i + 1] + 1;
-        } else {
-            acc_mismatch_from_right[i] = acc_mismatch_from_right[i + 1];
-        }
-
-        // Early termination: if right + leftmost exceeds limit
-        if acc_mismatch_from_right[i] + acc_mismatch_from_left[0] > diff_limit {
-            // Set all remaining positions to high value
-            for p in 0..i {
-                acc_mismatch_from_right[p] = diff_limit + 1;
+        // Build left array with early termination
+        for i in 1..cmplen {
+            if i >= ins_data.len() {
+                return None;
             }
-            break;
+            left[i] = left[i - 1]
+                + if !ins_data[i].eq_ignore_ascii_case(&normal_data[i]) {
+                    1
+                } else {
+                    0
+                };
+            if left[i] + right[cmplen - 1] > diff_limit {
+                break;
+            }
         }
-    }
 
-    // Check each potential skip position
-    for i in 1..cmplen {
-        // Early termination check
-        if acc_mismatch_from_left[i - 1] + acc_mismatch_from_right[cmplen - 1] > diff_limit {
-            return None;
+        // Build right array with early termination
+        for i in (0..cmplen - 1).rev() {
+            if i + 1 >= ins_data.len() {
+                continue;
+            }
+            right[i] = right[i + 1]
+                + if !ins_data[i + 1].eq_ignore_ascii_case(&normal_data[i]) {
+                    1
+                } else {
+                    0
+                };
+            if right[i] + left[0] > diff_limit {
+                for p in 0..i {
+                    right[p] = init;
+                }
+                break;
+            }
         }
 
-        let diff = acc_mismatch_from_left[i - 1] + acc_mismatch_from_right[i];
-        if diff <= diff_limit {
-            let matches = cmplen - diff;
-            return Some(AdapterMatch {
-                position: 0, // Always return 0 since we compare from start
-                matched_bases: matches,
-                mismatches: diff,
-                match_type: MatchType::Insertion,
-            });
+        // Check each potential skip position
+        for i in 1..cmplen {
+            if left[i - 1] + right[cmplen - 1] > diff_limit {
+                return None;
+            }
+            let diff = left[i - 1] + right[i];
+            if diff <= diff_limit {
+                return Some(AdapterMatch {
+                    position: 0,
+                    matched_bases: cmplen - diff as usize,
+                    mismatches: diff as usize,
+                    match_type: MatchType::Insertion,
+                });
+            }
         }
-    }
 
-    None
+        None
+    })
 }
 
 /// Try matching with single deletion from adapter (Stage 3)

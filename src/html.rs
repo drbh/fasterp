@@ -50,36 +50,40 @@ fn write_css(html: &mut String) {
     html.push_str(
         "body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif; ",
     );
-    html.push_str("background: #f9f9f9; padding: 20px; line-height: 1.6; color: #333; }\n");
-    html.push_str("#container { max-width: 1000px; margin: 0 auto; background: white; ");
-    html.push_str("border: 1px solid #ddd; padding: 40px; }\n");
-    html.push_str("h1 { color: #333; font-size: 28px; font-weight: 600; ");
-    html.push_str("margin-bottom: 30px; border-bottom: 2px solid #333; padding-bottom: 10px; }\n");
-    html.push_str("h2 { color: #555; font-size: 18px; font-weight: 600; ");
+    html.push_str("background: #1a1a1a; padding: 20px; line-height: 1.6; color: #e0e0e0; }\n");
+    html.push_str("#container { max-width: 1000px; margin: 0 auto; background: #242424; ");
+    html.push_str("border: 1px solid #3a3a3a; padding: 40px; }\n");
+    html.push_str("h1 { color: #f0f0f0; font-size: 28px; font-weight: 600; ");
+    html.push_str(
+        "margin-bottom: 30px; border-bottom: 2px solid #4a4a4a; padding-bottom: 10px; }\n",
+    );
+    html.push_str("h2 { color: #c0c0c0; font-size: 18px; font-weight: 600; ");
     html.push_str("margin-top: 35px; margin-bottom: 15px; text-transform: uppercase; ");
     html.push_str("letter-spacing: 0.5px; }\n");
     html.push_str("table { width: 100%; border-collapse: collapse; margin: 15px 0 30px 0; }\n");
-    html.push_str("th { background: #f5f5f5; color: #333; padding: 10px; ");
+    html.push_str("th { background: #2a2a2a; color: #e0e0e0; padding: 10px; ");
     html.push_str("text-align: left; font-weight: 600; font-size: 13px; ");
-    html.push_str("border-bottom: 2px solid #ddd; }\n");
-    html.push_str("td { padding: 10px; border-bottom: 1px solid #eee; font-size: 14px; }\n");
+    html.push_str("border-bottom: 2px solid #3a3a3a; }\n");
+    html.push_str("td { padding: 10px; border-bottom: 1px solid #333; font-size: 14px; }\n");
     html.push_str("tr:last-child td { border-bottom: none; }\n");
-    html.push_str(".col1 { font-weight: 500; color: #666; width: 250px; }\n");
-    html.push_str(".value { color: #333; }\n");
+    html.push_str(".col1 { font-weight: 500; color: #999; width: 250px; }\n");
+    html.push_str(".value { color: #d0d0d0; }\n");
     html.push_str(".badge { display: inline-block; padding: 2px 8px; ");
     html.push_str("border-radius: 3px; font-size: 12px; ");
-    html.push_str("background: #f0f0f0; color: #666; margin-left: 6px; }\n");
+    html.push_str("background: #3a3a3a; color: #b0b0b0; margin-left: 6px; }\n");
     html.push_str("footer { margin-top: 50px; padding-top: 20px; ");
-    html.push_str("border-top: 1px solid #ddd; color: #888; font-size: 12px; }\n");
-    html.push_str(".command { background: #f8f8f8; padding: 10px; ");
-    html.push_str("border-left: 3px solid #ddd; margin: 10px 0; ");
+    html.push_str("border-top: 1px solid #3a3a3a; color: #888; font-size: 12px; }\n");
+    html.push_str(".command { background: #2a2a2a; padding: 10px; ");
+    html.push_str("border-left: 3px solid #4a4a4a; margin: 10px 0; ");
     html.push_str("font-family: 'JetBrains Mono', 'Courier New', monospace; font-size: 12px; ");
-    html.push_str("color: #555; word-break: break-all; }\n");
+    html.push_str("color: #b0b0b0; word-break: break-all; }\n");
     html.push_str(".chart { width: 100%; height: 400px; margin: 20px 0; ");
-    html.push_str("border: 1px solid #eee; }\n");
+    html.push_str("border: 1px solid #3a3a3a; }\n");
     html.push_str(".kmer_table { border-collapse: collapse; margin: 20px 0; ");
     html.push_str("font-family: 'JetBrains Mono', 'Courier New', monospace; font-size: 3px; }\n");
-    html.push_str(".kmer_table td { border: 1px solid #ddd; padding: 1px; text-align: center; }\n");
+    html.push_str(
+        ".kmer_table td { border: 1px solid #3a3a3a; padding: 1px; text-align: center; }\n",
+    );
     html.push_str(".sub_section_tips { color: #888; font-size: 12px; ");
     html.push_str("font-style: italic; margin: 10px 0; }\n");
     html.push_str("</style>\n");
@@ -379,11 +383,17 @@ fn write_base_contents_chart(
 
     html.push_str("var data = [a_trace, t_trace, c_trace, g_trace, n_trace, gc_trace];\n");
     html.push_str("var layout = {\n");
-    html.push_str("  xaxis: {title: 'Position in read (bp)'},\n");
-    html.push_str("  yaxis: {title: 'Base content (%)'},\n");
+    html.push_str(
+        "  xaxis: {title: 'Position in read (bp)', color: '#c0c0c0', gridcolor: '#3a3a3a'},\n",
+    );
+    html.push_str(
+        "  yaxis: {title: 'Base content (%)', color: '#c0c0c0', gridcolor: '#3a3a3a'},\n",
+    );
     html.push_str("  margin: {l: 50, r: 30, t: 30, b: 50},\n");
     html.push_str("  showlegend: true,\n");
-    html.push_str("  legend: {x: 1, xanchor: 'right', y: 1}\n");
+    html.push_str("  legend: {x: 1, xanchor: 'right', y: 1, font: {color: '#c0c0c0'}},\n");
+    html.push_str("  paper_bgcolor: '#242424',\n");
+    html.push_str("  plot_bgcolor: '#2a2a2a'\n");
     html.push_str("};\n");
     html.push_str(&format!("Plotly.newPlot('{div_id}', data, layout);\n"));
     html.push_str("</script>\n");
@@ -500,10 +510,14 @@ fn write_quality_histogram(
 
         html.push_str("var data = [hist_trace];\n");
         html.push_str("var layout = {\n");
-        html.push_str("  xaxis: {title: 'Base quality score'},\n");
-        html.push_str("  yaxis: {title: 'Base count'},\n");
+        html.push_str(
+            "  xaxis: {title: 'Base quality score', color: '#c0c0c0', gridcolor: '#3a3a3a'},\n",
+        );
+        html.push_str("  yaxis: {title: 'Base count', color: '#c0c0c0', gridcolor: '#3a3a3a'},\n");
         html.push_str("  margin: {l: 60, r: 30, t: 30, b: 50},\n");
-        html.push_str("  showlegend: false\n");
+        html.push_str("  showlegend: false,\n");
+        html.push_str("  paper_bgcolor: '#242424',\n");
+        html.push_str("  plot_bgcolor: '#2a2a2a'\n");
         html.push_str("};\n");
         html.push_str(&format!("Plotly.newPlot('{div_id}', data, layout);\n"));
         html.push_str("</script>\n");
@@ -622,11 +636,15 @@ fn write_quality_chart(html: &mut String, stats: &DetailedReadStats, title: &str
     // Layout and plot
     html.push_str("var data = [mean_trace, a_trace, t_trace, c_trace, g_trace];\n");
     html.push_str("var layout = {\n");
-    html.push_str("  xaxis: {title: 'Position in read (bp)'},\n");
-    html.push_str("  yaxis: {title: 'Quality score'},\n");
+    html.push_str(
+        "  xaxis: {title: 'Position in read (bp)', color: '#c0c0c0', gridcolor: '#3a3a3a'},\n",
+    );
+    html.push_str("  yaxis: {title: 'Quality score', color: '#c0c0c0', gridcolor: '#3a3a3a'},\n");
     html.push_str("  margin: {l: 50, r: 30, t: 30, b: 50},\n");
     html.push_str("  showlegend: true,\n");
-    html.push_str("  legend: {x: 1, xanchor: 'right', y: 1}\n");
+    html.push_str("  legend: {x: 1, xanchor: 'right', y: 1, font: {color: '#c0c0c0'}},\n");
+    html.push_str("  paper_bgcolor: '#242424',\n");
+    html.push_str("  plot_bgcolor: '#2a2a2a'\n");
     html.push_str("};\n");
     html.push_str(&format!("Plotly.newPlot('{div_id}', data, layout);\n"));
     html.push_str("</script>\n");
