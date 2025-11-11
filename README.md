@@ -1,10 +1,10 @@
 # fasterp
 
 > [!NOTE]
-> This is project is in early development. While it aims to be a drop-in replacement for `fastp` but does not yet support all features.
+> This is project is in early development. Most features are at parity with `fastp` but some results may differ slightly (mainly autodetected adapters and trimming). Please report any issues you find!
 
 **fasterp** — a Rust reimplementation of [**fastp**](https://github.com/OpenGene/fastp).
-Same interface and behavior, often **>5× faster** but your mileage may vary depending on dataset and CPU.
+Same interface and behavior, often **significantly faster** but your mileage may vary depending on dataset and CPU.
 
 | Feature                       | fastp | fasterp |
 | :---------------------------- | :---: | :-----: |
@@ -27,7 +27,8 @@ Same interface and behavior, often **>5× faster** but your mileage may vary dep
 | PE Multi-threading            |   ✓   |    ✓    |
 | Adapter trimming (SE)         |   ✓   |    ✓    |
 | Adapter trimming (PE)         |   ✓   |    ✓    |
-| Auto-detection adapters       |   ✓   |    -    |
+| Auto-detection adapters (PE)  |   ✓   |    ✓    |
+| Auto-detection adapters (SE)  |   ✓   |    ✓    |
 | HTML reports                  |   ✓   |    ✓    |
 | Low complexity filtering      |   ✓   |    ✓    |
 | Base correction (PE overlap)  |   ✓   |    ✓    |

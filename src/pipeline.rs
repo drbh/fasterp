@@ -89,6 +89,9 @@ pub(crate) struct WorkerResult {
     pub low_quality: usize,
     pub low_complexity: usize,
     pub invalid: usize,
+    // Adapter trimming stats
+    pub adapter_trimmed_reads: usize,
+    pub adapter_trimmed_bases: usize,
 }
 
 // ============================================================================
@@ -296,6 +299,8 @@ pub(crate) fn worker_thread(
         let mut low_quality = 0usize;
         let mut low_complexity = 0usize;
         let mut invalid = 0usize;
+        let mut adapter_trimmed_reads = 0usize;
+        let mut adapter_trimmed_bases = 0usize;
         let mut pieces = Vec::new(); // Zero-copy: store ranges instead of bytes
 
         // Process each record in the batch
@@ -407,8 +412,16 @@ pub(crate) fn worker_thread(
                     end_pos: seq.len(),
                     poly_g_trimmed: 0,
                     poly_x_trimmed: 0,
+                    adapter_trimmed: false,
+                    adapter_bases_trimmed: 0,
                 }
             };
+
+            // Track adapter trimming stats
+            if trimming_result.adapter_trimmed {
+                adapter_trimmed_reads += 1;
+                adapter_trimmed_bases += trimming_result.adapter_bases_trimmed;
+            }
 
             // Get trimmed sequences
             let trimmed_seq = &seq[trimming_result.start_pos..trimming_result.end_pos];
@@ -522,6 +535,8 @@ pub(crate) fn worker_thread(
             low_quality,
             low_complexity,
             invalid,
+            adapter_trimmed_reads,
+            adapter_trimmed_bases,
         };
 
         if sender.send(Some(result)).is_err() {
@@ -670,6 +685,10 @@ pub(crate) fn merger_thread(
                     acc.low_quality += result.low_quality;
                     acc.low_complexity += result.low_complexity;
                     acc.invalid += result.invalid;
+
+                    // Merge adapter trimming stats
+                    acc.adapter_trimmed_reads += result.adapter_trimmed_reads;
+                    acc.adapter_trimmed_bases += result.adapter_trimmed_bases;
 
                     // Track max cycle
                     if result.pos.total_sum.len() > acc.max_cycle {
@@ -1054,6 +1073,8 @@ pub(crate) fn paired_worker_thread(
                     end_pos: final_umi_seq1.len(),
                     poly_g_trimmed: 0,
                     poly_x_trimmed: 0,
+                    adapter_trimmed: false,
+                    adapter_bases_trimmed: 0,
                 }
             };
 
@@ -1066,6 +1087,8 @@ pub(crate) fn paired_worker_thread(
                     end_pos: final_umi_seq2.len(),
                     poly_g_trimmed: 0,
                     poly_x_trimmed: 0,
+                    adapter_trimmed: false,
+                    adapter_bases_trimmed: 0,
                 }
             };
 

@@ -378,6 +378,8 @@ fn test_trimming_stats_add() {
         end_pos: 90,
         poly_g_trimmed: 10,
         poly_x_trimmed: 0,
+        adapter_trimmed: false,
+        adapter_bases_trimmed: 0,
     };
 
     stats.add(&result);
@@ -424,6 +426,9 @@ fn test_trimming_stats_merge() {
 
 #[test]
 fn test_trimming_config_disabled() {
+    let mut adapter_config = crate::adapter::AdapterConfig::new();
+    adapter_config.detect_adapter_for_pe = false; // Explicitly disable auto-detection for this test
+
     let config = TrimmingConfig {
         enable_trim_front: false,
         enable_trim_tail: false,
@@ -435,7 +440,7 @@ fn test_trimming_config_disabled() {
         enable_poly_g: false,
         enable_poly_x: false,
         poly_min_len: 10,
-        adapter_config: crate::adapter::AdapterConfig::new(),
+        adapter_config,
     };
 
     assert!(!config.is_enabled(), "Config should be disabled");

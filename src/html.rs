@@ -685,11 +685,11 @@ fn add_row_3col(html: &mut String, label: &str, before: &str, after: &str) {
 
 fn format_number(n: usize) -> String {
     if n >= 1_000_000_000 {
-        format!("{:.1}B", n as f64 / 1e9)
+        format!("{:.4}B", n as f64 / 1e9)
     } else if n >= 1_000_000 {
-        format!("{:.1}M", n as f64 / 1e6)
+        format!("{:.4}M", n as f64 / 1e6)
     } else if n >= 1_000 {
-        format!("{:.1}K", n as f64 / 1e3)
+        format!("{:.4}K", n as f64 / 1e3)
     } else {
         n.to_string()
     }

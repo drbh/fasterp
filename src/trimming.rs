@@ -53,6 +53,8 @@ pub(crate) struct TrimmingResult {
     pub end_pos: usize,   // Ending position after 3' trimming
     pub poly_g_trimmed: usize,
     pub poly_x_trimmed: usize,
+    pub adapter_trimmed: bool, // Whether adapter was found and trimmed
+    pub adapter_bases_trimmed: usize, // Number of bases trimmed due to adapter
 }
 
 impl TrimmingResult {
@@ -281,6 +283,8 @@ pub(crate) fn trim_read_with_adapter(
         end_pos: seq.len(),
         poly_g_trimmed: 0,
         poly_x_trimmed: 0,
+        adapter_trimmed: false,
+        adapter_bases_trimmed: 0,
     };
 
     // 1. Fixed front trimming
@@ -295,7 +299,7 @@ pub(crate) fn trim_read_with_adapter(
     }
 
     // 2. Adapter trimming (BEFORE tail trim, to match fastp behavior)
-    let adapter_trimmed = if config.adapter_config.is_enabled() {
+    if config.adapter_config.is_enabled() {
         // Use adapter_override if provided (for PE read2), otherwise use adapter_seq
         let adapter_to_use = if let Some(adapter) = adapter_override {
             Some(adapter)
@@ -305,6 +309,7 @@ pub(crate) fn trim_read_with_adapter(
 
         if let Some(adapter) = adapter_to_use {
             let current_seq = &seq[result.start_pos..result.end_pos];
+            let _current_length = current_seq.len();
 
             if let Some(adapter_match) = crate::adapter::find_adapter(
                 current_seq,
@@ -313,17 +318,14 @@ pub(crate) fn trim_read_with_adapter(
                 config.adapter_config.max_mismatches,
             ) {
                 // Trim from the adapter position
-                result.end_pos = result.start_pos + adapter_match.position;
-                true
-            } else {
-                false
+                let new_end = result.start_pos + adapter_match.position;
+                let bases_trimmed = result.end_pos - new_end;
+                result.end_pos = new_end;
+                result.adapter_trimmed = true;
+                result.adapter_bases_trimmed = bases_trimmed;
             }
-        } else {
-            false
         }
-    } else {
-        false
-    };
+    }
 
     // 3. Fixed tail trimming (AFTER adapter trim)
     // Note: fastp applies fixed tail trimming AFTER adapter trimming

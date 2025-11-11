@@ -201,6 +201,10 @@ pub(crate) struct StreamAccumulator {
     pub low_complexity: usize,
     pub invalid: usize,
     pub max_cycle: usize,
+
+    // Adapter trimming stats
+    pub adapter_trimmed_reads: usize,
+    pub adapter_trimmed_bases: usize,
 }
 
 /// Paired-end accumulator for streaming processing
@@ -225,6 +229,10 @@ pub(crate) struct PairedEndAccumulator {
     pub duplicated: usize,
     pub max_cycle_r1: usize,
     pub max_cycle_r2: usize,
+
+    // Adapter trimming stats
+    pub adapter_trimmed_reads: usize,
+    pub adapter_trimmed_bases: usize,
 }
 
 impl StreamAccumulator {
@@ -242,6 +250,8 @@ impl StreamAccumulator {
             low_complexity: 0,
             invalid: 0,
             max_cycle: 0,
+            adapter_trimmed_reads: 0,
+            adapter_trimmed_bases: 0,
         }
     }
 
@@ -416,8 +426,16 @@ impl StreamAccumulator {
                 end_pos: seq.len(),
                 poly_g_trimmed: 0,
                 poly_x_trimmed: 0,
+                adapter_trimmed: false,
+                adapter_bases_trimmed: 0,
             }
         };
+
+        // Track adapter trimming stats
+        if trimming_result.adapter_trimmed {
+            self.adapter_trimmed_reads += 1;
+            self.adapter_trimmed_bases += trimming_result.adapter_bases_trimmed;
+        }
 
         // Get trimmed sequences
         let trimmed_seq = &seq[trimming_result.start_pos..trimming_result.end_pos];
@@ -542,6 +560,8 @@ impl PairedEndAccumulator {
             duplicated: 0,
             max_cycle_r1: 0,
             max_cycle_r2: 0,
+            adapter_trimmed_reads: 0,
+            adapter_trimmed_bases: 0,
         }
     }
 
@@ -842,6 +862,8 @@ pub(crate) fn process_paired_fastq_stream<R1: BufRead, R2: BufRead, W1: Write, W
                         end_pos: final_seq1.len(),
                         poly_g_trimmed: 0,
                         poly_x_trimmed: 0,
+                        adapter_trimmed: false,
+                        adapter_bases_trimmed: 0,
                     }
                 };
 
@@ -855,8 +877,20 @@ pub(crate) fn process_paired_fastq_stream<R1: BufRead, R2: BufRead, W1: Write, W
                         end_pos: final_seq2.len(),
                         poly_g_trimmed: 0,
                         poly_x_trimmed: 0,
+                        adapter_trimmed: false,
+                        adapter_bases_trimmed: 0,
                     }
                 };
+
+                // Track adapter trimming stats for paired-end
+                if trim_result1.adapter_trimmed {
+                    acc.adapter_trimmed_reads += 1;
+                    acc.adapter_trimmed_bases += trim_result1.adapter_bases_trimmed;
+                }
+                if trim_result2.adapter_trimmed {
+                    acc.adapter_trimmed_reads += 1;
+                    acc.adapter_trimmed_bases += trim_result2.adapter_bases_trimmed;
+                }
 
                 let trimmed_seq1 = &final_seq1[trim_result1.start_pos..trim_result1.end_pos];
                 let trimmed_qual1 = &final_qual1[trim_result1.start_pos..trim_result1.end_pos];

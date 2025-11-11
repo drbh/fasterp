@@ -206,9 +206,9 @@ struct Args {
     #[arg(long = "adapter_sequence_r2")]
     adapter_sequence_r2: Option<String>,
 
-    /// Enable adapter auto-detection for paired-end (use PE overlap)
-    #[arg(long = "detect_adapter_for_pe")]
-    detect_adapter_for_pe: bool,
+    /// Disable adapter auto-detection (enabled by default, use this to turn off)
+    #[arg(long = "disable_adapter_detection")]
+    disable_adapter_detection: bool,
 
     /// Enable base correction using overlap analysis for paired-end data
     #[arg(short = 'c', long)]
@@ -275,9 +275,7 @@ fn create_trimming_config(args: &Args) -> TrimmingConfig {
     let mut adapter_config = AdapterConfig::new();
 
     if !args.disable_adapter_trimming {
-        // Only enable adapter trimming if user explicitly specifies adapters
-        // fastp uses auto-detection by default, which we haven't implemented yet
-        // So we only trim when adapters are explicitly provided
+        // Set manual adapter sequences if provided
         if let Some(ref seq) = args.adapter_sequence {
             adapter_config.adapter_seq = Some(seq.as_bytes().to_vec());
         }
@@ -286,7 +284,14 @@ fn create_trimming_config(args: &Args) -> TrimmingConfig {
             adapter_config.adapter_seq_r2 = Some(seq.as_bytes().to_vec());
         }
 
-        adapter_config.detect_adapter_for_pe = args.detect_adapter_for_pe;
+        // Disable auto-detection if flag is set
+        if args.disable_adapter_detection {
+            adapter_config.detect_adapter_for_pe = false;
+        }
+        // Otherwise keep the default (true, auto-detection enabled)
+    } else {
+        // If adapter trimming is disabled entirely, also disable auto-detection
+        adapter_config.detect_adapter_for_pe = false;
     }
 
     // Determine trim values - prefer read-specific args, fall back to generic
@@ -332,7 +337,14 @@ fn create_trimming_config_r2(args: &Args) -> TrimmingConfig {
             adapter_config.adapter_seq = Some(seq.as_bytes().to_vec());
         }
 
-        adapter_config.detect_adapter_for_pe = args.detect_adapter_for_pe;
+        // Disable auto-detection if flag is set
+        if args.disable_adapter_detection {
+            adapter_config.detect_adapter_for_pe = false;
+        }
+        // Otherwise keep the default (true, auto-detection enabled)
+    } else {
+        // If adapter trimming is disabled entirely, also disable auto-detection
+        adapter_config.detect_adapter_for_pe = false;
     }
 
     // Determine trim values for R2
@@ -620,7 +632,14 @@ fn build_and_write_paired_end_report(
         duplication: Some(DuplicationStats {
             rate: combined_dup_rate,
         }),
-        adapter_cutting: None, // TODO: Track adapter cutting stats
+        adapter_cutting: if pe_acc.adapter_trimmed_reads > 0 {
+            Some(AdapterCuttingStats {
+                adapter_trimmed_reads: pe_acc.adapter_trimmed_reads,
+                adapter_trimmed_bases: pe_acc.adapter_trimmed_bases,
+            })
+        } else {
+            None
+        },
     };
 
     // Print report to stdout (fastp-compatible format)
@@ -805,6 +824,148 @@ fn print_report_to_stdout(
     );
 }
 
+/// Perform adapter auto-detection for paired-end reads
+///
+/// Samples the first N read pairs and uses overlap analysis to detect adapters
+fn auto_detect_adapters_pe(
+    input1: &str,
+    input2: &str,
+    sample_size: usize,
+) -> Result<adapter::AdapterDetectionResult> {
+    use std::io::BufRead;
+
+    eprintln!("Auto-detecting adapters from paired-end reads...");
+    eprintln!("Sampling first {sample_size} read pairs for analysis");
+
+    let mut reader1 = open_input(input1)?;
+    let mut reader2 = open_input(input2)?;
+
+    let mut r1_seqs = Vec::new();
+    let mut r2_seqs = Vec::new();
+
+    let mut line1 = String::new();
+    let mut line2 = String::new();
+
+    // Sample reads using simple line-by-line reading
+    let mut count = 0;
+    while count < sample_size {
+        // Read R1 record (4 lines)
+        line1.clear();
+        if reader1.read_line(&mut line1)? == 0 {
+            break; // EOF
+        }
+
+        let mut seq1 = String::new();
+        let mut plus1 = String::new();
+        let mut qual1 = String::new();
+        if reader1.read_line(&mut seq1)? == 0
+            || reader1.read_line(&mut plus1)? == 0
+            || reader1.read_line(&mut qual1)? == 0
+        {
+            break; // EOF or incomplete record
+        }
+
+        // Read R2 record (4 lines)
+        line2.clear();
+        if reader2.read_line(&mut line2)? == 0 {
+            break; // EOF
+        }
+
+        let mut seq2 = String::new();
+        let mut plus2 = String::new();
+        let mut qual2 = String::new();
+        if reader2.read_line(&mut seq2)? == 0
+            || reader2.read_line(&mut plus2)? == 0
+            || reader2.read_line(&mut qual2)? == 0
+        {
+            break; // EOF or incomplete record
+        }
+
+        // Store sequences (trim trailing newline)
+        r1_seqs.push(seq1.trim_end().as_bytes().to_vec());
+        r2_seqs.push(seq2.trim_end().as_bytes().to_vec());
+        count += 1;
+    }
+
+    if r1_seqs.is_empty() {
+        anyhow::bail!("No reads found for adapter detection");
+    }
+
+    eprintln!("Analyzing {} read pairs...", r1_seqs.len());
+
+    // Convert to slices for detection
+    let r1_refs: Vec<&[u8]> = r1_seqs.iter().map(|v| v.as_slice()).collect();
+    let r2_refs: Vec<&[u8]> = r2_seqs.iter().map(|v| v.as_slice()).collect();
+
+    let result = adapter::detect_adapters_from_pe_reads(
+        r1_refs.into_iter(),
+        r2_refs.into_iter(),
+        sample_size,
+        0.01, // 1% minimum frequency
+    );
+
+    Ok(result)
+}
+
+/// Perform adapter auto-detection for single-end reads
+///
+/// Samples the first N reads and uses k-mer frequency analysis to detect adapters
+fn auto_detect_adapter_se(
+    input: &str,
+    sample_size: usize,
+) -> Result<adapter::AdapterDetectionResult> {
+    use std::io::BufRead;
+
+    eprintln!("Auto-detecting adapter from single-end reads...");
+    eprintln!("Sampling first {sample_size} reads for analysis");
+
+    let mut reader = open_input(input)?;
+    let mut seqs = Vec::new();
+
+    let mut line = String::new();
+
+    // Sample reads using simple line-by-line reading
+    let mut count = 0;
+    while count < sample_size {
+        // Read FASTQ record (4 lines)
+        line.clear();
+        if reader.read_line(&mut line)? == 0 {
+            break; // EOF
+        }
+
+        let mut seq = String::new();
+        let mut plus = String::new();
+        let mut qual = String::new();
+        if reader.read_line(&mut seq)? == 0
+            || reader.read_line(&mut plus)? == 0
+            || reader.read_line(&mut qual)? == 0
+        {
+            break; // EOF or incomplete record
+        }
+
+        // Store sequence (trim trailing newline)
+        seqs.push(seq.trim_end().as_bytes().to_vec());
+        count += 1;
+    }
+
+    if seqs.is_empty() {
+        anyhow::bail!("No reads found for adapter detection");
+    }
+
+    eprintln!("Analyzing {} reads...", seqs.len());
+
+    // Convert to slices for detection
+    let seq_refs: Vec<&[u8]> = seqs.iter().map(|v| v.as_slice()).collect();
+
+    let result = adapter::detect_adapter_from_se_reads(
+        seq_refs.into_iter(),
+        sample_size,
+        0.0001, // 0.01% minimum frequency (same as fastp)
+    );
+
+    Ok(result)
+}
+
 // MAIN FUNCTION
 
 /// MULTI-THREADED MAIN FUNCTION:
@@ -894,6 +1055,48 @@ fn main() -> Result<()> {
             && args.trim_tail2 == 0
         {
             trimming_config_r2.trim_tail_bases = 1;
+        }
+
+        // Perform adapter auto-detection if requested
+        if trimming_config_r1.adapter_config.detect_adapter_for_pe {
+            match auto_detect_adapters_pe(
+                &args.input,
+                args.input2.as_ref().unwrap(),
+                1_000_000, // Sample first 1M read pairs
+            ) {
+                Ok(detection_result) => {
+                    if let Some(ref adapter) = detection_result.adapter_r1 {
+                        eprintln!(
+                            "Detected R1 adapter: {} (confidence: {:.2}%, {} reads analyzed)",
+                            String::from_utf8_lossy(adapter),
+                            detection_result.confidence * 100.0,
+                            detection_result.reads_analyzed
+                        );
+                        trimming_config_r1.adapter_config.adapter_seq = Some(adapter.clone());
+                    } else {
+                        eprintln!("No R1 adapter detected");
+                    }
+
+                    if let Some(ref adapter) = detection_result.adapter_r2 {
+                        eprintln!("Detected R2 adapter: {}", String::from_utf8_lossy(adapter));
+                        trimming_config_r2.adapter_config.adapter_seq_r2 = Some(adapter.clone());
+                    } else {
+                        eprintln!("No R2 adapter detected");
+                    }
+
+                    if detection_result.adapter_r1.is_none()
+                        && detection_result.adapter_r2.is_none()
+                    {
+                        eprintln!(
+                            "Warning: Adapter auto-detection found no adapters. Proceeding without adapter trimming."
+                        );
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Warning: Adapter auto-detection failed: {e}");
+                    eprintln!("Proceeding without adapter trimming.");
+                }
+            }
         }
 
         // Apply disable_length_filtering flag
@@ -1037,6 +1240,37 @@ fn main() -> Result<()> {
     }
 
     // SINGLE-END MODE
+
+    // Perform adapter auto-detection if requested and no adapter specified
+    let mut se_trimming_config = trimming_config;
+    if se_trimming_config.adapter_config.detect_adapter_for_pe
+        && se_trimming_config.adapter_config.adapter_seq.is_none()
+    {
+        match auto_detect_adapter_se(
+            &args.input,
+            1_000_000, // Sample first 1M reads
+        ) {
+            Ok(detection_result) => {
+                if let Some(ref adapter) = detection_result.adapter_r1 {
+                    eprintln!(
+                        "Detected adapter: {} (confidence: {:.2}%, {} reads analyzed)",
+                        String::from_utf8_lossy(adapter),
+                        detection_result.confidence * 100.0,
+                        detection_result.reads_analyzed
+                    );
+                    se_trimming_config.adapter_config.adapter_seq = Some(adapter.clone());
+                } else {
+                    eprintln!("No adapter detected in single-end mode");
+                    eprintln!("Proceeding without adapter trimming.");
+                }
+            }
+            Err(e) => {
+                eprintln!("Warning: Adapter auto-detection failed: {e}");
+                eprintln!("Proceeding without adapter trimming.");
+            }
+        }
+    }
+
     // Apply disable_length_filtering flag
     let min_len = if args.disable_length_filtering {
         0
@@ -1062,7 +1296,7 @@ fn main() -> Result<()> {
             args.average_qual,
             args.low_complexity_filter,
             args.complexity_threshold,
-            &trimming_config,
+            &se_trimming_config,
         )?;
 
         writer.finish()?;
@@ -1093,7 +1327,7 @@ fn main() -> Result<()> {
             let low_complexity = args.low_complexity_filter;
             let complexity_thresh = args.complexity_threshold;
             let no_kmer = args.no_kmer;
-            let trimming_config_clone = trimming_config.clone();
+            let trimming_config_clone = se_trimming_config.clone();
 
             let worker = thread::spawn(move || {
                 worker_thread(
@@ -1194,7 +1428,14 @@ fn main() -> Result<()> {
         duplication: Some(DuplicationStats {
             rate: duplication_rate,
         }),
-        adapter_cutting: None, // TODO: Track adapter cutting stats
+        adapter_cutting: if acc.adapter_trimmed_reads > 0 {
+            Some(AdapterCuttingStats {
+                adapter_trimmed_reads: acc.adapter_trimmed_reads,
+                adapter_trimmed_bases: acc.adapter_trimmed_bases,
+            })
+        } else {
+            None
+        },
     };
 
     // Print report to stdout (fastp-compatible format)

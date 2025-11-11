@@ -4,9 +4,11 @@
 //! - Manual adapter specification
 //! - Built-in common adapter sequences
 //! - Overlap-based adapter detection for paired-end reads
+//! - Auto-detection using PE overlap analysis
 //! - Mismatch-tolerant matching
 
 use std::cmp::min;
+use std::collections::HashMap;
 
 /// Configuration for adapter trimming
 #[derive(Debug, Clone)]
@@ -28,8 +30,8 @@ impl AdapterConfig {
         Self {
             adapter_seq: None,
             adapter_seq_r2: None,
-            detect_adapter_for_pe: false,
-            min_overlap: 5, // fastp's default for adapter trimming
+            detect_adapter_for_pe: true, // fastp enables auto-detection by default
+            min_overlap: 5,              // fastp's default for adapter trimming
             max_mismatches: 2,
         }
     }
@@ -37,6 +39,363 @@ impl AdapterConfig {
     pub fn is_enabled(&self) -> bool {
         self.adapter_seq.is_some() || self.adapter_seq_r2.is_some() || self.detect_adapter_for_pe
     }
+}
+
+/// Result of adapter auto-detection
+#[derive(Debug, Clone)]
+pub struct AdapterDetectionResult {
+    /// Detected adapter for read 1
+    pub adapter_r1: Option<Vec<u8>>,
+    /// Detected adapter for read 2
+    pub adapter_r2: Option<Vec<u8>>,
+    /// Confidence score (fraction of reads supporting this adapter)
+    pub confidence: f64,
+    /// Number of reads analyzed
+    pub reads_analyzed: usize,
+}
+
+/// Detect adapters from paired-end reads using overlap analysis
+///
+/// This function samples read pairs and uses overlap detection to identify
+/// adapter sequences. When R1 and R2 overlap, any bases beyond the overlap
+/// are considered adapter contamination.
+///
+/// # Arguments
+/// * `r1_seqs` - Iterator of R1 sequences
+/// * `r2_seqs` - Iterator of R2 sequences
+/// * `sample_size` - Maximum number of read pairs to analyze
+/// * `min_frequency` - Minimum fraction of reads that must support an adapter (default: 0.01 = 1%)
+///
+/// # Returns
+/// AdapterDetectionResult with detected adapters and confidence scores
+pub fn detect_adapters_from_pe_reads<'a>(
+    r1_seqs: impl Iterator<Item = &'a [u8]>,
+    r2_seqs: impl Iterator<Item = &'a [u8]>,
+    sample_size: usize,
+    min_frequency: f64,
+) -> AdapterDetectionResult {
+    use crate::overlap::{OverlapConfig, detect_overlap, reverse_complement};
+
+    let overlap_config = OverlapConfig {
+        min_overlap_len: 10, // Lower threshold for detection
+        max_diff: 5,
+        max_diff_percent: 20,
+    };
+
+    let mut adapter_r1_counts: HashMap<Vec<u8>, usize> = HashMap::new();
+    let mut adapter_r2_counts: HashMap<Vec<u8>, usize> = HashMap::new();
+    let mut total_reads = 0;
+    let mut reads_with_adapters = 0;
+
+    // Sample read pairs and extract adapters
+    for (r1_seq, r2_seq) in r1_seqs.zip(r2_seqs).take(sample_size) {
+        total_reads += 1;
+
+        // Detect overlap between R1 and R2
+        if let Some(overlap_result) = detect_overlap(r1_seq, r2_seq, &overlap_config) {
+            let r2_rc = reverse_complement(r2_seq);
+
+            // Extract adapter from R1 (bases after the overlap)
+            let r1_adapter_start = overlap_result.offset + overlap_result.overlap_len;
+            if r1_adapter_start < r1_seq.len() {
+                let adapter = r1_seq[r1_adapter_start..].to_vec();
+                if !adapter.is_empty() && adapter.len() >= 3 {
+                    *adapter_r1_counts.entry(adapter).or_insert(0) += 1;
+                    reads_with_adapters += 1;
+                }
+            }
+
+            // Extract adapter from R2 (bases after the overlap in R2_rc)
+            // Since we're working with R2_rc, the adapter is also at the end
+            let r2_adapter_start = overlap_result.overlap_len;
+            if r2_adapter_start < r2_rc.len() {
+                let adapter_rc = r2_rc[r2_adapter_start..].to_vec();
+                if !adapter_rc.is_empty() && adapter_rc.len() >= 3 {
+                    // Store the original R2 adapter (reverse complement of what we extracted)
+                    let adapter = reverse_complement(&adapter_rc);
+                    *adapter_r2_counts.entry(adapter).or_insert(0) += 1;
+                }
+            }
+        }
+    }
+
+    // Find the most common adapters
+    let threshold = (total_reads as f64 * min_frequency) as usize;
+
+    let adapter_r1 = find_consensus_adapter(&adapter_r1_counts, threshold);
+    let adapter_r2 = find_consensus_adapter(&adapter_r2_counts, threshold);
+
+    let confidence = if total_reads > 0 {
+        reads_with_adapters as f64 / total_reads as f64
+    } else {
+        0.0
+    };
+
+    AdapterDetectionResult {
+        adapter_r1,
+        adapter_r2,
+        confidence,
+        reads_analyzed: total_reads,
+    }
+}
+
+/// Find consensus adapter from frequency counts
+fn find_consensus_adapter(
+    adapter_counts: &HashMap<Vec<u8>, usize>,
+    threshold: usize,
+) -> Option<Vec<u8>> {
+    if adapter_counts.is_empty() {
+        return None;
+    }
+
+    // Find the most frequent adapter
+    let mut best_adapter: Option<Vec<u8>> = None;
+    let mut best_count = threshold;
+
+    for (adapter, &count) in adapter_counts.iter() {
+        if count > best_count {
+            best_count = count;
+            best_adapter = Some(adapter.clone());
+        }
+    }
+
+    // Try to match against known adapters for validation
+    if let Some(ref adapter) = best_adapter {
+        // Check if it's a known adapter or substring of known adapter
+        for known_seq in adapters::get_known_adapters().keys() {
+            let known_bytes = known_seq.as_bytes();
+
+            // Check if detected adapter matches start of known adapter
+            if adapter.len() >= 6 && known_bytes.starts_with(adapter.as_slice()) {
+                // Use the full known adapter sequence
+                return Some(known_bytes.to_vec());
+            }
+
+            // Check if known adapter is contained in detected adapter
+            if adapter.len() > known_bytes.len()
+                && adapter[..known_bytes.len()].eq_ignore_ascii_case(known_bytes)
+            {
+                return Some(known_bytes.to_vec());
+            }
+        }
+    }
+
+    best_adapter
+}
+
+/// Detect adapters from single-end reads using k-mer frequency analysis
+///
+/// This function samples reads and analyzes k-mer frequencies in read tails
+/// to identify adapter contamination. High-frequency k-mers in tail positions
+/// are likely adapter sequences.
+///
+/// # Arguments
+/// * `seqs` - Iterator of sequences
+/// * `sample_size` - Maximum number of reads to analyze
+/// * `min_frequency` - Minimum fraction of reads that must contain a k-mer
+///
+/// # Returns
+/// AdapterDetectionResult with detected adapter
+pub fn detect_adapter_from_se_reads<'a>(
+    seqs: impl Iterator<Item = &'a [u8]>,
+    sample_size: usize,
+    min_frequency: f64,
+) -> AdapterDetectionResult {
+    const KMER_SIZE: usize = 10;
+    const MIN_READS_FOR_DETECTION: usize = 10000; // Fastp requires at least 10k reads
+    const FOLD_THRESHOLD: usize = 20; // K-mer must appear 20x more than average
+    const START_POS: usize = 20; // Start searching from position 20 like fastp
+
+    let mut kmer_counts: HashMap<Vec<u8>, usize> = HashMap::new();
+    let mut total_reads = 0;
+    let mut total_kmers: usize = 0;
+
+    // Sample reads and extract k-mers starting from position 20
+    for seq in seqs.take(sample_size) {
+        total_reads += 1;
+
+        if seq.len() < START_POS + KMER_SIZE {
+            continue;
+        }
+
+        // Extract k-mers starting from position 20 (like fastp)
+        for i in START_POS..=(seq.len().saturating_sub(KMER_SIZE + 1)) {
+            let kmer = &seq[i..i + KMER_SIZE];
+
+            // Filter low-complexity k-mers (like fastp)
+            if is_low_complexity(kmer) {
+                continue;
+            }
+
+            // Filter GC-rich k-mers (like fastp: GC count >= keylen-2)
+            let gc_count = kmer
+                .iter()
+                .filter(|&&b| b == b'G' || b == b'C' || b == b'g' || b == b'c')
+                .count();
+            if gc_count >= KMER_SIZE - 2 {
+                continue;
+            }
+
+            // Check diversity: need at least 3 different adjacent bases (like fastp)
+            let mut diff_count = 0;
+            for j in 0..kmer.len() - 1 {
+                if kmer[j] != kmer[j + 1] {
+                    diff_count += 1;
+                }
+            }
+            if diff_count < 3 {
+                continue;
+            }
+
+            *kmer_counts.entry(kmer.to_vec()).or_insert(0) += 1;
+            total_kmers += 1;
+        }
+    }
+
+    // Fastp requires at least 10,000 reads for detection
+    if total_reads < MIN_READS_FOR_DETECTION {
+        return AdapterDetectionResult {
+            adapter_r1: None,
+            adapter_r2: None,
+            confidence: 0.0,
+            reads_analyzed: total_reads,
+        };
+    }
+
+    if total_kmers == 0 {
+        return AdapterDetectionResult {
+            adapter_r1: None,
+            adapter_r2: None,
+            confidence: 0.0,
+            reads_analyzed: total_reads,
+        };
+    }
+
+    // Calculate fold threshold like fastp
+    // K-mer must appear at least FOLD_THRESHOLD times more than average
+    let size = 1usize << (KMER_SIZE * 2); // 4^10 = 1048576 possible k-mers
+    let fold_threshold = (total_kmers * FOLD_THRESHOLD) / size;
+
+    // Find k-mers that meet the fold threshold
+    let mut high_freq_kmers: Vec<(Vec<u8>, usize)> = kmer_counts
+        .into_iter()
+        .filter(|(_, count)| *count >= fold_threshold && *count >= 10) // Also require at least 10 occurrences
+        .collect();
+
+    // Sort by frequency (descending)
+    high_freq_kmers.sort_by(|a, b| b.1.cmp(&a.1));
+
+    // Try to find adapter in known adapters
+    // Check top k-mers against known adapter sequences
+    const KNOWN_ADAPTERS: &[&[u8]] = &[
+        b"CTGTCTCTTATACACATCTCCGAGCCCACGAGAC", // Nextera Transposase 1
+        b"TCGTCGGCAGCGTCAGATGTGTATAAGAGACAG",  // Nextera Transposase 2
+        b"AGATCGGAAGAGCACACGTCTGAACTCCAGTCA",  // TruSeq Read 1
+        b"AGATCGGAAGAGCGTCGTGTAGGGAAAGAGTGT",  // TruSeq Read 2
+    ];
+
+    for (kmer, count) in &high_freq_kmers.iter().take(10).cloned().collect::<Vec<_>>() {
+        for &known_adapter in KNOWN_ADAPTERS {
+            if find_subsequence(known_adapter, kmer).is_some() {
+                return AdapterDetectionResult {
+                    adapter_r1: Some(known_adapter.to_vec()),
+                    adapter_r2: None,
+                    confidence: *count as f64 / total_reads as f64,
+                    reads_analyzed: total_reads,
+                };
+            }
+        }
+    }
+
+    // No adapter detected - high-frequency k-mers didn't match known adapters
+    AdapterDetectionResult {
+        adapter_r1: None,
+        adapter_r2: None,
+        confidence: 0.0,
+        reads_analyzed: total_reads,
+    }
+}
+
+/// Check if a k-mer is low complexity (too many repeats)
+/// Matches fastp's criteria: any base appears >= keylen-4 times
+fn is_low_complexity(kmer: &[u8]) -> bool {
+    if kmer.is_empty() {
+        return true;
+    }
+
+    let keylen = kmer.len();
+    let threshold = keylen.saturating_sub(4);
+
+    // Count each base (ATCG)
+    let mut counts = [0usize; 4];
+
+    for &base in kmer {
+        let upper = base.to_ascii_uppercase();
+        match upper {
+            b'A' => counts[0] += 1,
+            b'T' => counts[1] += 1,
+            b'C' => counts[2] += 1,
+            b'G' => counts[3] += 1,
+            _ => continue,
+        }
+    }
+
+    // Low complexity if any base appears >= keylen-4 times (like fastp)
+    counts.iter().any(|&count| count >= threshold)
+}
+
+/// Find a subsequence within a sequence
+fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return None;
+    }
+
+    (0..=(haystack.len() - needle.len()))
+        .find(|&i| haystack[i..i + needle.len()].eq_ignore_ascii_case(needle))
+}
+
+/// Extend a seed k-mer into a longer adapter sequence using overlapping k-mers
+fn extend_kmer_to_adapter(seed: &[u8], high_freq_kmers: &[(Vec<u8>, usize)]) -> Vec<u8> {
+    let mut adapter = seed.to_vec();
+    let min_overlap = 8; // Minimum overlap between k-mers
+
+    // Try to extend to the right
+    loop {
+        let mut best_extension: Option<&Vec<u8>> = None;
+        let mut best_overlap_len = 0;
+
+        // Find k-mer that overlaps with the end of current adapter
+        for (kmer, _) in high_freq_kmers {
+            for overlap_len in (min_overlap..=kmer.len()).rev() {
+                if adapter.len() >= overlap_len {
+                    let adapter_suffix = &adapter[adapter.len() - overlap_len..];
+                    let kmer_prefix = &kmer[..overlap_len];
+
+                    if adapter_suffix.eq_ignore_ascii_case(kmer_prefix) {
+                        if overlap_len > best_overlap_len {
+                            best_overlap_len = overlap_len;
+                            best_extension = Some(kmer);
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+
+        if let Some(ext_kmer) = best_extension {
+            // Extend adapter with non-overlapping part
+            adapter.extend_from_slice(&ext_kmer[best_overlap_len..]);
+
+            // Stop if we've extended enough (max adapter length ~40bp)
+            if adapter.len() >= 40 {
+                break;
+            }
+        } else {
+            break; // No more extensions found
+        }
+    }
+
+    adapter
 }
 
 /// Built-in Illumina adapter sequences
@@ -397,16 +756,14 @@ fn try_exact_match(
 /// normal_data: reference sequence (baseline, e.g., adapter)
 /// cmplen: comparison length (calculated by caller based on insertion/deletion case)
 fn try_insertion_match(
-    ins_data: &[u8],      // Sequence with insertion (read from start_pos)
-    normal_data: &[u8],   // Reference sequence (adapter or read, depending on case)
-    ins_start_pos: usize, // Starting position in ins_data
-    cmplen: usize,        // Length to compare
+    ins_data: &[u8],    // Sequence with insertion
+    normal_data: &[u8], // Reference sequence (adapter)
+    cmplen: usize,      // Length to compare
     min_overlap: usize,
 ) -> Option<AdapterMatch> {
-    let remaining = ins_data.len() - ins_start_pos;
-
+    // Fastp always compares from index 0 of the passed arrays
     // Need at least cmplen + 1 bases to have an insertion
-    if remaining < cmplen + 1 || cmplen < min_overlap {
+    if ins_data.len() < cmplen + 1 || cmplen < min_overlap {
         return None;
     }
 
@@ -426,15 +783,15 @@ fn try_insertion_match(
     let mut acc_mismatch_from_right = vec![diff_limit + 1; cmplen];
 
     // Initialize first and last elements
-    acc_mismatch_from_left[0] = if ins_data[ins_start_pos].eq_ignore_ascii_case(&normal_data[0]) {
+    acc_mismatch_from_left[0] = if ins_data[0].eq_ignore_ascii_case(&normal_data[0]) {
         0
     } else {
         1
     };
 
-    if ins_start_pos + cmplen < ins_data.len() {
+    if cmplen < ins_data.len() {
         acc_mismatch_from_right[cmplen - 1] =
-            if ins_data[ins_start_pos + cmplen].eq_ignore_ascii_case(&normal_data[cmplen - 1]) {
+            if ins_data[cmplen].eq_ignore_ascii_case(&normal_data[cmplen - 1]) {
                 0
             } else {
                 1
@@ -445,11 +802,11 @@ fn try_insertion_match(
 
     // Build left array with early termination
     for i in 1..cmplen {
-        if ins_start_pos + i >= ins_data.len() {
+        if i >= ins_data.len() {
             return None;
         }
 
-        if !ins_data[ins_start_pos + i].eq_ignore_ascii_case(&normal_data[i]) {
+        if !ins_data[i].eq_ignore_ascii_case(&normal_data[i]) {
             acc_mismatch_from_left[i] = acc_mismatch_from_left[i - 1] + 1;
         } else {
             acc_mismatch_from_left[i] = acc_mismatch_from_left[i - 1];
@@ -463,11 +820,11 @@ fn try_insertion_match(
 
     // Build right array with early termination
     for i in (0..cmplen - 1).rev() {
-        if ins_start_pos + i + 1 >= ins_data.len() {
+        if i + 1 >= ins_data.len() {
             continue;
         }
 
-        if !ins_data[ins_start_pos + i + 1].eq_ignore_ascii_case(&normal_data[i]) {
+        if !ins_data[i + 1].eq_ignore_ascii_case(&normal_data[i]) {
             acc_mismatch_from_right[i] = acc_mismatch_from_right[i + 1] + 1;
         } else {
             acc_mismatch_from_right[i] = acc_mismatch_from_right[i + 1];
@@ -494,7 +851,7 @@ fn try_insertion_match(
         if diff <= diff_limit {
             let matches = cmplen - diff;
             return Some(AdapterMatch {
-                position: ins_start_pos,
+                position: 0, // Always return 0 since we compare from start
                 matched_bases: matches,
                 mismatches: diff,
                 match_type: MatchType::Insertion,
@@ -511,25 +868,16 @@ fn try_insertion_match(
 fn try_deletion_match(
     seq: &[u8],
     adapter: &[u8],
-    start_pos: usize,
+    cmplen: usize,
     min_overlap: usize,
 ) -> Option<AdapterMatch> {
-    let remaining = seq.len() - start_pos;
-
-    // Fastp uses: cmplen = min(rlen - pos, alen - 1)
-    let cmplen = min(remaining, adapter.len().saturating_sub(1));
-
     if cmplen < min_overlap {
         return None;
     }
 
     // Swap arguments: treat adapter as having "insertion" relative to seq
-    // Pass adapter as ins_data, seq (from start_pos) as normal_data
-    if let Some(mut result) =
-        try_insertion_match(adapter, &seq[start_pos..], 0, cmplen, min_overlap)
-    {
-        // Adjust position back to original sequence coordinates
-        result.position = start_pos;
+    // Fastp always compares from index 0
+    if let Some(mut result) = try_insertion_match(adapter, seq, cmplen, min_overlap) {
         result.match_type = MatchType::Deletion;
         Some(result)
     } else {
@@ -570,7 +918,7 @@ pub fn find_adapter(
     seq: &[u8],
     adapter: &[u8],
     min_overlap: usize,
-    max_mismatches: usize,
+    _max_mismatches: usize,
 ) -> Option<AdapterMatch> {
     if adapter.is_empty() || seq.len() < min_overlap {
         return None;
@@ -593,47 +941,55 @@ pub fn find_adapter(
     // Minimum required match length (matchReq in fastp)
     let match_req = 4;
 
-    // Try all possible positions using three-stage matching
-    // Fastp uses: Stage 1 (exact), Stage 2 (insertion), Stage 3 (deletion)
     let end = (seq.len() as isize) - (match_req as isize);
+
+    // STAGE 1: Try exact matching at all positions with A-tailing support
+    // Fastp tries negative positions for adapters >= 16bp
     for pos in start..end {
-        // Stage 1: Try exact matching with mismatches
         if let Some(match_result) = try_exact_match(seq, adapter, pos, min_overlap) {
             if is_better_match(&match_result, &best_match) {
                 best_match = Some(match_result);
             }
-            continue; // Exact match found, skip indel stages
         }
+    }
 
-        // Indel matching only for non-negative positions
-        if pos < 0 {
-            continue;
-        }
+    // If exact match found, return it
+    if best_match.is_some() {
+        return best_match;
+    }
 
-        let start_pos = pos as usize;
-        let remaining = seq.len() - start_pos;
-
+    // STAGE 2: Try insertion matching with different comparison lengths
+    // Fastp loops through positions but always compares from START of sequences
+    // The loop varies cmplen based on remaining length, not the actual comparison position
+    for pos in 0..(seq.len() - match_req).saturating_sub(1) {
+        let remaining = seq.len() - pos;
         if remaining < min_overlap {
             break;
         }
 
-        // Stage 2 & 3: Indel matching ONLY at position 0
-        // Fastp only runs indel matching at the start of the sequence
-        if start_pos == 0 {
-            let cmplen_insertion = min(remaining.saturating_sub(1), adapter.len());
-            if let Some(match_result) =
-                try_insertion_match(seq, adapter, 0, cmplen_insertion, min_overlap)
-            {
-                if is_better_match(&match_result, &best_match) {
-                    best_match = Some(match_result);
-                }
-                continue; // Insertion match found, skip deletion stage
+        let cmplen = min(remaining.saturating_sub(1), adapter.len());
+        // Match fastp: always compare from position 0, passing only cmplen
+        if let Some(match_result) = try_insertion_match(seq, adapter, cmplen, min_overlap) {
+            if is_better_match(&match_result, &best_match) {
+                // Adjust position to match loop variable (fastp returns pos from loop)
+                let mut adjusted_match = match_result;
+                adjusted_match.position = pos;
+                best_match = Some(adjusted_match);
+                return best_match; // Fastp breaks immediately
             }
+        }
+    }
 
-            if let Some(match_result) = try_deletion_match(seq, adapter, 0, min_overlap) {
-                if is_better_match(&match_result, &best_match) {
-                    best_match = Some(match_result);
-                }
+    // STAGE 3: Try deletion matching with different comparison lengths
+    // Same logic as insertion - always compare from position 0
+    for pos in 0..(seq.len() - match_req) {
+        let cmplen = min(seq.len() - pos, adapter.len().saturating_sub(1));
+        if let Some(match_result) = try_deletion_match(seq, adapter, cmplen, min_overlap) {
+            if is_better_match(&match_result, &best_match) {
+                let mut adjusted_match = match_result;
+                adjusted_match.position = pos;
+                best_match = Some(adjusted_match);
+                return best_match; // Fastp breaks immediately
             }
         }
     }
@@ -656,20 +1012,15 @@ pub fn trim_adapter<'a>(
 
 /// Detect adapter using paired-end overlap information
 ///
-/// When read1 and read2 overlap, we can detect adapter contamination
-/// by checking for reverse-complement matching beyond the insert size.
+/// Deprecated: Use `detect_adapters_from_pe_reads` instead for batch detection.
+/// This function is kept for compatibility but returns None.
+#[deprecated(note = "Use detect_adapters_from_pe_reads for PE adapter auto-detection")]
 pub fn detect_adapter_from_pe_overlap(
     _seq1: &[u8],
     _seq2: &[u8],
     _min_overlap: usize,
 ) -> (Option<AdapterMatch>, Option<AdapterMatch>) {
-    // TODO: Implement paired-end overlap-based adapter detection
-    // This requires:
-    // 1. Find overlap between read1 and reverse-complement of read2
-    // 2. Determine insert size
-    // 3. Identify adapter sequences beyond the insert
-
-    // For now, return None (not implemented)
+    // Use detect_adapters_from_pe_reads for actual detection
     (None, None)
 }
 
@@ -821,4 +1172,76 @@ mod tests {
     //     let m = result.unwrap();
     //     assert_eq!(m.position, 6); // First occurrence
     // }
+
+    #[test]
+    fn test_adapter_detection_no_overlap() {
+        // Reads without overlap should not detect adapters
+        let r1_seqs = vec![
+            b"ACGTACGTACGTACGTACGTACGTACGTACGT".as_slice(),
+            b"TTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTT".as_slice(),
+        ];
+        let r2_seqs = vec![
+            b"GGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGG".as_slice(),
+            b"CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC".as_slice(),
+        ];
+
+        let result =
+            detect_adapters_from_pe_reads(r1_seqs.into_iter(), r2_seqs.into_iter(), 100, 0.01);
+
+        // Should not detect adapters when reads don't overlap
+        assert!(result.adapter_r1.is_none() || result.confidence < 0.01);
+    }
+
+    #[test]
+    fn test_adapter_detection_with_overlap() {
+        use crate::overlap::reverse_complement;
+
+        // Create reads that overlap with adapter contamination
+        // R1: 30bp insert + 10bp adapter
+        // R2: RC of same 30bp insert (no adapter for simplicity)
+        let insert = b"ACGTACGTACGTACGTACGTACGTACGTAC"; // 30bp
+        let adapter = b"AGATCGGAAG"; // 10bp adapter
+
+        let mut r1 = insert.to_vec();
+        r1.extend_from_slice(adapter);
+
+        let r2 = reverse_complement(insert);
+
+        let r1_seqs = vec![r1.as_slice(); 100]; // 100 identical reads
+        let r2_seqs = vec![r2.as_slice(); 100];
+
+        let result =
+            detect_adapters_from_pe_reads(r1_seqs.into_iter(), r2_seqs.into_iter(), 100, 0.01);
+
+        // Should detect adapter
+        assert!(result.adapter_r1.is_some());
+        assert!(result.confidence > 0.5); // High confidence
+        assert_eq!(result.reads_analyzed, 100);
+    }
+
+    #[test]
+    fn test_consensus_adapter_selection() {
+        let mut adapter_counts = HashMap::new();
+        adapter_counts.insert(b"AGATCGG".to_vec(), 5);
+        adapter_counts.insert(b"AGATCGGAAGAGC".to_vec(), 100); // Most frequent
+        adapter_counts.insert(b"TTTTTTT".to_vec(), 3);
+
+        let result = find_consensus_adapter(&adapter_counts, 10);
+
+        assert!(result.is_some());
+        let adapter = result.unwrap();
+        // Should pick the most frequent one
+        assert!(adapter.len() >= 7); // At least AGATCGG
+    }
+
+    #[test]
+    fn test_consensus_adapter_threshold() {
+        let mut adapter_counts = HashMap::new();
+        adapter_counts.insert(b"AGATCGG".to_vec(), 5); // Below threshold of 10
+
+        let result = find_consensus_adapter(&adapter_counts, 10);
+
+        // Should return None when no adapter meets threshold
+        assert!(result.is_none());
+    }
 }
