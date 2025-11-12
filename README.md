@@ -89,7 +89,7 @@ With quality trimming (10k reads):
 `fasterp` produces identical output to `fastp` and can replace it directly in existing workflows.
 Integration tests confirm equivalence across datasets (`cargo test`), and all checks run automatically in CI.
 
-See [integration tests](tests/integration_tests.rs) for ~90 tests comparing the inputs and outputs of both tools, these can be run locally via `cargo test` for verification.
+See [integration tests](tests/integration_tests.rs) for >100 tests comparing the inputs and outputs of both tools, these can be run locally via `cargo test` for verification.
 
 ## Sanity Check
 
