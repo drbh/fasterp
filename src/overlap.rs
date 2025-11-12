@@ -14,8 +14,11 @@ const BAD_QUAL: u8 = 14; // Q14 - low confidence base
 pub struct OverlapResult {
     /// Whether an overlap was found
     pub overlapped: bool,
-    /// Starting offset of overlap in R1
-    pub offset: usize,
+    /// Starting offset of overlap
+    /// Positive: R1 extends past R2 (offset in R1)
+    /// Negative: R2 extends past R1 (offset in R2, stored as negative)
+    /// Zero: reads start at same position
+    pub offset: isize,
     /// Length of overlapping region
     pub overlap_len: usize,
     /// Number of differences in overlap region
@@ -103,7 +106,7 @@ pub fn detect_overlap(
     // 2. R2 extends past R1 (offset in R2)
     // 3. Complete overlap
 
-    // Try offsets where R1 starts before R2_rc
+    // Try offsets where R1 starts before R2_rc (R1 extends past R2)
     for offset in 0..r1_len {
         let overlap_len = std::cmp::min(r1_len - offset, r2_len);
 
@@ -123,14 +126,14 @@ pub fn detect_overlap(
         {
             return Some(OverlapResult {
                 overlapped: true,
-                offset,
+                offset: offset as isize,
                 overlap_len,
                 differences,
             });
         }
     }
 
-    // Try offsets where R2_rc starts before R1
+    // Try offsets where R2_rc starts before R1 (R2 extends past R1)
     for offset in 1..r2_len {
         let overlap_len = std::cmp::min(r2_len - offset, r1_len);
 
@@ -148,13 +151,10 @@ pub fn detect_overlap(
         if differences <= config.max_diff
             && (differences * 100 / overlap_len) <= config.max_diff_percent
         {
-            // For R2 offset, we encode it as negative by using offset in R1 = 0
-            // and storing the R2 offset in a different way
-            // For now, we'll just return the case where R1 offset is 0
-            // and handle R2 offset separately in correction
+            // R2 extends past R1, so we return negative offset
             return Some(OverlapResult {
                 overlapped: true,
-                offset: 0, // R1 starts at beginning
+                offset: -(offset as isize),
                 overlap_len,
                 differences,
             });
@@ -195,8 +195,13 @@ pub fn correct_by_overlap(
 
     // Process each position in the overlap
     for i in 0..overlap.overlap_len {
-        let r1_pos = overlap.offset + i;
-        let r2_rc_pos = i;
+        let (r1_pos, r2_rc_pos) = if overlap.offset >= 0 {
+            // R1 extends past R2: R1 offset is positive
+            (overlap.offset as usize + i, i)
+        } else {
+            // R2 extends past R1: R2 offset is negative
+            (i, (-overlap.offset) as usize + i)
+        };
 
         // Get bases and qualities
         let r1_base = r1_seq[r1_pos];
@@ -232,6 +237,31 @@ pub fn correct_by_overlap(
     }
 
     stats
+}
+
+/// Trim adapters based on overlap analysis for paired-end reads
+///
+/// When R2 extends past R1 (negative offset), the non-overlapping parts
+/// are adapter sequences that should be trimmed.
+///
+/// Returns (r1_trim_len, r2_trim_len) - the lengths to keep for each read.
+/// Returns None if overlap-based trimming should not be applied.
+pub fn trim_by_overlap_analysis(
+    r1_len: usize,
+    r2_len: usize,
+    overlap: &OverlapResult,
+) -> Option<(usize, usize)> {
+    // Only trim if overlap is found and R2 extends past R1 (negative offset)
+    if !overlap.overlapped || overlap.offset >= 0 {
+        return None;
+    }
+
+    // When offset < 0, R2 extends beyond R1
+    // Trim both reads to the overlap length
+    let trim_len1 = std::cmp::min(r1_len, overlap.overlap_len);
+    let trim_len2 = std::cmp::min(r2_len, overlap.overlap_len);
+
+    Some((trim_len1, trim_len2))
 }
 
 #[cfg(test)]

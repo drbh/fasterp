@@ -104,25 +104,38 @@ pub fn detect_adapters_from_pe_reads<'a>(
         if let Some(overlap_result) = detect_overlap(r1_seq, r2_seq, &overlap_config) {
             let r2_rc = reverse_complement(r2_seq);
 
-            // Extract adapter from R1 (bases after the overlap)
-            let r1_adapter_start = overlap_result.offset + overlap_result.overlap_len;
-            if r1_adapter_start < r1_seq.len() {
-                let adapter = r1_seq[r1_adapter_start..].to_vec();
-                if !adapter.is_empty() && adapter.len() >= 3 {
-                    *adapter_r1_counts.entry(adapter).or_insert(0) += 1;
-                    reads_with_adapters += 1;
+            // Extract adapters based on offset direction
+            if overlap_result.offset >= 0 {
+                // R1 extends past R2: adapter is at end of R1
+                let r1_adapter_start = overlap_result.offset as usize + overlap_result.overlap_len;
+                if r1_adapter_start < r1_seq.len() {
+                    let adapter = r1_seq[r1_adapter_start..].to_vec();
+                    if !adapter.is_empty() && adapter.len() >= 3 {
+                        *adapter_r1_counts.entry(adapter).or_insert(0) += 1;
+                        reads_with_adapters += 1;
+                    }
                 }
-            }
+            } else {
+                // R2 extends past R1: adapters are at ends of both reads
+                // Adapter in R1 is at the end (beyond overlap)
+                if overlap_result.overlap_len < r1_seq.len() {
+                    let adapter = r1_seq[overlap_result.overlap_len..].to_vec();
+                    if !adapter.is_empty() && adapter.len() >= 3 {
+                        *adapter_r1_counts.entry(adapter).or_insert(0) += 1;
+                        reads_with_adapters += 1;
+                    }
+                }
 
-            // Extract adapter from R2 (bases after the overlap in R2_rc)
-            // Since we're working with R2_rc, the adapter is also at the end
-            let r2_adapter_start = overlap_result.overlap_len;
-            if r2_adapter_start < r2_rc.len() {
-                let adapter_rc = r2_rc[r2_adapter_start..].to_vec();
-                if !adapter_rc.is_empty() && adapter_rc.len() >= 3 {
-                    // Store the original R2 adapter (reverse complement of what we extracted)
-                    let adapter = reverse_complement(&adapter_rc);
-                    *adapter_r2_counts.entry(adapter).or_insert(0) += 1;
+                // Adapter in R2_rc is at the end (beyond overlap)
+                let r2_offset = (-overlap_result.offset) as usize;
+                let r2_adapter_start = r2_offset + overlap_result.overlap_len;
+                if r2_adapter_start < r2_rc.len() {
+                    let adapter_rc = r2_rc[r2_adapter_start..].to_vec();
+                    if !adapter_rc.is_empty() && adapter_rc.len() >= 3 {
+                        // Store the original R2 adapter (reverse complement of what we extracted)
+                        let adapter = reverse_complement(&adapter_rc);
+                        *adapter_r2_counts.entry(adapter).or_insert(0) += 1;
+                    }
                 }
             }
         }
@@ -1151,13 +1164,14 @@ pub fn find_adapter(
     };
 
     // Minimum required match length (matchReq in fastp)
-    let match_req = 4;
+    // Fastp uses 5 as the minimum match length
+    let match_req = 5;
 
     let end = (seq.len() as isize) - (match_req as isize);
 
     // STAGE 1: Try exact matching at all positions with A-tailing support
     // Fastp tries negative positions for adapters >= 16bp
-    for pos in start..end {
+    for pos in start..=end {
         if let Some(match_result) = try_exact_match(seq, adapter, pos, min_overlap) {
             if is_better_match(&match_result, &best_match) {
                 best_match = Some(match_result);
@@ -1173,7 +1187,7 @@ pub fn find_adapter(
     // STAGE 2: Try insertion matching with different comparison lengths
     // Fastp loops through positions but always compares from START of sequences
     // The loop varies cmplen based on remaining length, not the actual comparison position
-    for pos in 0..(seq.len() - match_req).saturating_sub(1) {
+    for pos in 0..=(seq.len() - match_req) {
         let remaining = seq.len() - pos;
         if remaining < min_overlap {
             break;
@@ -1194,7 +1208,7 @@ pub fn find_adapter(
 
     // STAGE 3: Try deletion matching with different comparison lengths
     // Same logic as insertion - always compare from position 0
-    for pos in 0..(seq.len() - match_req) {
+    for pos in 0..=(seq.len() - match_req) {
         let cmplen = min(seq.len() - pos, adapter.len().saturating_sub(1));
         if let Some(match_result) = try_deletion_match(seq, adapter, cmplen, min_overlap) {
             if is_better_match(&match_result, &best_match) {

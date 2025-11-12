@@ -298,7 +298,19 @@ pub(crate) fn trim_read_with_adapter(
         return result;
     }
 
-    // 2. Adapter trimming (BEFORE tail trim, to match fastp behavior)
+    // 2. Fixed tail trimming
+    // Note: fastp applies fixed tail trimming BEFORE adapter detection (in trimAndCut)
+    if config.trim_tail_bases > 0 {
+        result.end_pos = result.end_pos.saturating_sub(config.trim_tail_bases);
+    }
+
+    // Ensure we still have a valid range
+    if result.start_pos >= result.end_pos {
+        result.end_pos = result.start_pos;
+        return result;
+    }
+
+    // 3. Adapter trimming (AFTER fixed front/tail trim, to match fastp behavior)
     if config.adapter_config.is_enabled() {
         // Use adapter_override if provided (for PE read2), otherwise use adapter_seq
         let adapter_to_use = if let Some(adapter) = adapter_override {
@@ -325,12 +337,6 @@ pub(crate) fn trim_read_with_adapter(
                 result.adapter_bases_trimmed = bases_trimmed;
             }
         }
-    }
-
-    // 3. Fixed tail trimming (AFTER adapter trim)
-    // Note: fastp applies fixed tail trimming AFTER adapter trimming
-    if config.trim_tail_bases > 0 {
-        result.end_pos = result.end_pos.saturating_sub(config.trim_tail_bases);
     }
 
     // Ensure we still have a valid range

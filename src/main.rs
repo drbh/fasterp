@@ -689,20 +689,20 @@ fn build_and_write_paired_end_report(
 
 /// Print a summary of read statistics
 fn print_read_stats(title: &str, stats: &ReadStats) {
-    println!("{title}:");
-    println!("total reads: {}", stats.total_reads);
-    println!("total bases: {}", stats.total_bases);
-    println!(
+    eprintln!("{title}:");
+    eprintln!("total reads: {}", stats.total_reads);
+    eprintln!("total bases: {}", stats.total_bases);
+    eprintln!(
         "Q20 bases: {}({:.4}%)",
         stats.q20_bases,
         stats.q20_rate * 100.0
     );
-    println!(
+    eprintln!(
         "Q30 bases: {}({:.4}%)",
         stats.q30_bases,
         stats.q30_rate * 100.0
     );
-    println!("Q40 bases: 0(0%)");
+    eprintln!("Q40 bases: 0(0%)");
 }
 
 /// Print filtering results
@@ -710,44 +710,44 @@ fn print_filtering_results(
     result: &FilteringResult,
     adapter_cutting: Option<&AdapterCuttingStats>,
 ) {
-    println!("Filtering result:");
-    println!("reads passed filter: {}", result.passed_filter_reads);
-    println!(
+    eprintln!("Filtering result:");
+    eprintln!("reads passed filter: {}", result.passed_filter_reads);
+    eprintln!(
         "reads failed due to low quality: {}",
         result.low_quality_reads
     );
-    println!(
+    eprintln!(
         "reads failed due to too many N: {}",
         result.too_many_n_reads
     );
-    println!("reads failed due to too short: {}", result.too_short_reads);
+    eprintln!("reads failed due to too short: {}", result.too_short_reads);
 
     if let Some(ac) = adapter_cutting {
-        println!("reads with adapter trimmed: {}", ac.adapter_trimmed_reads);
-        println!(
+        eprintln!("reads with adapter trimmed: {}", ac.adapter_trimmed_reads);
+        eprintln!(
             "bases trimmed due to adapters: {}",
             ac.adapter_trimmed_bases
         );
     } else {
-        println!("reads with adapter trimmed: 0");
-        println!("bases trimmed due to adapters: 0");
+        eprintln!("reads with adapter trimmed: 0");
+        eprintln!("bases trimmed due to adapters: 0");
     }
 }
 
 /// Print command line reconstruction
 fn print_command_line(args: &Args, is_paired_end: bool) {
     if is_paired_end {
-        print!("fasterp -i {} ", args.input);
+        eprint!("fasterp -i {} ", args.input);
         if let Some(ref in2) = args.input2 {
-            print!("-I {in2} ");
+            eprint!("-I {in2} ");
         }
-        print!("-o {} ", args.output);
+        eprint!("-o {} ", args.output);
         if let Some(ref out2) = args.output2 {
-            print!("-O {out2} ");
+            eprint!("-O {out2} ");
         }
-        println!("-j {}", args.json);
+        eprintln!("-j {}", args.json);
     } else {
-        println!(
+        eprintln!(
             "fasterp -i {} -o {} -j {}",
             args.input, args.output, args.json
         );
@@ -763,22 +763,22 @@ fn print_report_to_stdout(
 ) {
     // Adapter detection messages
     if is_paired_end {
-        println!("Detecting adapter sequence for read1...");
-        println!("No adapter detected for read1");
-        println!();
-        println!("Detecting adapter sequence for read2...");
-        println!("No adapter detected for read2");
+        eprintln!("Detecting adapter sequence for read1...");
+        eprintln!("No adapter detected for read1");
+        eprintln!();
+        eprintln!("Detecting adapter sequence for read2...");
+        eprintln!("No adapter detected for read2");
     } else {
-        println!("Detecting adapter sequence for read1...");
-        println!("No adapter detected for read1");
+        eprintln!("Detecting adapter sequence for read1...");
+        eprintln!("No adapter detected for read1");
     }
-    println!();
+    eprintln!();
 
     // Before/after stats for read1
     print_read_stats("Read1 before filtering", &report.summary.before_filtering);
-    println!();
+    eprintln!();
     print_read_stats("Read1 after filtering", &report.summary.after_filtering);
-    println!();
+    eprintln!();
 
     // If paired-end, print read2 stats
     if is_paired_end {
@@ -789,7 +789,7 @@ fn print_report_to_stdout(
 
     // Filtering results
     print_filtering_results(&report.filtering_result, report.adapter_cutting.as_ref());
-    println!();
+    eprintln!();
 
     // Duplication rate
     if let Some(dup) = &report.duplication {
@@ -798,14 +798,14 @@ fn print_report_to_stdout(
         } else {
             " (may be overestimated since this is SE data)"
         };
-        println!("Duplication rate{}: {:.4}%", qualifier, dup.rate * 100.0);
+        eprintln!("Duplication rate{}: {:.4}%", qualifier, dup.rate * 100.0);
     }
-    println!();
+    eprintln!();
 
     // Report files
-    println!("JSON report: {}", args.json);
-    println!("HTML report: {}", args.html);
-    println!();
+    eprintln!("JSON report: {}", args.json);
+    eprintln!("HTML report: {}", args.html);
+    eprintln!();
 
     // Command line and version
     print_command_line(args, is_paired_end);
@@ -817,7 +817,7 @@ fn print_report_to_stdout(
         format!("{} milliseconds", elapsed.as_millis())
     };
 
-    println!(
+    eprintln!(
         "fasterp v{}, time used: {}",
         env!("CARGO_PKG_VERSION"),
         time_str
@@ -1058,7 +1058,11 @@ fn main() -> Result<()> {
         }
 
         // Perform adapter auto-detection if requested
-        if trimming_config_r1.adapter_config.detect_adapter_for_pe {
+        // Skip auto-detection if either input is stdin (can't rewind)
+        if trimming_config_r1.adapter_config.detect_adapter_for_pe
+            && args.input != "-"
+            && args.input2.as_ref().map_or(true, |i2| i2 != "-")
+        {
             match auto_detect_adapters_pe(
                 &args.input,
                 args.input2.as_ref().unwrap(),
@@ -1079,7 +1083,7 @@ fn main() -> Result<()> {
 
                     if let Some(ref adapter) = detection_result.adapter_r2 {
                         eprintln!("Detected R2 adapter: {}", String::from_utf8_lossy(adapter));
-                        trimming_config_r2.adapter_config.adapter_seq_r2 = Some(adapter.clone());
+                        trimming_config_r2.adapter_config.adapter_seq = Some(adapter.clone());
                     } else {
                         eprintln!("No R2 adapter detected");
                     }
@@ -1242,9 +1246,11 @@ fn main() -> Result<()> {
     // SINGLE-END MODE
 
     // Perform adapter auto-detection if requested and no adapter specified
+    // Skip auto-detection if input is stdin (can't rewind)
     let mut se_trimming_config = trimming_config;
     if se_trimming_config.adapter_config.detect_adapter_for_pe
         && se_trimming_config.adapter_config.adapter_seq.is_none()
+        && args.input != "-"
     {
         match auto_detect_adapter_se(
             &args.input,

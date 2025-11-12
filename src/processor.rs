@@ -853,34 +853,126 @@ pub(crate) fn process_paired_fastq_stream<R1: BufRead, R2: BufRead, W1: Write, W
                 acc.before_r2
                     .add(final_seq2.len(), stats2.q20, stats2.q30, stats2.gc);
 
-                // Apply trimming to both reads (using sequences after UMI removal)
-                let trim_result1 = if trimming_config_r1.is_enabled() {
-                    trim_read(final_seq1, final_qual1, trimming_config_r1)
+                // Detect overlap for adapter trimming (if adapters are enabled)
+                let overlap_result = if trimming_config_r1.adapter_config.is_enabled()
+                    || trimming_config_r2.adapter_config.is_enabled()
+                    || overlap_config.is_some()
+                {
+                    // Use default overlap config for adapter detection
+                    let overlap_detect_config = crate::overlap::OverlapConfig::default();
+                    crate::overlap::detect_overlap(final_seq1, final_seq2, &overlap_detect_config)
                 } else {
-                    TrimmingResult {
-                        start_pos: 0,
-                        end_pos: final_seq1.len(),
-                        poly_g_trimmed: 0,
-                        poly_x_trimmed: 0,
-                        adapter_trimmed: false,
-                        adapter_bases_trimmed: 0,
-                    }
+                    None
                 };
 
-                let trim_result2 = if trimming_config_r2.is_enabled() {
-                    // Use adapter_seq_r2 for read2 if available
-                    let adapter_r2 = trimming_config_r2.adapter_config.adapter_seq_r2.as_deref();
-                    trim_read_with_adapter(final_seq2, final_qual2, trimming_config_r2, adapter_r2)
-                } else {
-                    TrimmingResult {
-                        start_pos: 0,
-                        end_pos: final_seq2.len(),
-                        poly_g_trimmed: 0,
-                        poly_x_trimmed: 0,
-                        adapter_trimmed: false,
-                        adapter_bases_trimmed: 0,
+                // Try overlap-based adapter trimming first
+                let overlap_trimmed = if let Some(ref overlap) = overlap_result {
+                    if (trimming_config_r1.adapter_config.is_enabled()
+                        || trimming_config_r2.adapter_config.is_enabled())
+                    {
+                        crate::overlap::trim_by_overlap_analysis(
+                            final_seq1.len(),
+                            final_seq2.len(),
+                            overlap,
+                        )
+                    } else {
+                        None
                     }
+                } else {
+                    None
                 };
+
+                // Apply trimming to both reads (using sequences after UMI removal)
+                let mut trim_result1;
+                let mut trim_result2;
+
+                if let Some((overlap_trim_len1, overlap_trim_len2)) = overlap_trimmed {
+                    // Overlap-based adapter trimming succeeded
+                    // Still need to apply other trimming (poly-G, quality, etc.)
+                    // but skip adapter trimming since we already did it with overlap
+
+                    // Temporarily disable adapter trimming for other trims
+                    let mut temp_config1 = trimming_config_r1.clone();
+                    let mut temp_config2 = trimming_config_r2.clone();
+                    temp_config1.adapter_config.adapter_seq = None;
+                    temp_config2.adapter_config.adapter_seq = None;
+                    temp_config2.adapter_config.adapter_seq_r2 = None;
+
+                    trim_result1 = if trimming_config_r1.is_enabled() {
+                        trim_read(final_seq1, final_qual1, &temp_config1)
+                    } else {
+                        TrimmingResult {
+                            start_pos: 0,
+                            end_pos: final_seq1.len(),
+                            poly_g_trimmed: 0,
+                            poly_x_trimmed: 0,
+                            adapter_trimmed: false,
+                            adapter_bases_trimmed: 0,
+                        }
+                    };
+
+                    trim_result2 = if trimming_config_r2.is_enabled() {
+                        trim_read(final_seq2, final_qual2, &temp_config2)
+                    } else {
+                        TrimmingResult {
+                            start_pos: 0,
+                            end_pos: final_seq2.len(),
+                            poly_g_trimmed: 0,
+                            poly_x_trimmed: 0,
+                            adapter_trimmed: false,
+                            adapter_bases_trimmed: 0,
+                        }
+                    };
+
+                    // Apply overlap-based adapter trim lengths
+                    trim_result1.end_pos = std::cmp::min(trim_result1.end_pos, overlap_trim_len1);
+                    trim_result2.end_pos = std::cmp::min(trim_result2.end_pos, overlap_trim_len2);
+
+                    // Mark as adapter trimmed
+                    if overlap_trim_len1 < final_seq1.len() {
+                        trim_result1.adapter_trimmed = true;
+                        trim_result1.adapter_bases_trimmed = final_seq1.len() - overlap_trim_len1;
+                    }
+                    if overlap_trim_len2 < final_seq2.len() {
+                        trim_result2.adapter_trimmed = true;
+                        trim_result2.adapter_bases_trimmed = final_seq2.len() - overlap_trim_len2;
+                    }
+                } else {
+                    // No overlap-based trimming, use sequence-based adapter trimming
+                    trim_result1 = if trimming_config_r1.is_enabled() {
+                        trim_read(final_seq1, final_qual1, trimming_config_r1)
+                    } else {
+                        TrimmingResult {
+                            start_pos: 0,
+                            end_pos: final_seq1.len(),
+                            poly_g_trimmed: 0,
+                            poly_x_trimmed: 0,
+                            adapter_trimmed: false,
+                            adapter_bases_trimmed: 0,
+                        }
+                    };
+
+                    trim_result2 = if trimming_config_r2.is_enabled() {
+                        // Use adapter_seq_r2 for read2 if available
+                        let adapter_r2 =
+                            trimming_config_r2.adapter_config.adapter_seq_r2.as_deref();
+                        trim_read_with_adapter(
+                            final_seq2,
+                            final_qual2,
+                            trimming_config_r2,
+                            adapter_r2,
+                        )
+                    } else {
+                        TrimmingResult {
+                            start_pos: 0,
+                            end_pos: final_seq2.len(),
+                            poly_g_trimmed: 0,
+                            poly_x_trimmed: 0,
+                            adapter_trimmed: false,
+                            adapter_bases_trimmed: 0,
+                        }
+                    };
+                }
 
                 // Track adapter trimming stats for paired-end
                 if trim_result1.adapter_trimmed {
@@ -911,7 +1003,8 @@ pub(crate) fn process_paired_fastq_stream<R1: BufRead, R2: BufRead, W1: Write, W
                     seq2_corrected_buf = trimmed_seq2.to_vec();
                     qual2_corrected_buf = trimmed_qual2.to_vec();
 
-                    // Detect overlap and correct mismatches
+                    // Detect overlap on trimmed sequences for correction
+                    // (trimmed sequences may have different overlap than original)
                     if let Some(overlap) = crate::overlap::detect_overlap(
                         &seq1_corrected_buf,
                         &seq2_corrected_buf,
