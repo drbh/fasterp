@@ -925,17 +925,23 @@ pub(crate) fn process_paired_fastq_stream<R1: BufRead, R2: BufRead, W1: Write, W
                     };
 
                     // Apply overlap-based adapter trim lengths
+                    // Track the end position before overlap trim to calculate adapter bases correctly
+                    let end_before_overlap1 = trim_result1.end_pos;
+                    let end_before_overlap2 = trim_result2.end_pos;
+
                     trim_result1.end_pos = std::cmp::min(trim_result1.end_pos, overlap_trim_len1);
                     trim_result2.end_pos = std::cmp::min(trim_result2.end_pos, overlap_trim_len2);
 
-                    // Mark as adapter trimmed
-                    if overlap_trim_len1 < final_seq1.len() {
+                    // Mark as adapter trimmed (only count bases trimmed beyond other trims)
+                    if trim_result1.end_pos < end_before_overlap1 {
                         trim_result1.adapter_trimmed = true;
-                        trim_result1.adapter_bases_trimmed = final_seq1.len() - overlap_trim_len1;
+                        trim_result1.adapter_bases_trimmed =
+                            end_before_overlap1 - trim_result1.end_pos;
                     }
-                    if overlap_trim_len2 < final_seq2.len() {
+                    if trim_result2.end_pos < end_before_overlap2 {
                         trim_result2.adapter_trimmed = true;
-                        trim_result2.adapter_bases_trimmed = final_seq2.len() - overlap_trim_len2;
+                        trim_result2.adapter_bases_trimmed =
+                            end_before_overlap2 - trim_result2.end_pos;
                     }
                 } else {
                     // No overlap-based trimming, use sequence-based adapter trimming

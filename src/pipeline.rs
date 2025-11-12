@@ -140,6 +140,9 @@ pub(crate) struct PairedWorkerResult {
     pub low_complexity: usize,
     pub invalid: usize,
     pub duplicated: usize,
+    // Adapter trimming stats
+    pub adapter_trimmed_reads: usize,
+    pub adapter_trimmed_bases: usize,
 }
 
 /// Producer thread: read blocks and parse into batches
@@ -951,6 +954,8 @@ pub(crate) fn paired_worker_thread(
         let mut low_complexity = 0usize;
         let mut invalid = 0usize;
         let mut duplicated = 0usize;
+        let mut adapter_trimmed_reads = 0usize;
+        let mut adapter_trimmed_bases = 0usize;
         let mut pieces = Vec::new();
 
         // Process each pair
@@ -1091,6 +1096,16 @@ pub(crate) fn paired_worker_thread(
                     adapter_bases_trimmed: 0,
                 }
             };
+
+            // Track adapter trimming stats (count each read individually)
+            if trim_result1.adapter_trimmed {
+                adapter_trimmed_reads += 1;
+                adapter_trimmed_bases += trim_result1.adapter_bases_trimmed;
+            }
+            if trim_result2.adapter_trimmed {
+                adapter_trimmed_reads += 1;
+                adapter_trimmed_bases += trim_result2.adapter_bases_trimmed;
+            }
 
             // Get trimmed sequences (from UMI-processed sequences)
             let trimmed_seq1 = &final_umi_seq1[trim_result1.start_pos..trim_result1.end_pos];
@@ -1378,6 +1393,8 @@ pub(crate) fn paired_worker_thread(
             low_complexity,
             invalid,
             duplicated,
+            adapter_trimmed_reads,
+            adapter_trimmed_bases,
         };
 
         if sender.send(Some(result)).is_err() {
@@ -1623,6 +1640,10 @@ pub(crate) fn paired_merger_thread(
                     acc.low_complexity += result.low_complexity;
                     acc.invalid += result.invalid;
                     acc.duplicated += result.duplicated;
+
+                    // Merge adapter trimming stats
+                    acc.adapter_trimmed_reads += result.adapter_trimmed_reads;
+                    acc.adapter_trimmed_bases += result.adapter_trimmed_bases;
 
                     if result.pos_r1.total_sum.len() > acc.max_cycle_r1 {
                         acc.max_cycle_r1 = result.pos_r1.total_sum.len();

@@ -250,14 +250,15 @@ pub(crate) fn detect_poly_x_tail(seq: &[u8], min_len: usize) -> usize {
 
 /// Apply all trimming operations to a read
 ///
-/// Trimming order:
+/// Trimming order (matching fastp):
 /// 1. Fixed front trimming
 /// 2. Fixed tail trimming
-/// 3. Adapter trimming
-/// 4. Maximum length trimming
-/// 5. Sliding window front trimming (if enabled)
-/// 6. Sliding window tail trimming (if enabled)
-/// 7. PolyG/PolyX tail trimming
+/// 3. Quality sliding window front trimming (if enabled)
+/// 4. Quality sliding window tail trimming (if enabled)
+/// 5. Adapter trimming
+/// 6. PolyG tail trimming
+/// 7. PolyX tail trimming
+/// 8. Maximum length trimming
 ///
 /// # Arguments
 /// * `seq` - Nucleotide sequence
@@ -299,7 +300,6 @@ pub(crate) fn trim_read_with_adapter(
     }
 
     // 2. Fixed tail trimming
-    // Note: fastp applies fixed tail trimming BEFORE adapter detection (in trimAndCut)
     if config.trim_tail_bases > 0 {
         result.end_pos = result.end_pos.saturating_sub(config.trim_tail_bases);
     }
@@ -310,7 +310,41 @@ pub(crate) fn trim_read_with_adapter(
         return result;
     }
 
-    // 3. Adapter trimming (AFTER fixed front/tail trim, to match fastp behavior)
+    // 3. Quality sliding window front trimming
+    // Note: fastp does quality trimming (in trimAndCut) BEFORE adapter trimming
+    if config.enable_trim_front {
+        let current_qual = &qual[result.start_pos..result.end_pos];
+        let trim_amount = trim_front_sliding_window(
+            current_qual,
+            config.cut_window_size,
+            config.cut_mean_quality,
+        );
+        result.start_pos += trim_amount;
+    }
+
+    // Ensure we still have sequence left
+    if result.start_pos >= result.end_pos {
+        result.end_pos = result.start_pos;
+        return result;
+    }
+
+    // 4. Quality sliding window tail trimming
+    if config.enable_trim_tail {
+        let new_len = trim_tail_sliding_window(
+            &qual[result.start_pos..result.end_pos],
+            config.cut_window_size,
+            config.cut_mean_quality,
+        );
+        result.end_pos = result.start_pos + new_len;
+    }
+
+    // Ensure we still have sequence left
+    if result.start_pos >= result.end_pos {
+        result.end_pos = result.start_pos;
+        return result;
+    }
+
+    // 5. Adapter trimming (AFTER quality trimming, to match fastp behavior)
     if config.adapter_config.is_enabled() {
         // Use adapter_override if provided (for PE read2), otherwise use adapter_seq
         let adapter_to_use = if let Some(adapter) = adapter_override {
@@ -321,7 +355,6 @@ pub(crate) fn trim_read_with_adapter(
 
         if let Some(adapter) = adapter_to_use {
             let current_seq = &seq[result.start_pos..result.end_pos];
-            let _current_length = current_seq.len();
 
             if let Some(adapter_match) = crate::adapter::find_adapter(
                 current_seq,
@@ -339,48 +372,6 @@ pub(crate) fn trim_read_with_adapter(
         }
     }
 
-    // Ensure we still have a valid range
-    if result.start_pos >= result.end_pos {
-        result.end_pos = result.start_pos;
-        return result;
-    }
-
-    // 4. Maximum length trimming (trim from tail if read is too long)
-    if config.max_len > 0 {
-        let current_len = result.end_pos - result.start_pos;
-        if current_len > config.max_len {
-            result.end_pos = result.start_pos + config.max_len;
-        }
-    }
-
-    // Ensure we still have a valid range
-    if result.start_pos >= result.end_pos {
-        result.end_pos = result.start_pos;
-        return result;
-    }
-
-    let current_qual = &qual[result.start_pos..result.end_pos];
-
-    // 5. Sliding window front trimming
-    if config.enable_trim_front {
-        let trim_amount = trim_front_sliding_window(
-            current_qual,
-            config.cut_window_size,
-            config.cut_mean_quality,
-        );
-        result.start_pos += trim_amount;
-    }
-
-    // 6. Sliding window tail trimming
-    if config.enable_trim_tail {
-        let new_len = trim_tail_sliding_window(
-            &qual[result.start_pos..result.end_pos],
-            config.cut_window_size,
-            config.cut_mean_quality,
-        );
-        result.end_pos = result.start_pos + new_len;
-    }
-
     // Ensure we still have sequence left
     if result.start_pos >= result.end_pos {
         result.end_pos = result.start_pos;
@@ -389,7 +380,7 @@ pub(crate) fn trim_read_with_adapter(
 
     let current_seq = &seq[result.start_pos..result.end_pos];
 
-    // 7. PolyG tail trimming (check polyG first as it's more specific)
+    // 6. PolyG tail trimming (check polyG first as it's more specific)
     if config.enable_poly_g {
         let poly_g = detect_poly_g_tail(current_seq, config.poly_min_len);
         if poly_g > 0 {
@@ -398,13 +389,28 @@ pub(crate) fn trim_read_with_adapter(
         }
     }
 
-    // 8. PolyX tail trimming (only if polyG didn't already trim)
+    // 7. PolyX tail trimming (only if polyG didn't already trim)
     if config.enable_poly_x && result.poly_g_trimmed == 0 {
         let current_seq = &seq[result.start_pos..result.end_pos];
         let poly_x = detect_poly_x_tail(current_seq, config.poly_min_len);
         if poly_x > 0 {
             result.poly_x_trimmed = poly_x;
             result.end_pos = result.end_pos.saturating_sub(poly_x);
+        }
+    }
+
+    // Ensure we still have sequence left
+    if result.start_pos >= result.end_pos {
+        result.end_pos = result.start_pos;
+        return result;
+    }
+
+    // 8. Maximum length trimming (trim from tail if read is too long)
+    // Note: fastp does this last
+    if config.max_len > 0 {
+        let current_len = result.end_pos - result.start_pos;
+        if current_len > config.max_len {
+            result.end_pos = result.start_pos + config.max_len;
         }
     }
 

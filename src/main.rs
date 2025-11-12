@@ -73,9 +73,13 @@ struct Args {
     #[arg(short = 'L', long)]
     disable_length_filtering: bool,
 
-    /// Maximum length limit - trim reads longer than this (default: 0 = disabled)
-    #[arg(short = 'b', long, default_value = "0")]
-    max_len: usize,
+    /// Maximum length for read1 - trim if longer (default: 0 = disabled)
+    #[arg(short = 'b', long = "max_len1", default_value = "0")]
+    max_len1: usize,
+
+    /// Maximum length for read2 - trim if longer (default: 0 = disabled, follows read1 if not specified)
+    #[arg(short = 'B', long = "max_len2", default_value = "0")]
+    max_len2: usize,
 
     /// Quality value that a base is qualified (phred quality >= this value) (default: 15)
     #[arg(short = 'q', long, default_value = "15")]
@@ -118,7 +122,7 @@ struct Args {
     compression_level: Option<u32>,
 
     /// Number of worker threads (default: auto-detect CPU count)
-    #[arg(short = 't', long)]
+    #[arg(short = 'w', long)]
     threads: Option<usize>,
 
     /// Batch size in bytes (default: 16 MiB)
@@ -167,7 +171,7 @@ struct Args {
     trim_front1: usize,
 
     /// Trim N bases from tail for read1 (fastp compatibility)
-    #[arg(long = "trim_tail1", default_value = "0")]
+    #[arg(short = 't', long = "trim_tail1", default_value = "0")]
     trim_tail1: usize,
 
     /// Trim N bases from front for read2 (fastp compatibility)
@@ -306,19 +310,20 @@ fn create_trimming_config(args: &Args) -> TrimmingConfig {
         args.trim_tail
     };
 
-    TrimmingConfig {
+    let config = TrimmingConfig {
         enable_trim_front: args.cut_front && args.cut_mean_quality > 0,
         enable_trim_tail: args.cut_tail && args.cut_mean_quality > 0 && !args.disable_trim_tail,
         cut_mean_quality: args.cut_mean_quality,
         cut_window_size: args.cut_window_size,
         trim_front_bases: trim_front,
         trim_tail_bases: trim_tail,
-        max_len: args.max_len,
+        max_len: args.max_len1,
         enable_poly_g: args.trim_poly_g && !args.disable_trim_poly_g,
         enable_poly_x: args.trim_poly_x,
         poly_min_len: args.poly_g_min_len,
         adapter_config,
-    }
+    };
+    config
 }
 
 // Helper function to create TrimmingConfig for read2 in paired-end mode
@@ -365,19 +370,27 @@ fn create_trimming_config_r2(args: &Args) -> TrimmingConfig {
         args.trim_tail
     };
 
-    TrimmingConfig {
+    // Per fastp docs: "If not specified, it will follow read1's settings"
+    let max_len = if args.max_len2 > 0 {
+        args.max_len2
+    } else {
+        args.max_len1
+    };
+
+    let config = TrimmingConfig {
         enable_trim_front: args.cut_front && args.cut_mean_quality > 0,
         enable_trim_tail: args.cut_tail && args.cut_mean_quality > 0 && !args.disable_trim_tail,
         cut_mean_quality: args.cut_mean_quality,
         cut_window_size: args.cut_window_size,
         trim_front_bases: trim_front,
         trim_tail_bases: trim_tail,
-        max_len: args.max_len,
+        max_len,
         enable_poly_g: args.trim_poly_g && !args.disable_trim_poly_g,
         enable_poly_x: args.trim_poly_x,
         poly_min_len: args.poly_g_min_len,
         adapter_config,
-    }
+    };
+    config
 }
 
 // Helper function to create OverlapConfig from CLI args
@@ -583,10 +596,12 @@ fn build_and_write_paired_end_report(
         filtering_result: FilteringResult {
             // Count both R1 and R2 reads to match fastp's behavior
             passed_filter_reads: pe_acc.after_r1.total_reads + pe_acc.after_r2.total_reads,
-            low_quality_reads: pe_acc.low_quality,
-            low_complexity_reads: pe_acc.low_complexity,
-            too_many_n_reads: pe_acc.too_many_n,
-            too_short_reads: pe_acc.too_short,
+            // In paired-end mode, filter counts represent pairs, but fastp reports individual reads
+            // So multiply by 2 to count both R1 and R2
+            low_quality_reads: pe_acc.low_quality * 2,
+            low_complexity_reads: pe_acc.low_complexity * 2,
+            too_many_n_reads: pe_acc.too_many_n * 2,
+            too_short_reads: pe_acc.too_short * 2,
             too_long_reads: 0,
         },
         read1_before_filtering: DetailedReadStats {
@@ -1038,25 +1053,6 @@ fn main() -> Result<()> {
         let mut trimming_config_r2 = create_trimming_config_r2(&args);
 
         // Apply fastp's undocumented default: trim_tail=1 when NO trimming parameters specified
-        // This default is disabled if user specifies ANY fixed trimming parameter
-        let user_specified_trimming = args.trim_front != 0
-            || args.trim_tail != 0
-            || args.trim_front1 != 0
-            || args.trim_tail1 != 0
-            || args.trim_front2 != 0
-            || args.trim_tail2 != 0;
-
-        if !user_specified_trimming && args.trim_tail == 0 && args.trim_tail1 == 0 {
-            trimming_config_r1.trim_tail_bases = 1;
-        }
-        if !user_specified_trimming
-            && args.trim_tail == 0
-            && args.trim_tail1 == 0
-            && args.trim_tail2 == 0
-        {
-            trimming_config_r2.trim_tail_bases = 1;
-        }
-
         // Perform adapter auto-detection if requested
         // Skip auto-detection if either input is stdin (can't rewind)
         if trimming_config_r1.adapter_config.detect_adapter_for_pe
