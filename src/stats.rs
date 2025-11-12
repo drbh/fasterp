@@ -103,6 +103,13 @@ pub(crate) struct AdapterCuttingStats {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct InsertSizeStats {
+    pub peak: usize,
+    pub unknown: usize,
+    pub histogram: Vec<usize>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct FasterpReport {
     pub summary: Summary,
     pub filtering_result: FilteringResult,
@@ -117,6 +124,8 @@ pub(crate) struct FasterpReport {
     pub duplication: Option<DuplicationStats>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub adapter_cutting: Option<AdapterCuttingStats>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub insert_size: Option<InsertSizeStats>,
 }
 
 /// Accumulator for per-position quality statistics

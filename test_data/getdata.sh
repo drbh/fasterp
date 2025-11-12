@@ -72,6 +72,53 @@ for f in R1.fq small_1k.fq medium_10k.fq large_100k.fq xlarge_500k.fq; do
     fi
 done
 
+# Function to create merge test files (R2 is reverse complement of R1)
+create_merge_test_files() {
+    local num_reads=$1
+    local r1_file=$2
+    local r2_file=$3
+    local read_length=${4:-60}  # Default 60bp for perfect overlaps
+
+    echo ""
+    echo "Creating merge test files: $r1_file and $r2_file with $num_reads reads..."
+
+    # Create R1 first
+    > "$r1_file"
+    > "$r2_file"
+
+    # Function to reverse complement a DNA sequence
+    reverse_complement() {
+        echo "$1" | rev | tr 'ACGTacgt' 'TGCAtgca'
+    }
+
+    for i in $(seq 0 $((num_reads - 1))); do
+        # Generate random sequence for R1
+        local seq=""
+        local bases="ACGT"
+        for ((j=0; j<read_length; j++)); do
+            seq="${seq}${bases:$((RANDOM % 4)):1}"
+        done
+
+        # Create quality string (all high quality)
+        local qual=$(printf 'I%.0s' $(seq 1 $read_length))
+
+        # Write R1
+        echo "@read${i}" >> "$r1_file"
+        echo "$seq" >> "$r1_file"
+        echo "+" >> "$r1_file"
+        echo "$qual" >> "$r1_file"
+
+        # Write R2 as reverse complement of R1
+        local r2_seq=$(reverse_complement "$seq")
+        echo "@read${i}" >> "$r2_file"
+        echo "$r2_seq" >> "$r2_file"
+        echo "+" >> "$r2_file"
+        echo "$qual" >> "$r2_file"
+    done
+
+    echo "  Created merge test files with $num_reads read pairs ($read_length bp each)"
+}
+
 # Function to create paired-end test files with overlap
 create_pe_overlap_files() {
     local num_reads=$1
@@ -118,6 +165,12 @@ create_pe_files() {
 
     echo "  Created PE files with $num_reads read pairs"
 }
+
+# Generate merge test files (R2 is reverse complement of R1 for perfect merging)
+echo ""
+echo "Generating merge test files for read merging tests..."
+create_merge_test_files 3 "merge_test_R1.fq" "merge_test_R2.fq" 60
+create_merge_test_files 1000 "merge_test_10k_R1.fq" "merge_test_10k_R2.fq" 100
 
 # Generate overlap test files (shorter reads that can overlap)
 echo ""
@@ -204,6 +257,9 @@ echo "All test data files created successfully!"
 echo ""
 echo "Single-end files:"
 ls -lh *.fq | grep -v "_R[12].fq"
+echo ""
+echo "Merge test files:"
+ls -lh merge_test_*.fq
 echo ""
 echo "Paired-end overlap files:"
 ls -lh overlap_*.fq

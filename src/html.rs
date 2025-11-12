@@ -102,58 +102,75 @@ fn write_body(html: &mut String, report: &FasterpReport, args: &Args) {
     // Filtering results
     write_filtering_results(html, report);
 
+    // Determine if this is paired-end
+    let is_paired_end = report.read2_before_filtering.is_some();
+
+    // Insert size estimation (only for paired-end)
+    if is_paired_end {
+        if let Some(ref insert_size) = report.insert_size {
+            write_insert_size_chart(html, insert_size);
+        }
+    }
+
     // Charts section - vertical layout
     html.push_str("<h2>Filtering Statistics</h2>\n");
 
-    // Base quality charts
+    // Read1 charts
+    if is_paired_end {
+        html.push_str(
+            "<h3 style='color: #a0a0a0; font-size: 16px; margin-top: 25px;'>Read 1</h3>\n",
+        );
+    }
+
+    // Base quality charts - Read1
     write_quality_chart(
         html,
         &report.read1_before_filtering,
         "Before filtering: Base Mean Quality",
-        "chart_before",
+        "chart_r1_before",
     );
     if let Some(ref after_stats) = report.read1_after_filtering {
         write_quality_chart(
             html,
             after_stats,
             "After filtering: Base Mean Quality",
-            "chart_after",
+            "chart_r1_after",
         );
     }
 
-    // Quality histograms
+    // Quality histograms - Read1
     write_quality_histogram(
         html,
         &report.read1_before_filtering,
         "Before filtering: Quality Score Histogram",
-        "qual_hist_before",
+        "qual_hist_r1_before",
     );
     if let Some(ref after_stats) = report.read1_after_filtering {
         write_quality_histogram(
             html,
             after_stats,
             "After filtering: Quality Score Histogram",
-            "qual_hist_after",
+            "qual_hist_r1_after",
         );
     }
 
-    // Base contents charts
+    // Base contents charts - Read1
     write_base_contents_chart(
         html,
         &report.read1_before_filtering,
         "Before filtering: Base Contents",
-        "contents_before",
+        "contents_r1_before",
     );
     if let Some(ref after_stats) = report.read1_after_filtering {
         write_base_contents_chart(
             html,
             after_stats,
             "After filtering: Base Contents",
-            "contents_after",
+            "contents_r1_after",
         );
     }
 
-    // KMER tables
+    // KMER tables - Read1
     write_kmer_table(
         html,
         &report.read1_before_filtering,
@@ -161,6 +178,67 @@ fn write_body(html: &mut String, report: &FasterpReport, args: &Args) {
     );
     if let Some(ref after_stats) = report.read1_after_filtering {
         write_kmer_table(html, after_stats, "After filtering: KMER Counting");
+    }
+
+    // Read2 charts if paired-end
+    if let Some(ref r2_before) = report.read2_before_filtering {
+        html.push_str(
+            "<h3 style='color: #a0a0a0; font-size: 16px; margin-top: 35px;'>Read 2</h3>\n",
+        );
+
+        // Base quality charts - Read2
+        write_quality_chart(
+            html,
+            r2_before,
+            "Before filtering: Base Mean Quality",
+            "chart_r2_before",
+        );
+        if let Some(ref after_stats) = report.read2_after_filtering {
+            write_quality_chart(
+                html,
+                after_stats,
+                "After filtering: Base Mean Quality",
+                "chart_r2_after",
+            );
+        }
+
+        // Quality histograms - Read2
+        write_quality_histogram(
+            html,
+            r2_before,
+            "Before filtering: Quality Score Histogram",
+            "qual_hist_r2_before",
+        );
+        if let Some(ref after_stats) = report.read2_after_filtering {
+            write_quality_histogram(
+                html,
+                after_stats,
+                "After filtering: Quality Score Histogram",
+                "qual_hist_r2_after",
+            );
+        }
+
+        // Base contents charts - Read2
+        write_base_contents_chart(
+            html,
+            r2_before,
+            "Before filtering: Base Contents",
+            "contents_r2_before",
+        );
+        if let Some(ref after_stats) = report.read2_after_filtering {
+            write_base_contents_chart(
+                html,
+                after_stats,
+                "After filtering: Base Contents",
+                "contents_r2_after",
+            );
+        }
+
+        // KMER tables - Read2
+        write_kmer_table(html, r2_before, "Before filtering: KMER Counting");
+        if let Some(ref after_stats) = report.read2_after_filtering {
+            write_kmer_table(html, after_stats, "After filtering: KMER Counting");
+        }
     }
 
     // Command info
@@ -193,11 +271,11 @@ fn write_summary(html: &mut String, report: &FasterpReport) {
     );
 
     if let Some(dup) = &report.duplication {
-        add_row(
-            html,
-            "duplication rate",
-            &format!("{:.6}%", dup.rate * 100.0),
-        );
+        add_row(html, "duplication rate", &format!("{}%", dup.rate * 100.0));
+    }
+
+    if let Some(insert_size) = &report.insert_size {
+        add_row(html, "Insert size peak", &format!("{}", insert_size.peak));
     }
 
     html.push_str("</table>\n");
@@ -216,7 +294,7 @@ fn write_before_after_comparison(html: &mut String, report: &FasterpReport) {
         html,
         "Q20 bases",
         &format!(
-            "{} <span class='badge'>{:.6}%</span>",
+            "{} <span class='badge'>{}%</span>",
             format_number(before.q20_bases),
             before.q20_rate * 100.0
         ),
@@ -225,16 +303,16 @@ fn write_before_after_comparison(html: &mut String, report: &FasterpReport) {
         html,
         "Q30 bases",
         &format!(
-            "{} <span class='badge'>{:.6}%</span>",
+            "{} <span class='badge'>{}%</span>",
             format_number(before.q30_bases),
             before.q30_rate * 100.0
         ),
     );
-    add_row(html, "Q40 bases", "0 <span class='badge'>0.000000%</span>");
+    add_row(html, "Q40 bases", "0 <span class='badge'>0%</span>");
     add_row(
         html,
         "GC content",
-        &format!("{:.6}%", before.gc_content * 100.0),
+        &format!("{}%", before.gc_content * 100.0),
     );
     html.push_str("</table>\n");
 
@@ -247,7 +325,7 @@ fn write_before_after_comparison(html: &mut String, report: &FasterpReport) {
         html,
         "Q20 bases",
         &format!(
-            "{} <span class='badge'>{:.6}%</span>",
+            "{} <span class='badge'>{}%</span>",
             format_number(after.q20_bases),
             after.q20_rate * 100.0
         ),
@@ -256,16 +334,16 @@ fn write_before_after_comparison(html: &mut String, report: &FasterpReport) {
         html,
         "Q30 bases",
         &format!(
-            "{} <span class='badge'>{:.6}%</span>",
+            "{} <span class='badge'>{}%</span>",
             format_number(after.q30_bases),
             after.q30_rate * 100.0
         ),
     );
-    add_row(html, "Q40 bases", "0 <span class='badge'>0.000000%</span>");
+    add_row(html, "Q40 bases", "0 <span class='badge'>0%</span>");
     add_row(
         html,
         "GC content",
-        &format!("{:.6}%", after.gc_content * 100.0),
+        &format!("{}%", after.gc_content * 100.0),
     );
     html.push_str("</table>\n");
 }
@@ -284,9 +362,9 @@ fn write_filtering_results(html: &mut String, report: &FasterpReport) {
 
     let calc_pct = |count: usize| -> String {
         if total > 0 {
-            format!("{:.6}%", count as f64 * 100.0 / total as f64)
+            format!("{}%", count as f64 * 100.0 / total as f64)
         } else {
-            "0.000000%".to_string()
+            "0%".to_string()
         }
     };
 
@@ -647,6 +725,59 @@ fn write_quality_chart(html: &mut String, stats: &DetailedReadStats, title: &str
     html.push_str("  plot_bgcolor: '#2a2a2a'\n");
     html.push_str("};\n");
     html.push_str(&format!("Plotly.newPlot('{div_id}', data, layout);\n"));
+    html.push_str("</script>\n");
+}
+
+fn write_insert_size_chart(html: &mut String, insert_size: &InsertSizeStats) {
+    html.push_str("<h2>Insert Size Estimation</h2>\n");
+    html.push_str("<div id='insert_size_chart' class='chart'></div>\n");
+    html.push_str("<script>\n");
+
+    // Find the last non-zero value in the histogram
+    let mut max_size = 0;
+    for (size, &count) in insert_size.histogram.iter().enumerate() {
+        if count > 0 {
+            max_size = size;
+        }
+    }
+
+    // Include all values from 0 to max_size (don't filter out zeros)
+    html.push_str("var insert_sizes = [");
+    for size in 0..=max_size {
+        if size > 0 {
+            html.push(',');
+        }
+        html.push_str(&size.to_string());
+    }
+    html.push_str("];\n");
+
+    html.push_str("var counts = [");
+    for size in 0..=max_size {
+        if size > 0 {
+            html.push(',');
+        }
+        let count = insert_size.histogram.get(size).unwrap_or(&0);
+        html.push_str(&count.to_string());
+    }
+    html.push_str("];\n");
+
+    html.push_str("var trace = {\n");
+    html.push_str("  x: insert_sizes,\n");
+    html.push_str("  y: counts,\n");
+    html.push_str("  type: 'bar',\n");
+    html.push_str("  marker: {color: '#fb8072'}\n");
+    html.push_str("};\n");
+
+    html.push_str("var data = [trace];\n");
+    html.push_str("var layout = {\n");
+    html.push_str("  xaxis: {title: 'Insert size (bp)', color: '#c0c0c0', gridcolor: '#3a3a3a'},\n");
+    html.push_str("  yaxis: {title: 'Read pairs', color: '#c0c0c0', gridcolor: '#3a3a3a'},\n");
+    html.push_str("  margin: {l: 60, r: 30, t: 30, b: 50},\n");
+    html.push_str("  showlegend: false,\n");
+    html.push_str("  paper_bgcolor: '#242424',\n");
+    html.push_str("  plot_bgcolor: '#2a2a2a'\n");
+    html.push_str("};\n");
+    html.push_str("Plotly.newPlot('insert_size_chart', data, layout);\n");
     html.push_str("</script>\n");
 }
 

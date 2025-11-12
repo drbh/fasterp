@@ -219,6 +219,8 @@ pub(crate) struct PairedEndAccumulator {
     pub pos_r2_after: PositionStats,
     pub kmer_table_r1: [usize; 1024],
     pub kmer_table_r2: [usize; 1024],
+    pub kmer_table_r1_after: [usize; 1024],
+    pub kmer_table_r2_after: [usize; 1024],
 
     // Filtering counts
     pub too_short: usize,
@@ -233,6 +235,10 @@ pub(crate) struct PairedEndAccumulator {
     // Adapter trimming stats
     pub adapter_trimmed_reads: usize,
     pub adapter_trimmed_bases: usize,
+
+    // Insert size stats (paired-end only)
+    pub insert_size_histogram: Vec<usize>,
+    pub insert_size_unknown: usize,
 }
 
 impl StreamAccumulator {
@@ -457,12 +463,7 @@ impl StreamAccumulator {
         let trimmed_gc = trimmed_stats.gc;
         let unqualified_count = trimmed_stats.unqualified;
 
-        // Apply remaining filters on TRIMMED read
-
-        if trimmed_ncnt > n_limit {
-            self.too_many_n += 1;
-            return Ok(());
-        }
+        // Apply remaining filters on TRIMMED read (match fastp's order: quality before N-bases)
 
         // Check unqualified percent (fastp -q/-u logic)
         // unqualified_count already computed by SIMD above
@@ -481,6 +482,12 @@ impl StreamAccumulator {
                 self.low_quality += 1;
                 return Ok(());
             }
+        }
+
+        // Check N-base filter (after quality check to match fastp order)
+        if trimmed_ncnt > n_limit {
+            self.too_many_n += 1;
+            return Ok(());
         }
 
         // Check low complexity (fastp -y/-Y logic)
@@ -552,6 +559,8 @@ impl PairedEndAccumulator {
             pos_r2_after: PositionStats::new(),
             kmer_table_r1: [0; 1024],
             kmer_table_r2: [0; 1024],
+            kmer_table_r1_after: [0; 1024],
+            kmer_table_r2_after: [0; 1024],
             too_short: 0,
             too_many_n: 0,
             low_quality: 0,
@@ -562,6 +571,8 @@ impl PairedEndAccumulator {
             max_cycle_r2: 0,
             adapter_trimmed_reads: 0,
             adapter_trimmed_bases: 0,
+            insert_size_histogram: vec![0; 512],  // Track insert sizes up to 512bp
+            insert_size_unknown: 0,
         }
     }
 
@@ -586,6 +597,45 @@ impl PairedEndAccumulator {
             );
         }
         map
+    }
+
+    pub(crate) fn kmer_table_to_map_r1_after(&self) -> IndexMap<String, usize> {
+        let mut map = IndexMap::new();
+        for code in 0..1024 {
+            map.insert(
+                crate::kmer::kmer_to_str(code).to_string(),
+                self.kmer_table_r1_after[code],
+            );
+        }
+        map
+    }
+
+    pub(crate) fn kmer_table_to_map_r2_after(&self) -> IndexMap<String, usize> {
+        let mut map = IndexMap::new();
+        for code in 0..1024 {
+            map.insert(
+                crate::kmer::kmer_to_str(code).to_string(),
+                self.kmer_table_r2_after[code],
+            );
+        }
+        map
+    }
+
+    /// Calculate the peak (mode) insert size from the histogram
+    pub(crate) fn calculate_insert_size_peak(&self) -> usize {
+        if self.insert_size_histogram.is_empty() {
+            return 0;
+        }
+
+        let mut max_count = 0;
+        let mut peak = 0;
+        for (size, &count) in self.insert_size_histogram.iter().enumerate() {
+            if count > max_count {
+                max_count = count;
+                peak = size;
+            }
+        }
+        peak
     }
 }
 
@@ -635,11 +685,20 @@ pub(crate) fn process_fastq_stream<R: BufRead, W: Write>(
 ///
 /// Processes two FASTQ files simultaneously, maintaining read pair synchronization.
 /// Read pairs pass/fail together - if either fails filtering, both are discarded.
-pub(crate) fn process_paired_fastq_stream<R1: BufRead, R2: BufRead, W1: Write, W2: Write>(
+pub(crate) fn process_paired_fastq_stream<
+    R1: BufRead,
+    R2: BufRead,
+    W1: Write,
+    W2: Write,
+    WM: Write,
+>(
     reader1: R1,
     reader2: R2,
     writer1: &mut W1,
     writer2: &mut W2,
+    mut merged_writer: Option<&mut WM>,
+    merge_enabled: bool,
+    include_unmerged: bool,
     min_len: usize,
     n_limit: usize,
     qualified_quality_phred: u8,
@@ -865,6 +924,21 @@ pub(crate) fn process_paired_fastq_stream<R1: BufRead, R2: BufRead, W1: Write, W
                     None
                 };
 
+                // Track insert size from overlap detection
+                if let Some(ref overlap) = overlap_result {
+                    if overlap.overlapped {
+                        // Insert size = R1_length + R2_length - overlap_length
+                        let insert_size = final_seq1.len() + final_seq2.len() - overlap.overlap_len;
+                        if insert_size < acc.insert_size_histogram.len() {
+                            acc.insert_size_histogram[insert_size] += 1;
+                        }
+                    } else {
+                        acc.insert_size_unknown += 1;
+                    }
+                } else {
+                    acc.insert_size_unknown += 1;
+                }
+
                 // Try overlap-based adapter trimming first
                 let overlap_trimmed = if let Some(ref overlap) = overlap_result {
                     if (trimming_config_r1.adapter_config.is_enabled()
@@ -1050,47 +1124,61 @@ pub(crate) fn process_paired_fastq_stream<R1: BufRead, R2: BufRead, W1: Write, W
                 let trimmed_stats2 =
                     simd::compute_stats(corrected_seq2, corrected_qual2, qualified_quality_phred);
 
-                // Check N-base filter for both reads
-                if trimmed_stats1.ncnt > n_limit || trimmed_stats2.ncnt > n_limit {
-                    acc.too_many_n += 1;
+                // Mimic fastp's per-read filtering with max() logic
+                // In fastp, all quality and N-base checks are inside qualfilter.enabled block
+                // Filter R1
+                let mut result1_fail_quality = false;
+                let mut result1_fail_n = false;
+
+                // R1: Check quality filters (fastp checks quality, then N-bases in else-if chain)
+                // Use fastp's exact comparison logic with floating point to match behavior
+                if !corrected_seq1.is_empty() {
+                    let rlen1 = corrected_seq1.len();
+                    let unqual_threshold1 = (unqualified_percent_limit * rlen1) as f64 / 100.0;
+                    if (trimmed_stats1.unqualified as f64) > unqual_threshold1 {
+                        result1_fail_quality = true;
+                    } else if average_qual > 0 {
+                        let mean_qual1 = trimmed_stats1.qsum as f64 / rlen1 as f64;
+                        if mean_qual1 < average_qual as f64 {
+                            result1_fail_quality = true;
+                        }
+                    } else if trimmed_stats1.ncnt > n_limit {
+                        // Only check N-bases if quality checks passed (fastp's else if logic)
+                        result1_fail_n = true;
+                    }
+                }
+
+                // Filter R2
+                let mut result2_fail_quality = false;
+                let mut result2_fail_n = false;
+
+                // R2: Check quality filters (fastp checks quality, then N-bases in else-if chain)
+                // Use fastp's exact comparison logic with floating point to match behavior
+                if !corrected_seq2.is_empty() {
+                    let rlen2 = corrected_seq2.len();
+                    let unqual_threshold2 = (unqualified_percent_limit * rlen2) as f64 / 100.0;
+                    if (trimmed_stats2.unqualified as f64) > unqual_threshold2 {
+                        result2_fail_quality = true;
+                    } else if average_qual > 0 {
+                        let mean_qual2 = trimmed_stats2.qsum as f64 / rlen2 as f64;
+                        if mean_qual2 < average_qual as f64 {
+                            result2_fail_quality = true;
+                        }
+                    } else if trimmed_stats2.ncnt > n_limit {
+                        // Only check N-bases if quality checks passed (fastp's else if logic)
+                        result2_fail_n = true;
+                    }
+                }
+
+                // Use max() logic like fastp: FAIL_QUALITY (20) > FAIL_N_BASE (12)
+                // If either read fails quality, count as low_quality
+                if result1_fail_quality || result2_fail_quality {
+                    acc.low_quality += 1;
                     continue;
                 }
-
-                // Check unqualified percent for both reads
-                let mut fail_quality = false;
-                if qualified_quality_phred > 0 {
-                    if !corrected_seq1.is_empty()
-                        && 100 * trimmed_stats1.unqualified
-                            > unqualified_percent_limit * corrected_seq1.len()
-                    {
-                        fail_quality = true;
-                    }
-                    if !corrected_seq2.is_empty()
-                        && 100 * trimmed_stats2.unqualified
-                            > unqualified_percent_limit * corrected_seq2.len()
-                    {
-                        fail_quality = true;
-                    }
-                }
-
-                // Check average quality for both reads
-                if average_qual > 0 {
-                    if !corrected_seq1.is_empty() {
-                        let mean_qual1 = trimmed_stats1.qsum as f64 / corrected_seq1.len() as f64;
-                        if mean_qual1 < average_qual as f64 {
-                            fail_quality = true;
-                        }
-                    }
-                    if !corrected_seq2.is_empty() {
-                        let mean_qual2 = trimmed_stats2.qsum as f64 / corrected_seq2.len() as f64;
-                        if mean_qual2 < average_qual as f64 {
-                            fail_quality = true;
-                        }
-                    }
-                }
-
-                if fail_quality {
-                    acc.low_quality += 1;
+                // Otherwise, if either read fails N-base, count as too_many_n
+                if result1_fail_n || result2_fail_n {
+                    acc.too_many_n += 1;
                     continue;
                 }
 
@@ -1125,7 +1213,108 @@ pub(crate) fn process_paired_fastq_stream<R1: BufRead, R2: BufRead, W1: Write, W
                     }
                 }
 
-                // Both reads passed - write them (with UMI-modified headers if applicable)
+                // Try to merge if merge mode enabled
+                if merge_enabled {
+                    if let Some(ref mut mwriter) = merged_writer {
+                        // Detect overlap for merging
+                        if let Some(overlap) = crate::overlap::detect_overlap(
+                            corrected_seq1,
+                            corrected_seq2,
+                            &crate::overlap::OverlapConfig::default(),
+                        ) {
+                            if overlap.overlapped {
+                                // Merge the reads
+                                let (merged_header, merged_seq, merged_qual) =
+                                    crate::overlap::merge_reads(
+                                        corrected_seq1,
+                                        corrected_qual1,
+                                        final_header1,
+                                        corrected_seq2,
+                                        corrected_qual2,
+                                        &overlap,
+                                    );
+
+                                // Write merged read
+                                writeln!(mwriter, "{}", std::str::from_utf8(&merged_header)?)?;
+                                writeln!(mwriter, "{}", std::str::from_utf8(&merged_seq)?)?;
+                                writeln!(mwriter, "+")?;
+                                writeln!(mwriter, "{}", std::str::from_utf8(&merged_qual)?)?;
+
+                                // Update "after" stats for merged read
+                                let merged_stats = simd::compute_stats(
+                                    &merged_seq,
+                                    &merged_qual,
+                                    qualified_quality_phred,
+                                );
+                                acc.after_r1.add(
+                                    merged_seq.len(),
+                                    merged_stats.q20,
+                                    merged_stats.q30,
+                                    merged_stats.gc,
+                                );
+
+                                // Track position stats for merged read
+                                track_position_stats(
+                                    &merged_seq,
+                                    &merged_qual,
+                                    &mut acc.pos_r1_after,
+                                )?;
+
+                                // Track kmers for merged read
+                                count_k5_2bit(&merged_seq, &mut acc.kmer_table_r1_after);
+
+                                continue; // Skip normal R1/R2 output
+                            }
+                        }
+
+                        // Merge failed or no overlap - write unmerged if flag set
+                        if include_unmerged {
+                            writeln!(mwriter, "{}", std::str::from_utf8(final_header1)?)?;
+                            writeln!(mwriter, "{}", std::str::from_utf8(corrected_seq1)?)?;
+                            writeln!(mwriter, "{}", std::str::from_utf8(&plus1)?)?;
+                            writeln!(mwriter, "{}", std::str::from_utf8(corrected_qual1)?)?;
+
+                            writeln!(mwriter, "{}", std::str::from_utf8(final_header2)?)?;
+                            writeln!(mwriter, "{}", std::str::from_utf8(corrected_seq2)?)?;
+                            writeln!(mwriter, "{}", std::str::from_utf8(&plus2)?)?;
+                            writeln!(mwriter, "{}", std::str::from_utf8(corrected_qual2)?)?;
+
+                            // Update "after" stats
+                            acc.after_r1.add(
+                                corrected_seq1.len(),
+                                trimmed_stats1.q20,
+                                trimmed_stats1.q30,
+                                trimmed_stats1.gc,
+                            );
+                            acc.after_r2.add(
+                                corrected_seq2.len(),
+                                trimmed_stats2.q20,
+                                trimmed_stats2.q30,
+                                trimmed_stats2.gc,
+                            );
+
+                            // Track position stats for unmerged reads
+                            track_position_stats(
+                                corrected_seq1,
+                                corrected_qual1,
+                                &mut acc.pos_r1_after,
+                            )?;
+                            track_position_stats(
+                                corrected_seq2,
+                                corrected_qual2,
+                                &mut acc.pos_r2_after,
+                            )?;
+
+                            // Track kmers for unmerged reads
+                            count_k5_2bit(corrected_seq1, &mut acc.kmer_table_r1_after);
+                            count_k5_2bit(corrected_seq2, &mut acc.kmer_table_r2_after);
+
+                            continue; // Skip normal R1/R2 output
+                        }
+                    }
+                }
+
+                // Normal output (merge disabled, or merge failed without include_unmerged)
                 writeln!(writer1, "{}", std::str::from_utf8(final_header1)?)?;
                 writeln!(writer1, "{}", std::str::from_utf8(corrected_seq1)?)?;
                 writeln!(writer1, "{}", std::str::from_utf8(&plus1)?)?;
@@ -1153,6 +1342,10 @@ pub(crate) fn process_paired_fastq_stream<R1: BufRead, R2: BufRead, W1: Write, W
                 // Track position stats for reads that passed filters (after filtering)
                 track_position_stats(corrected_seq1, corrected_qual1, &mut acc.pos_r1_after)?;
                 track_position_stats(corrected_seq2, corrected_qual2, &mut acc.pos_r2_after)?;
+
+                // Track kmers for reads that passed filters
+                count_k5_2bit(corrected_seq1, &mut acc.kmer_table_r1_after);
+                count_k5_2bit(corrected_seq2, &mut acc.kmer_table_r2_after);
             }
         }
     }
@@ -1161,7 +1354,7 @@ pub(crate) fn process_paired_fastq_stream<R1: BufRead, R2: BufRead, W1: Write, W
 }
 
 /// Helper function to track position stats for a read (after filtering)
-fn track_position_stats(seq: &[u8], qual: &[u8], pos: &mut PositionStats) -> Result<()> {
+pub(crate) fn track_position_stats(seq: &[u8], qual: &[u8], pos: &mut PositionStats) -> Result<()> {
     pos.ensure_capacity(seq.len());
 
     // SAFETY: We've validated seq.len() == qual.len(), and ensured capacity

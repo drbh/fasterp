@@ -22,25 +22,54 @@ fn main() {
 
     let mut results = Vec::new();
 
-    let test_file_small = "test_data/small_1k.fq";
-    let test_file_medium = "test_data/medium_10k.fq";
-    // let test_file_medium = "test_data/xlarge_500k.fq";
+    let test_file_50k = "test_data/large_50k.fq";
+    let test_file_500k = "test_data/xlarge_500k.fq";
+    let test_file_1m = "test_data/xlarge_1m.fq";
+    let test_file_5m = "test_data/huge_5m.fq";
 
-    // Benchmark 1: Small dataset (1k reads)
-    if let Some(result) = run_benchmark(test_file_small, "Small dataset (1k reads)", &[]) {
+    // Benchmark 1: Basic filtering - 50k reads
+    if let Some(result) = run_benchmark(test_file_50k, "Basic filtering (50k reads)", &[]) {
         results.push(result);
     }
 
-    // Benchmark 2: Medium dataset (10k reads)
-    if let Some(result) = run_benchmark(test_file_medium, "Medium dataset (10k reads)", &[]) {
+    // Benchmark 2: Basic filtering - 500k reads
+    if let Some(result) = run_benchmark(test_file_500k, "Basic filtering (500k reads)", &[]) {
         results.push(result);
     }
 
-    // Benchmark 3: Quality trimming
+    // Benchmark 3: Basic filtering - 1M reads
+    if let Some(result) = run_benchmark(test_file_1m, "Basic filtering (1M reads)", &[]) {
+        results.push(result);
+    }
+
+    // Benchmark 4: Basic filtering - 5M reads
+    if let Some(result) = run_benchmark(test_file_5m, "Basic filtering (5M reads)", &[]) {
+        results.push(result);
+    }
+
+    // Benchmark 5: Quality trimming - 5M reads
     if let Some(result) = run_benchmark(
-        test_file_medium,
-        "With quality trimming (10k reads)",
+        test_file_5m,
+        "Quality trimming (5M reads)",
         &["--cut-tail", "--cut-mean-quality", "20"],
+    ) {
+        results.push(result);
+    }
+
+    // Benchmark 6: Aggressive trimming - 5M reads
+    if let Some(result) = run_benchmark(
+        test_file_5m,
+        "Aggressive trimming (5M reads)",
+        &[
+            "--trim-front",
+            "5",
+            "--trim-tail",
+            "5",
+            "--cut-front",
+            "--cut-tail",
+            "--cut-mean-quality",
+            "20",
+        ],
     ) {
         results.push(result);
     }

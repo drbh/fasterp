@@ -35,7 +35,7 @@ Same interface and behavior, often **significantly faster** but your mileage may
 | UMI processing                |   ✓   |    ✓    |
 | Deduplication                 |   ✓   |    ✓    |
 | Output splitting              |   ✓   |    ✓    |
-| Read merging                  |   ✓   |    -    |
+| Read merging                  |   ✓   |    ✓    |
 | Rust memory safety (mostly)   |   -   |    ✓    |
 | SIMD acceleration (AVX2/NEON) |   -   |    ✓    |
 | Minimal memory usage          |   -   |    ✓    |

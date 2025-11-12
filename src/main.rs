@@ -198,11 +198,11 @@ struct Args {
     #[arg(long, default_value = "10")]
     poly_g_min_len: usize,
 
-    /// Disable adapter trimming
-    #[arg(short = 'A', long)]
+    /// Disable adapter trimming (adapter trimming is enabled by default)
+    #[arg(short = 'A', long = "disable_adapter_trimming")]
     disable_adapter_trimming: bool,
 
-    /// Adapter sequence for read1 (auto-use Illumina TruSeq if not specified)
+    /// The adapter for read1. For SE data, if not specified, the adapter will be auto-detected. For PE data, this is used if R1/R2 are found not overlapped
     #[arg(short = 'a', long = "adapter_sequence")]
     adapter_sequence: Option<String>,
 
@@ -229,6 +229,18 @@ struct Args {
     /// Maximum allowed difference percentage (0-100) (default: 20)
     #[arg(long, default_value = "20")]
     overlap_diff_percent_limit: usize,
+
+    /// Merge overlapping paired-end reads into single reads
+    #[arg(short = 'm', long)]
+    merge: bool,
+
+    /// Output file for merged reads (required when --merge is enabled)
+    #[arg(long)]
+    merged_out: Option<String>,
+
+    /// Write unmerged reads to merged output file
+    #[arg(long)]
+    include_unmerged: bool,
 
     /// Enable UMI preprocessing
     #[arg(long)]
@@ -510,6 +522,8 @@ fn build_and_write_paired_end_report(
     let qual_hist_r2_after = pe_acc.pos_r2_after.to_qual_hist();
     let kmer_map_r1 = pe_acc.kmer_table_to_map_r1();
     let kmer_map_r2 = pe_acc.kmer_table_to_map_r2();
+    let kmer_map_r1_after = pe_acc.kmer_table_to_map_r1_after();
+    let kmer_map_r2_after = pe_acc.kmer_table_to_map_r2_after();
 
     // Calculate duplication rate from combined kmer counts
     let dup_rate_r1 = stats::calculate_duplication_rate(&kmer_map_r1);
@@ -632,7 +646,7 @@ fn build_and_write_paired_end_report(
             quality_curves: quality_curves_r1_after,
             content_curves: content_curves_r1_after,
             qual_hist: qual_hist_r1_after,
-            kmer_count: IndexMap::new(),
+            kmer_count: kmer_map_r1_after,
         }),
         read2_after_filtering: Some(DetailedReadStats {
             total_reads: after_stats_r2.total_reads,
@@ -642,7 +656,7 @@ fn build_and_write_paired_end_report(
             quality_curves: quality_curves_r2_after,
             content_curves: content_curves_r2_after,
             qual_hist: qual_hist_r2_after,
-            kmer_count: IndexMap::new(),
+            kmer_count: kmer_map_r2_after,
         }),
         duplication: Some(DuplicationStats {
             rate: combined_dup_rate,
@@ -655,6 +669,11 @@ fn build_and_write_paired_end_report(
         } else {
             None
         },
+        insert_size: Some(InsertSizeStats {
+            peak: pe_acc.calculate_insert_size_peak(),
+            unknown: pe_acc.insert_size_unknown,
+            histogram: pe_acc.insert_size_histogram.clone(),
+        }),
     };
 
     // Print report to stdout (fastp-compatible format)
@@ -816,6 +835,17 @@ fn print_report_to_stdout(
         eprintln!("Duplication rate{}: {:.4}%", qualifier, dup.rate * 100.0);
     }
     eprintln!();
+
+    // Insert size peak (only for paired-end)
+    if is_paired_end {
+        if let Some(insert_size) = &report.insert_size {
+            eprintln!(
+                "Insert size peak (evaluated by paired-end reads): {}",
+                insert_size.peak
+            );
+            eprintln!();
+        }
+    }
 
     // Report files
     eprintln!("JSON report: {}", args.json);
@@ -1018,6 +1048,23 @@ fn main() -> Result<()> {
     // Determine number of threads
     let num_threads = args.threads.unwrap_or_else(num_cpus::get);
 
+    // Validate merge arguments
+    if args.merge {
+        if !is_paired_end {
+            anyhow::bail!("Merge mode requires paired-end input (-I/--in2)");
+        }
+        if args.merged_out.is_none() {
+            anyhow::bail!("Merge mode requires --merged_out to specify output file");
+        }
+        // TODO: Add multi-threaded support for merge
+        if num_threads > 1 {
+            eprintln!(
+                "Warning: Merge mode currently only supports single-threaded processing. Use -w 1 to enable merge."
+            );
+            eprintln!("Continuing without merge functionality...");
+        }
+    }
+
     // Create trimming configuration from CLI args
     let trimming_config = create_trimming_config(&args);
 
@@ -1121,11 +1168,25 @@ fn main() -> Result<()> {
                 compression,
             )?;
 
+            // Open merged output if merge mode enabled
+            let mut merged_writer_storage = if args.merge {
+                Some(split::SplitWriter::new(
+                    args.merged_out.as_ref().unwrap(),
+                    split_config.clone(),
+                    compression,
+                )?)
+            } else {
+                None
+            };
+
             let pe_acc = process_paired_fastq_stream(
                 reader1,
                 reader2,
                 &mut writer1,
                 &mut writer2,
+                merged_writer_storage.as_mut(),
+                args.merge,
+                args.include_unmerged,
                 min_len,
                 args.n_base_limit,
                 args.qualified_quality_phred,
@@ -1140,6 +1201,10 @@ fn main() -> Result<()> {
                 dedup_config.as_ref(),
             )?;
 
+            // Finish writers
+            if let Some(mw) = merged_writer_storage {
+                mw.finish()?;
+            }
             writer1.finish()?;
             writer2.finish()?;
             pe_acc
@@ -1438,6 +1503,7 @@ fn main() -> Result<()> {
         } else {
             None
         },
+        insert_size: None, // Insert size is only applicable for paired-end reads
     };
 
     // Print report to stdout (fastp-compatible format)

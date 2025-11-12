@@ -127,12 +127,16 @@ pub(crate) struct PairedWorkerResult {
     pub before_r1: SimpleStats,
     pub after_r1: SimpleStats,
     pub pos_r1: PositionStats,
+    pub pos_r1_after: PositionStats,
     pub k5_r1: [usize; 1024],
+    pub k5_r1_after: [usize; 1024],
     // R2 stats
     pub before_r2: SimpleStats,
     pub after_r2: SimpleStats,
     pub pos_r2: PositionStats,
+    pub pos_r2_after: PositionStats,
     pub k5_r2: [usize; 1024],
+    pub k5_r2_after: [usize; 1024],
     // Filter counts (shared - pairs pass/fail together)
     pub too_short: usize,
     pub too_many_n: usize,
@@ -143,6 +147,9 @@ pub(crate) struct PairedWorkerResult {
     // Adapter trimming stats
     pub adapter_trimmed_reads: usize,
     pub adapter_trimmed_bases: usize,
+    // Insert size stats
+    pub insert_size_histogram: Vec<usize>,
+    pub insert_size_unknown: usize,
 }
 
 /// Producer thread: read blocks and parse into batches
@@ -785,35 +792,76 @@ pub(crate) fn paired_producer_thread(
         let is_eof2 = bytes_read2 == 0;
 
         // Parse R1
-        let (complete_len1, recs1) = parse_fastq_buffer(&buffer1, actual_len1, is_eof1)?;
+        let (complete_len1, mut recs1) = parse_fastq_buffer(&buffer1, actual_len1, is_eof1)?;
 
         // Parse R2
-        let (complete_len2, recs2) = parse_fastq_buffer(&buffer2, actual_len2, is_eof2)?;
+        let (complete_len2, mut recs2) = parse_fastq_buffer(&buffer2, actual_len2, is_eof2)?;
 
-        // Verify same number of records
+        // Handle record count mismatch due to gzip decompression boundaries
+        // Take the minimum number of complete records from both files
+        let num_pairs = std::cmp::min(recs1.len(), recs2.len());
+
+        let adjusted_complete_len1;
+        let adjusted_complete_len2;
+
         if recs1.len() != recs2.len() {
-            anyhow::bail!(
-                "Paired-end files have different numbers of records in batch {}: R1={}, R2={}",
-                batch_id,
-                recs1.len(),
-                recs2.len()
-            );
+            // Trim to same number of records
+            if recs1.len() > num_pairs {
+                // R1 has more records - truncate and save excess to carryover
+                recs1.truncate(num_pairs);
+                // Find the byte position after the last record we're keeping
+                if num_pairs > 0 {
+                    let last_rec = recs1[num_pairs - 1];
+                    // Find end of last record (after 4th line's newline)
+                    adjusted_complete_len1 = buffer1[last_rec[3]..complete_len1]
+                        .iter()
+                        .position(|&b| b == b'\n')
+                        .map(|pos| last_rec[3] + pos + 1)
+                        .unwrap_or(complete_len1);
+                } else {
+                    adjusted_complete_len1 = 0;
+                }
+            } else {
+                adjusted_complete_len1 = complete_len1;
+            }
+
+            if recs2.len() > num_pairs {
+                // R2 has more records - truncate and save excess to carryover
+                recs2.truncate(num_pairs);
+                // Find the byte position after the last record we're keeping
+                if num_pairs > 0 {
+                    let last_rec = recs2[num_pairs - 1];
+                    // Find end of last record (after 4th line's newline)
+                    adjusted_complete_len2 = buffer2[last_rec[3]..complete_len2]
+                        .iter()
+                        .position(|&b| b == b'\n')
+                        .map(|pos| last_rec[3] + pos + 1)
+                        .unwrap_or(complete_len2);
+                } else {
+                    adjusted_complete_len2 = 0;
+                }
+            } else {
+                adjusted_complete_len2 = complete_len2;
+            }
+        } else {
+            adjusted_complete_len1 = complete_len1;
+            adjusted_complete_len2 = complete_len2;
         }
 
         // Save incomplete parts for next iteration
-        if !is_eof1 && complete_len1 < actual_len1 {
-            carryover1 = buffer1[complete_len1..actual_len1].to_vec();
+        if !is_eof1 && adjusted_complete_len1 < actual_len1 {
+            carryover1 = buffer1[adjusted_complete_len1..actual_len1].to_vec();
         }
-        if !is_eof2 && complete_len2 < actual_len2 {
-            carryover2 = buffer2[complete_len2..actual_len2].to_vec();
+        if !is_eof2 && adjusted_complete_len2 < actual_len2 {
+            carryover2 = buffer2[adjusted_complete_len2..actual_len2].to_vec();
         }
 
         // Send batch if we have records
         if !recs1.is_empty() {
             let batch = PairedBatch {
                 id: batch_id,
-                buf_r1: Arc::new(buffer1[..complete_len1].to_vec()),
-                buf_r2: Arc::new(buffer2[..complete_len2].to_vec()),
+                buf_r1: Arc::new(buffer1[..adjusted_complete_len1].to_vec()),
+                buf_r2: Arc::new(buffer2[..adjusted_complete_len2].to_vec()),
                 recs_r1: recs1,
                 recs_r2: recs2,
             };
@@ -941,12 +989,16 @@ pub(crate) fn paired_worker_thread(
         let mut before_r1 = SimpleStats::default();
         let mut after_r1 = SimpleStats::default();
         let mut pos_r1 = PositionStats::new();
+        let mut pos_r1_after = PositionStats::new();
         let mut k5_r1 = [0usize; 1024];
+        let mut k5_r1_after = [0usize; 1024];
 
         let mut before_r2 = SimpleStats::default();
         let mut after_r2 = SimpleStats::default();
         let mut pos_r2 = PositionStats::new();
+        let mut pos_r2_after = PositionStats::new();
         let mut k5_r2 = [0usize; 1024];
+        let mut k5_r2_after = [0usize; 1024];
 
         let mut too_short = 0usize;
         let mut too_many_n = 0usize;
@@ -956,6 +1008,8 @@ pub(crate) fn paired_worker_thread(
         let mut duplicated = 0usize;
         let mut adapter_trimmed_reads = 0usize;
         let mut adapter_trimmed_bases = 0usize;
+        let mut insert_size_histogram = vec![0usize; 512];
+        let mut insert_size_unknown = 0usize;
         let mut pieces = Vec::new();
 
         // Process each pair
@@ -1151,6 +1205,25 @@ pub(crate) fn paired_worker_thread(
                 final_qual1 = trimmed_qual1;
                 final_seq2 = trimmed_seq2;
                 final_qual2 = trimmed_qual2;
+            }
+
+            // Track insert size by detecting overlap
+            let overlap_for_insert_size = crate::overlap::detect_overlap(
+                final_seq1,
+                final_seq2,
+                &crate::overlap::OverlapConfig::default(),
+            );
+            if let Some(overlap) = overlap_for_insert_size {
+                if overlap.overlapped {
+                    let insert_size = final_seq1.len() + final_seq2.len() - overlap.overlap_len;
+                    if insert_size < insert_size_histogram.len() {
+                        insert_size_histogram[insert_size] += 1;
+                    }
+                } else {
+                    insert_size_unknown += 1;
+                }
+            } else {
+                insert_size_unknown += 1;
             }
 
             // Check length filter (EITHER read too short = BOTH fail)
@@ -1374,6 +1447,14 @@ pub(crate) fn paired_worker_thread(
                 trimmed_stats2.q30,
                 trimmed_stats2.gc,
             );
+
+            // Track position stats for reads that passed filters
+            crate::processor::track_position_stats(final_seq1, final_qual1, &mut pos_r1_after).ok();
+            crate::processor::track_position_stats(final_seq2, final_qual2, &mut pos_r2_after).ok();
+
+            // Track kmers for reads that passed filters
+            count_k5_2bit(final_seq1, &mut k5_r1_after);
+            count_k5_2bit(final_seq2, &mut k5_r2_after);
         }
 
         let result = PairedWorkerResult {
@@ -1382,11 +1463,15 @@ pub(crate) fn paired_worker_thread(
             before_r1,
             after_r1,
             pos_r1,
+            pos_r1_after,
             k5_r1,
+            k5_r1_after,
             before_r2,
             after_r2,
             pos_r2,
+            pos_r2_after,
             k5_r2,
+            k5_r2_after,
             too_short,
             too_many_n,
             low_quality,
@@ -1395,6 +1480,8 @@ pub(crate) fn paired_worker_thread(
             duplicated,
             adapter_trimmed_reads,
             adapter_trimmed_bases,
+            insert_size_histogram,
+            insert_size_unknown,
         };
 
         if sender.send(Some(result)).is_err() {
@@ -1451,6 +1538,11 @@ fn update_position_stats(pos: &mut PositionStats, seq: &[u8], qual: &[u8]) {
         if let Some(bi) = base_idx(b) {
             pos.base_sum[bi][i] += qval;
             pos.base_cnt[bi][i] += 1;
+        }
+
+        // Track quality histogram
+        if qval < 94 {
+            pos.qual_hist[qval as usize] += 1;
         }
     }
 }
@@ -1615,6 +1707,10 @@ pub(crate) fn paired_merger_thread(
                             acc.pos_r1.base_cnt[b][i] += result.pos_r1.base_cnt[b][i];
                         }
                     }
+                    // Merge quality histogram - R1 before filtering
+                    for (i, &count) in result.pos_r1.qual_hist.iter().enumerate() {
+                        acc.pos_r1.qual_hist[i] += count;
+                    }
 
                     // Merge position stats - R2
                     acc.pos_r2.ensure_capacity(result.pos_r2.total_sum.len());
@@ -1626,12 +1722,56 @@ pub(crate) fn paired_merger_thread(
                             acc.pos_r2.base_cnt[b][i] += result.pos_r2.base_cnt[b][i];
                         }
                     }
+                    // Merge quality histogram - R2 before filtering
+                    for (i, &count) in result.pos_r2.qual_hist.iter().enumerate() {
+                        acc.pos_r2.qual_hist[i] += count;
+                    }
+
+                    // Merge position stats after filtering - R1
+                    acc.pos_r1_after
+                        .ensure_capacity(result.pos_r1_after.total_sum.len());
+                    for i in 0..result.pos_r1_after.total_sum.len() {
+                        acc.pos_r1_after.total_sum[i] += result.pos_r1_after.total_sum[i];
+                        acc.pos_r1_after.total_cnt[i] += result.pos_r1_after.total_cnt[i];
+                        for b in 0..4 {
+                            acc.pos_r1_after.base_sum[b][i] += result.pos_r1_after.base_sum[b][i];
+                            acc.pos_r1_after.base_cnt[b][i] += result.pos_r1_after.base_cnt[b][i];
+                        }
+                    }
+
+                    // Merge position stats after filtering - R2
+                    acc.pos_r2_after
+                        .ensure_capacity(result.pos_r2_after.total_sum.len());
+                    for i in 0..result.pos_r2_after.total_sum.len() {
+                        acc.pos_r2_after.total_sum[i] += result.pos_r2_after.total_sum[i];
+                        acc.pos_r2_after.total_cnt[i] += result.pos_r2_after.total_cnt[i];
+                        for b in 0..4 {
+                            acc.pos_r2_after.base_sum[b][i] += result.pos_r2_after.base_sum[b][i];
+                            acc.pos_r2_after.base_cnt[b][i] += result.pos_r2_after.base_cnt[b][i];
+                        }
+                    }
+
+                    // Merge quality histograms for after filtering
+                    for (i, &count) in result.pos_r1_after.qual_hist.iter().enumerate() {
+                        acc.pos_r1_after.qual_hist[i] += count;
+                    }
+                    for (i, &count) in result.pos_r2_after.qual_hist.iter().enumerate() {
+                        acc.pos_r2_after.qual_hist[i] += count;
+                    }
 
                     for (i, &count) in result.k5_r1.iter().enumerate() {
                         acc.kmer_table_r1[i] += count;
                     }
                     for (i, &count) in result.k5_r2.iter().enumerate() {
                         acc.kmer_table_r2[i] += count;
+                    }
+
+                    // Merge kmer tables for after filtering
+                    for (i, &count) in result.k5_r1_after.iter().enumerate() {
+                        acc.kmer_table_r1_after[i] += count;
+                    }
+                    for (i, &count) in result.k5_r2_after.iter().enumerate() {
+                        acc.kmer_table_r2_after[i] += count;
                     }
 
                     acc.too_short += result.too_short;
@@ -1644,6 +1784,14 @@ pub(crate) fn paired_merger_thread(
                     // Merge adapter trimming stats
                     acc.adapter_trimmed_reads += result.adapter_trimmed_reads;
                     acc.adapter_trimmed_bases += result.adapter_trimmed_bases;
+
+                    // Merge insert size histograms
+                    for (i, &count) in result.insert_size_histogram.iter().enumerate() {
+                        if i < acc.insert_size_histogram.len() {
+                            acc.insert_size_histogram[i] += count;
+                        }
+                    }
+                    acc.insert_size_unknown += result.insert_size_unknown;
 
                     if result.pos_r1.total_sum.len() > acc.max_cycle_r1 {
                         acc.max_cycle_r1 = result.pos_r1.total_sum.len();

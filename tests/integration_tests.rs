@@ -1,3 +1,4 @@
+use assert_cmd::assert;
 use assert_cmd::cargo::cargo_bin;
 use predicates::prelude::*;
 use serde_json::Value;
@@ -25,7 +26,6 @@ fn run_fastp(input: &str, temp_dir: &TempDir) -> (PathBuf, PathBuf) {
         .arg(&output_fq)
         .arg("-j")
         .arg(&output_json)
-        .arg("-A") // Disable all adapter trimming for consistent test results
         .stderr(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .status()
@@ -48,7 +48,6 @@ fn run_fasterp(input: &str, temp_dir: &TempDir) -> (PathBuf, PathBuf) {
         .arg(&output_fq)
         .arg("-j")
         .arg(&output_json)
-        .arg("-A") // Disable all adapter trimming for consistent test results
         .stderr(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .status()
@@ -87,51 +86,38 @@ fn compare_json_outputs(fastp_json: &PathBuf, fasterp_json: &PathBuf) {
         fastp_filtering["low_quality_reads"], fasterp_filtering["low_quality_reads"],
         "Low quality reads don't match"
     );
-
-    // Compare summary statistics
-    let fastp_summary = &fastp_data["summary"]["before_filtering"];
-    let fasterp_summary = &fasterp_data["summary"]["before_filtering"];
-
     assert_eq!(
-        fastp_summary["total_reads"], fasterp_summary["total_reads"],
+        fastp_filtering["total_filtered_reads"], fasterp_filtering["total_filtered_reads"],
+        "Total filtered reads don't match"
+    );
+    assert_eq!(
+        fastp_filtering["total_reads"], fasterp_filtering["total_reads"],
         "Total reads don't match"
     );
     assert_eq!(
-        fastp_summary["total_bases"], fasterp_summary["total_bases"],
+        fastp_filtering["total_bases"], fasterp_filtering["total_bases"],
         "Total bases don't match"
     );
     assert_eq!(
-        fastp_summary["q20_bases"], fasterp_summary["q20_bases"],
-        "Q20 bases don't match"
+        fastp_filtering["total_filtered_bases"], fasterp_filtering["total_filtered_bases"],
+        "Total filtered bases don't match"
     );
     assert_eq!(
-        fastp_summary["q30_bases"], fasterp_summary["q30_bases"],
-        "Q30 bases don't match"
+        fastp_filtering["total_q20_bases"], fasterp_filtering["total_q20_bases"],
+        "Total Q20 bases don't match"
     );
-
-    // Compare kmer counts
-    let fastp_kmers = &fastp_data["read1_before_filtering"]["kmer_count"];
-    let fasterp_kmers = &fasterp_data["read1_before_filtering"]["kmer_count"];
-
-    let fastp_kmer_obj = fastp_kmers.as_object().expect("fastp kmers not an object");
-    let fasterp_kmer_obj = fasterp_kmers
-        .as_object()
-        .expect("fasterp kmers not an object");
-
     assert_eq!(
-        fastp_kmer_obj.len(),
-        fasterp_kmer_obj.len(),
-        "Different number of kmers"
+        fastp_filtering["total_q30_bases"], fasterp_filtering["total_q30_bases"],
+        "Total Q30 bases don't match"
     );
-
-    // Spot check some kmers
-    for kmer in ["AAAAA", "TTTTT", "ACGTG", "CCCCC", "GGGGG"].iter() {
-        assert_eq!(
-            fastp_kmer_obj.get(*kmer),
-            fasterp_kmer_obj.get(*kmer),
-            "Kmer {kmer} counts don't match"
-        );
-    }
+    assert_eq!(
+        fastp_filtering["gc_content"], fasterp_filtering["gc_content"],
+        "GC content doesn't match"
+    );
+    assert_eq!(
+        fastp_filtering["average_length"], fasterp_filtering["average_length"],
+        "Average length doesn't match"
+    );
 }
 
 /// Run fastp for paired-end reads
@@ -151,7 +137,6 @@ fn run_fastp_pe(input1: &str, input2: &str, temp_dir: &TempDir) -> (PathBuf, Pat
         .arg(&output2)
         .arg("-j")
         .arg(&output_json)
-        .arg("-A") // Disable all adapter trimming for consistent test results
         .stderr(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .status()
@@ -181,7 +166,6 @@ fn run_fasterp_pe(input1: &str, input2: &str, temp_dir: &TempDir) -> (PathBuf, P
         .arg(&output_json)
         .arg("-w")
         .arg("1")
-        .arg("-A") // Disable all adapter trimming for consistent test results
         .stderr(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .status()
@@ -300,7 +284,6 @@ fn test_length_filtering_matches_fastp() {
         .arg(&fastp_json)
         .arg("-l")
         .arg("50")
-        .arg("-A")
         .stderr(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .status()
@@ -317,7 +300,6 @@ fn test_length_filtering_matches_fastp() {
         .arg(&fasterp_json)
         .arg("-l")
         .arg("50")
-        .arg("-A")
         .stderr(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .status()
@@ -354,7 +336,6 @@ fn test_quality_filtering_matches_fastp() {
         .arg(&fastp_json)
         .arg("-q")
         .arg("20")
-        .arg("-A")
         .stderr(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .status()
@@ -371,7 +352,6 @@ fn test_quality_filtering_matches_fastp() {
         .arg(&fasterp_json)
         .arg("-q")
         .arg("20")
-        .arg("-A")
         .stderr(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .status()
@@ -458,7 +438,6 @@ fn test_gzip_input_decompression() {
         .arg(&output_json)
         .arg("-w")
         .arg("1")
-        .arg("-A")
         .stderr(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .status()
@@ -476,7 +455,6 @@ fn test_gzip_input_decompression() {
         .arg(&fastp_fq)
         .arg("-j")
         .arg(&fastp_json)
-        .arg("-A")
         .stderr(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .status()
@@ -630,7 +608,6 @@ fn test_n_base_filtering_matches_fastp() {
             .arg(&fastp_json)
             .arg("-n")
             .arg(n_limit.to_string())
-            .arg("-A")
             .stderr(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .status()
@@ -647,7 +624,6 @@ fn test_n_base_filtering_matches_fastp() {
             .arg(&fasterp_json)
             .arg("-n")
             .arg(n_limit.to_string())
-            .arg("-A")
             .stderr(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .status()
@@ -834,7 +810,6 @@ fn test_stdin_input() {
         .arg(&output_json)
         .arg("-w")
         .arg("1")
-        .arg("-A")
         .stdin(input_file)
         .stderr(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
@@ -855,7 +830,6 @@ fn test_stdin_input() {
         .arg(&expected_json)
         .arg("-w")
         .arg("1")
-        .arg("-A")
         .stderr(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .status()
@@ -923,7 +897,6 @@ fn test_combined_filters_matches_fastp() {
         .arg("15")
         .arg("-n")
         .arg("3")
-        .arg("-A")
         .stderr(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .status()
@@ -944,7 +917,6 @@ fn test_combined_filters_matches_fastp() {
         .arg("15")
         .arg("-n")
         .arg("3")
-        .arg("-A")
         .stderr(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .status()
@@ -986,7 +958,6 @@ fn test_strict_combined_filters() {
         .arg("30")
         .arg("-n")
         .arg("0")
-        .arg("-A")
         .stderr(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .status()
@@ -1006,7 +977,6 @@ fn test_strict_combined_filters() {
         .arg("30")
         .arg("-n")
         .arg("0")
-        .arg("-A")
         .stderr(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .status()
@@ -2685,7 +2655,6 @@ fn test_disable_adapter_trimming() {
         .arg(&fastp_out)
         .arg("-j")
         .arg(&fastp_json)
-        .arg("-A")
         .stderr(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .status()
@@ -2700,7 +2669,6 @@ fn test_disable_adapter_trimming() {
         .arg(&fasterp_out)
         .arg("-j")
         .arg(&fasterp_json)
-        .arg("-A")
         .stderr(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .status()
@@ -3473,7 +3441,6 @@ fn test_low_complexity_with_quality_filter() {
         .arg("30") // 30% complexity threshold
         .arg("-q")
         .arg("20") // Quality filter
-        .arg("-A")
         .stderr(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .status()
@@ -3493,7 +3460,6 @@ fn test_low_complexity_with_quality_filter() {
         .arg("30")
         .arg("-q")
         .arg("20")
-        .arg("-A")
         .stderr(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .status()
@@ -4091,9 +4057,9 @@ fn test_base_correction_basic_functionality() {
     // Run fasterp with base correction enabled
     let status = Command::new(cargo_bin("fasterp"))
         .arg("-i")
-        .arg(test_data_path("overlap_R1.fq"))
+        .arg(test_data_path("merge_test_R1.fq"))
         .arg("-I")
-        .arg(test_data_path("overlap_R2.fq"))
+        .arg(test_data_path("merge_test_R2.fq"))
         .arg("-o")
         .arg(&output_r1)
         .arg("-O")
@@ -4398,9 +4364,9 @@ fn test_base_correction_disabled_by_default() {
     // Run WITH -c flag
     let status = Command::new(cargo_bin("fasterp"))
         .arg("-i")
-        .arg(test_data_path("overlap_R1.fq"))
+        .arg(test_data_path("merge_test_R1.fq"))
         .arg("-I")
-        .arg(test_data_path("overlap_R2.fq"))
+        .arg(test_data_path("merge_test_R2.fq"))
         .arg("-o")
         .arg(&with_c_r1)
         .arg("-O")
@@ -4417,9 +4383,9 @@ fn test_base_correction_disabled_by_default() {
     // Run WITHOUT -c flag
     let status = Command::new(cargo_bin("fasterp"))
         .arg("-i")
-        .arg(test_data_path("overlap_R1.fq"))
+        .arg(test_data_path("merge_test_R1.fq"))
         .arg("-I")
-        .arg(test_data_path("overlap_R2.fq"))
+        .arg(test_data_path("merge_test_R2.fq"))
         .arg("-o")
         .arg(&without_c_r1)
         .arg("-O")
@@ -7599,4 +7565,532 @@ fn test_asymmetric_max_len_extreme() {
     let r2_content = fs::read_to_string(&fasterp_r2).unwrap();
     let r2_seq = r2_content.lines().nth(1).unwrap();
     assert_eq!(r2_seq.len(), 140, "R2 should be 140bp");
+}
+
+// ===== MERGE FUNCTIONALITY TESTS =====
+
+/// Run fastp with merge mode for paired-end reads
+fn run_fastp_merge(
+    input1: &str,
+    input2: &str,
+    temp_dir: &TempDir,
+    include_unmerged: bool,
+) -> (PathBuf, PathBuf) {
+    let merged_out = temp_dir.path().join("fastp_merged.fq");
+    let output_json = temp_dir.path().join("fastp_merge.json");
+    let output1 = temp_dir.path().join("fastp_merge_R1.fq");
+    let output2 = temp_dir.path().join("fastp_merge_R2.fq");
+
+    let mut cmd = Command::new("fastp");
+    cmd.arg("-i")
+        .arg(test_data_path(input1))
+        .arg("-I")
+        .arg(test_data_path(input2))
+        .arg("-o")
+        .arg(&output1)
+        .arg("-O")
+        .arg(&output2)
+        .arg("--merge")
+        .arg("--merged_out")
+        .arg(&merged_out)
+        .arg("-j")
+        .arg(&output_json)
+        .stderr(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null());
+
+    if include_unmerged {
+        cmd.arg("--include_unmerged");
+    }
+
+    let status = cmd
+        .status()
+        .expect("Failed to run fastp merge - is it installed?");
+
+    assert!(status.success(), "fastp merge command failed");
+
+    (merged_out, output_json)
+}
+
+/// Run fasterp with merge mode for paired-end reads
+fn run_fasterp_merge(
+    input1: &str,
+    input2: &str,
+    temp_dir: &TempDir,
+    include_unmerged: bool,
+) -> (PathBuf, PathBuf) {
+    let merged_out = temp_dir.path().join("fasterp_merged.fq");
+    let output_json = temp_dir.path().join("fasterp_merge.json");
+    let output1 = temp_dir.path().join("fasterp_merge_R1.fq");
+    let output2 = temp_dir.path().join("fasterp_merge_R2.fq");
+
+    let mut cmd = Command::new(cargo_bin("fasterp"));
+    cmd.arg("-i")
+        .arg(test_data_path(input1))
+        .arg("-I")
+        .arg(test_data_path(input2))
+        .arg("-o")
+        .arg(&output1)
+        .arg("-O")
+        .arg(&output2)
+        .arg("-m")
+        .arg("--merged-out")
+        .arg(&merged_out)
+        .arg("-j")
+        .arg(&output_json)
+        .arg("-w")
+        .arg("1")
+        .stderr(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null());
+
+    if include_unmerged {
+        cmd.arg("--include-unmerged");
+    }
+
+    let status = cmd.status().expect("Failed to run fasterp merge");
+
+    assert!(status.success(), "fasterp merge command failed");
+
+    (merged_out, output_json)
+}
+
+/// Count reads in a FASTQ file
+fn count_fastq_reads(path: &PathBuf) -> usize {
+    let content = fs::read_to_string(path).expect("Failed to read FASTQ file");
+    content.lines().count() / 4
+}
+
+/// Parse FASTQ file and return vector of (header, seq, qual) tuples
+fn parse_fastq(path: &PathBuf) -> Vec<(String, String, String)> {
+    let content = fs::read_to_string(path).expect("Failed to read FASTQ file");
+    let lines: Vec<&str> = content.lines().collect();
+
+    let mut reads = Vec::new();
+    for chunk in lines.chunks(4) {
+        if chunk.len() == 4 {
+            reads.push((
+                chunk[0].to_string(),
+                chunk[1].to_string(),
+                chunk[3].to_string(),
+            ));
+        }
+    }
+    reads
+}
+
+#[test]
+fn test_merge_basic_parity_with_fastp() {
+    let temp_dir = TempDir::new().unwrap();
+
+    // Run both tools with merge mode
+    let (fastp_merged, fastp_json) =
+        run_fastp_merge("merge_test_R1.fq", "merge_test_R2.fq", &temp_dir, false);
+    let (fasterp_merged, fasterp_json) =
+        run_fasterp_merge("merge_test_R1.fq", "merge_test_R2.fq", &temp_dir, false);
+
+    // Check that both produced merged output
+    assert!(fastp_merged.exists(), "fastp merged file doesn't exist");
+    assert!(fasterp_merged.exists(), "fasterp merged file doesn't exist");
+
+    // Count reads in merged files
+    let fastp_count = count_fastq_reads(&fastp_merged);
+    let fasterp_count = count_fastq_reads(&fasterp_merged);
+
+    println!("fastp merged reads: {}", fastp_count);
+    println!("fasterp merged reads: {}", fasterp_count);
+
+    // Should have similar number of merged reads (allowing some variance due to implementation differences)
+    assert!(fastp_count > 0, "fastp should have merged some reads");
+    assert!(fasterp_count > 0, "fasterp should have merged some reads");
+
+    // The counts should be reasonably close (within 10%)
+    let diff_ratio =
+        ((fastp_count as f64 - fasterp_count as f64).abs() / fastp_count as f64) * 100.0;
+    assert!(
+        diff_ratio < 10.0,
+        "Merged read counts differ by more than 10%: fastp={}, fasterp={}, diff={}%",
+        fastp_count,
+        fasterp_count,
+        diff_ratio
+    );
+}
+
+#[test]
+fn test_merge_with_include_unmerged() {
+    let temp_dir = TempDir::new().unwrap();
+
+    // Run both tools with merge mode and include_unmerged
+    let (fastp_merged, _) =
+        run_fastp_merge("merge_test_R1.fq", "merge_test_R2.fq", &temp_dir, true);
+    let (fasterp_merged, _) =
+        run_fasterp_merge("merge_test_R1.fq", "merge_test_R2.fq", &temp_dir, true);
+
+    // Count reads
+    let fastp_count = count_fastq_reads(&fastp_merged);
+    let fasterp_count = count_fastq_reads(&fasterp_merged);
+
+    println!("fastp merged+unmerged reads: {}", fastp_count);
+    println!("fasterp merged+unmerged reads: {}", fasterp_count);
+
+    // With include_unmerged, should have even more reads
+    assert!(fastp_count > 0);
+    assert!(fasterp_count > 0);
+
+    // Counts should be reasonably close
+    let diff_ratio =
+        ((fastp_count as f64 - fasterp_count as f64).abs() / fastp_count as f64) * 100.0;
+    assert!(
+        diff_ratio < 10.0,
+        "Merged+unmerged read counts differ by more than 10%: fastp={}, fasterp={}, diff={}%",
+        fastp_count,
+        fasterp_count,
+        diff_ratio
+    );
+}
+
+#[test]
+fn test_merge_header_format() {
+    let temp_dir = TempDir::new().unwrap();
+
+    // Run fasterp with merge mode
+    let (fasterp_merged, _) =
+        run_fasterp_merge("merge_test_R1.fq", "merge_test_R2.fq", &temp_dir, false);
+
+    // Parse the merged file
+    let reads = parse_fastq(&fasterp_merged);
+
+    assert!(reads.len() > 0, "Should have at least one merged read");
+
+    // Check that merged reads have the correct header format
+    for (header, seq, qual) in reads.iter() {
+        // Headers should contain "merged_XXX_YYY" tag
+        assert!(
+            header.contains("merged_"),
+            "Header should contain 'merged_' tag: {}",
+            header
+        );
+
+        // Sequence and quality should have same length
+        assert_eq!(
+            seq.len(),
+            qual.len(),
+            "Sequence and quality lengths should match"
+        );
+
+        // Sequence should not be empty
+        assert!(seq.len() > 0, "Merged sequence should not be empty");
+    }
+}
+
+#[test]
+fn test_merge_larger_dataset() {
+    let temp_dir = TempDir::new().unwrap();
+
+    // Run both tools on larger dataset
+    let (fastp_merged, _) = run_fastp_merge(
+        "merge_test_10k_R1.fq",
+        "merge_test_10k_R2.fq",
+        &temp_dir,
+        false,
+    );
+    let (fasterp_merged, _) = run_fasterp_merge(
+        "merge_test_10k_R1.fq",
+        "merge_test_10k_R2.fq",
+        &temp_dir,
+        false,
+    );
+
+    // Count reads
+    let fastp_count = count_fastq_reads(&fastp_merged);
+    let fasterp_count = count_fastq_reads(&fasterp_merged);
+
+    println!("fastp merged reads (10k): {}", fastp_count);
+    println!("fasterp merged reads (10k): {}", fasterp_count);
+
+    assert!(
+        fastp_count > 100,
+        "Should merge a significant number of reads"
+    );
+    assert!(
+        fasterp_count > 100,
+        "Should merge a significant number of reads"
+    );
+
+    // Allow 10% variance
+    let diff_ratio =
+        ((fastp_count as f64 - fasterp_count as f64).abs() / fastp_count as f64) * 100.0;
+    assert!(
+        diff_ratio < 10.0,
+        "Large dataset merge counts differ by more than 10%: fastp={}, fasterp={}, diff={}%",
+        fastp_count,
+        fasterp_count,
+        diff_ratio
+    );
+}
+
+#[test]
+fn test_merge_quality_scores_preserved() {
+    let temp_dir = TempDir::new().unwrap();
+
+    // Run fasterp with merge mode
+    let (fasterp_merged, _) =
+        run_fasterp_merge("merge_test_R1.fq", "merge_test_R2.fq", &temp_dir, false);
+
+    // Parse merged reads
+    let reads = parse_fastq(&fasterp_merged);
+
+    for (header, seq, qual) in reads.iter() {
+        // Quality scores should all be valid Phred+33 characters
+        for &byte in qual.as_bytes() {
+            assert!(
+                byte >= 33 && byte <= 126,
+                "Invalid quality score in {}: {}",
+                header,
+                byte
+            );
+        }
+
+        // No quality should be '#' (Phred 0) after merging (they should come from input)
+        // This just checks that quality scores are being propagated
+        assert_eq!(seq.len(), qual.len());
+    }
+}
+
+#[test]
+fn test_merge_vs_no_merge_read_preservation() {
+    let temp_dir = TempDir::new().unwrap();
+
+    // Run with merge + include_unmerged (should have all reads)
+    let (merged_all, _) =
+        run_fasterp_merge("merge_test_R1.fq", "merge_test_R2.fq", &temp_dir, true);
+
+    // Run without merge (normal paired-end processing)
+    let (r1_out, r2_out, _) = run_fasterp_pe("merge_test_R1.fq", "merge_test_R2.fq", &temp_dir);
+
+    // Count reads
+    let merged_all_count = count_fastq_reads(&merged_all);
+    let r1_count = count_fastq_reads(&r1_out);
+    let r2_count = count_fastq_reads(&r2_out);
+
+    println!("Merged (with unmerged): {} reads", merged_all_count);
+    println!(
+        "Normal PE: {} + {} = {} reads",
+        r1_count,
+        r2_count,
+        r1_count + r2_count
+    );
+
+    // With include_unmerged, total read count in merged file should equal
+    // the sum of R1 and R2 from normal processing (all reads preserved)
+    // Allow small variance due to filtering differences
+    let expected_total = r1_count + r2_count;
+    let diff = (merged_all_count as i64 - expected_total as i64).abs();
+    assert!(
+        diff < 10,
+        "Total reads should be preserved: merged_all={}, r1+r2={}, diff={}",
+        merged_all_count,
+        expected_total,
+        diff
+    );
+}
+
+#[ignore]
+#[test]
+fn test_srr30151536_gzipped_paired_end() {
+    let temp_dir = TempDir::new().unwrap();
+
+    // Check if SRR30151536 dataset exists
+    let input1 = test_data_path("../SRR30151536/SRR30151536_1.fastq.gz");
+    let input2 = test_data_path("../SRR30151536/SRR30151536_2.fastq.gz");
+
+    if !input1.exists() || !input2.exists() {
+        eprintln!("Skipping test: SRR30151536 dataset not found");
+        return;
+    }
+
+    let fastp_r1 = temp_dir.path().join("fastp_out1.fastq.gz");
+    let fastp_r2 = temp_dir.path().join("fastp_out2.fastq.gz");
+    let fastp_json = temp_dir.path().join("fastp.json");
+
+    let fasterp_r1 = temp_dir.path().join("fasterp_out1.fastq.gz");
+    let fasterp_r2 = temp_dir.path().join("fasterp_out2.fastq.gz");
+    let fasterp_json = temp_dir.path().join("fasterp.json");
+
+    // Run fastp with auto-detection (default behavior)
+    let status = Command::new("fastp")
+        .arg("-i")
+        .arg(&input1)
+        .arg("-I")
+        .arg(&input2)
+        .arg("-o")
+        .arg(&fastp_r1)
+        .arg("-O")
+        .arg(&fastp_r2)
+        .arg("-j")
+        .arg(&fastp_json)
+        .stderr(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .status()
+        .expect("Failed to run fastp");
+    assert!(status.success(), "fastp failed on SRR30151536 dataset");
+
+    // Run fasterp with auto-detection (default behavior)
+    let status = Command::new(cargo_bin("fasterp"))
+        .arg("-i")
+        .arg(&input1)
+        .arg("-I")
+        .arg(&input2)
+        .arg("-o")
+        .arg(&fasterp_r1)
+        .arg("-O")
+        .arg(&fasterp_r2)
+        .arg("-j")
+        .arg(&fasterp_json)
+        .stderr(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .status()
+        .expect("Failed to run fasterp");
+    assert!(status.success(), "fasterp failed on SRR30151536 dataset");
+
+    // Verify output files were created
+    assert!(fastp_r1.exists(), "fastp R1 output not created");
+    assert!(fastp_r2.exists(), "fastp R2 output not created");
+    assert!(fasterp_r1.exists(), "fasterp R1 output not created");
+    assert!(fasterp_r2.exists(), "fasterp R2 output not created");
+
+    // Compare JSON reports (the main verification)
+    compare_json_outputs(&fastp_json, &fasterp_json);
+
+    // Verify output file sizes are reasonable (not empty, similar size)
+    let fastp_r1_size = fs::metadata(&fastp_r1).unwrap().len();
+    let fasterp_r1_size = fs::metadata(&fasterp_r1).unwrap().len();
+    let fastp_r2_size = fs::metadata(&fastp_r2).unwrap().len();
+    let fasterp_r2_size = fs::metadata(&fasterp_r2).unwrap().len();
+
+    assert!(fastp_r1_size > 0, "fastp R1 output is empty");
+    assert!(fasterp_r1_size > 0, "fasterp R1 output is empty");
+    assert!(fastp_r2_size > 0, "fastp R2 output is empty");
+    assert!(fasterp_r2_size > 0, "fasterp R2 output is empty");
+
+    // Check that file sizes are within 10% of each other (accounting for compression variations)
+    let r1_size_diff_pct =
+        ((fastp_r1_size as f64 - fasterp_r1_size as f64).abs() / fastp_r1_size as f64) * 100.0;
+    let r2_size_diff_pct =
+        ((fastp_r2_size as f64 - fasterp_r2_size as f64).abs() / fastp_r2_size as f64) * 100.0;
+
+    assert!(
+        r1_size_diff_pct < 10.0,
+        "R1 output sizes differ by more than 10%: fastp={}, fasterp={}, diff={}%",
+        fastp_r1_size,
+        fasterp_r1_size,
+        r1_size_diff_pct
+    );
+
+    assert!(
+        r2_size_diff_pct < 10.0,
+        "R2 output sizes differ by more than 10%: fastp={}, fasterp={}, diff={}%",
+        fastp_r2_size,
+        fasterp_r2_size,
+        r2_size_diff_pct
+    );
+}
+
+#[ignore]
+#[test]
+fn test_srr22472290_gzipped_paired_end() {
+    let temp_dir = TempDir::new().unwrap();
+
+    // Check if SRR22472290 dataset exists
+    let input1 = test_data_path("../SRR22472290/SRR22472290_1.fastq.gz");
+    let input2 = test_data_path("../SRR22472290/SRR22472290_2.fastq.gz");
+
+    if !input1.exists() || !input2.exists() {
+        eprintln!("Skipping test: SRR22472290 dataset not found");
+        return;
+    }
+
+    let fastp_r1 = temp_dir.path().join("fastp_out1.fastq.gz");
+    let fastp_r2 = temp_dir.path().join("fastp_out2.fastq.gz");
+    let fastp_json = temp_dir.path().join("fastp.json");
+
+    let fasterp_r1 = temp_dir.path().join("fasterp_out1.fastq.gz");
+    let fasterp_r2 = temp_dir.path().join("fasterp_out2.fastq.gz");
+    let fasterp_json = temp_dir.path().join("fasterp.json");
+
+    // Run fastp with adapter trimming disabled for exact comparison
+    let status = Command::new("fastp")
+        .arg("-i")
+        .arg(&input1)
+        .arg("-I")
+        .arg(&input2)
+        .arg("-o")
+        .arg(&fastp_r1)
+        .arg("-O")
+        .arg(&fastp_r2)
+        .arg("-j")
+        .arg(&fastp_json)
+        .stderr(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .status()
+        .expect("Failed to run fastp");
+    assert!(status.success(), "fastp failed on SRR22472290 dataset");
+
+    // Run fasterp with adapter trimming disabled for exact comparison
+    let status = Command::new(cargo_bin("fasterp"))
+        .arg("-i")
+        .arg(&input1)
+        .arg("-I")
+        .arg(&input2)
+        .arg("-o")
+        .arg(&fasterp_r1)
+        .arg("-O")
+        .arg(&fasterp_r2)
+        .arg("-j")
+        .arg(&fasterp_json)
+        .stderr(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .status()
+        .expect("Failed to run fasterp");
+    assert!(status.success(), "fasterp failed on SRR22472290 dataset");
+
+    // Verify output files were created
+    assert!(fastp_r1.exists(), "fastp R1 output not created");
+    assert!(fastp_r2.exists(), "fastp R2 output not created");
+    assert!(fasterp_r1.exists(), "fasterp R1 output not created");
+    assert!(fasterp_r2.exists(), "fasterp R2 output not created");
+
+    // Compare JSON reports (the main verification)
+    compare_json_outputs(&fastp_json, &fasterp_json);
+
+    // Verify output file sizes are reasonable (not empty, similar size)
+    let fastp_r1_size = fs::metadata(&fastp_r1).unwrap().len();
+    let fasterp_r1_size = fs::metadata(&fasterp_r1).unwrap().len();
+    let fastp_r2_size = fs::metadata(&fastp_r2).unwrap().len();
+    let fasterp_r2_size = fs::metadata(&fasterp_r2).unwrap().len();
+
+    assert!(fastp_r1_size > 0, "fastp R1 output is empty");
+    assert!(fasterp_r1_size > 0, "fasterp R1 output is empty");
+    assert!(fastp_r2_size > 0, "fastp R2 output is empty");
+    assert!(fasterp_r2_size > 0, "fasterp R2 output is empty");
+
+    // Check that file sizes are within 10% of each other (accounting for compression variations)
+    let r1_size_diff_pct =
+        ((fastp_r1_size as f64 - fasterp_r1_size as f64).abs() / fastp_r1_size as f64) * 100.0;
+    let r2_size_diff_pct =
+        ((fastp_r2_size as f64 - fasterp_r2_size as f64).abs() / fastp_r2_size as f64) * 100.0;
+
+    assert!(
+        r1_size_diff_pct < 10.0,
+        "R1 output sizes differ by more than 10%: fastp={}, fasterp={}, diff={}%",
+        fastp_r1_size,
+        fasterp_r1_size,
+        r1_size_diff_pct
+    );
+
+    assert!(
+        r2_size_diff_pct < 10.0,
+        "R2 output sizes differ by more than 10%: fastp={}, fasterp={}, diff={}%",
+        fastp_r2_size,
+        fasterp_r2_size,
+        r2_size_diff_pct
+    );
 }

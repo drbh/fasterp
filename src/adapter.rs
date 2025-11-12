@@ -181,27 +181,8 @@ fn find_consensus_adapter(
         }
     }
 
-    // Try to match against known adapters for validation
-    if let Some(ref adapter) = best_adapter {
-        // Check if it's a known adapter or substring of known adapter
-        for known_seq in adapters::get_known_adapters().keys() {
-            let known_bytes = known_seq.as_bytes();
-
-            // Check if detected adapter matches start of known adapter
-            if adapter.len() >= 6 && known_bytes.starts_with(adapter.as_slice()) {
-                // Use the full known adapter sequence
-                return Some(known_bytes.to_vec());
-            }
-
-            // Check if known adapter is contained in detected adapter
-            if adapter.len() > known_bytes.len()
-                && adapter[..known_bytes.len()].eq_ignore_ascii_case(known_bytes)
-            {
-                return Some(known_bytes.to_vec());
-            }
-        }
-    }
-
+    // Return the most frequently detected adapter without extending it
+    // This matches fastp's behavior which uses the detected fragments directly
     best_adapter
 }
 
