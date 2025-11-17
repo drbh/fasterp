@@ -757,9 +757,10 @@ pub(crate) fn paired_producer_thread_with_paths(
     use crossbeam_channel::bounded;
     use std::io::Read;
 
-    // Create channels for decompressed data from dedicated decompressor threads
-    let (decomp_tx1, decomp_rx1) = bounded::<(Vec<u8>, usize)>(2); // R1 decompressed chunks
-    let (decomp_tx2, decomp_rx2) = bounded::<(Vec<u8>, usize)>(2); // R2 decompressed chunks
+    // Use bounded channels with larger capacity to prevent deadlock
+    // Capacity of 16 provides enough buffering to handle speed differences between R1 and R2
+    let (decomp_tx1, decomp_rx1) = bounded::<(Vec<u8>, usize)>(16); // R1 decompressed chunks
+    let (decomp_tx2, decomp_rx2) = bounded::<(Vec<u8>, usize)>(16); // R2 decompressed chunks
 
     // Spawn dedicated decompressor thread for R1
     let input1_clone = input1.clone();
@@ -769,13 +770,22 @@ pub(crate) fn paired_producer_thread_with_paths(
         // Reuse buffer to reduce allocations
         let mut buffer = vec![0u8; decomp_chunk_size];
         loop {
-            let bytes_read = reader.read(&mut buffer)?;
-            if bytes_read == 0 {
+            // Keep reading until buffer is full or EOF
+            // This is critical for gzip streams which return small chunks
+            let mut total_read = 0;
+            while total_read < decomp_chunk_size {
+                match reader.read(&mut buffer[total_read..])? {
+                    0 => break, // EOF
+                    n => total_read += n,
+                }
+            }
+
+            if total_read == 0 {
                 break;
             }
             // Send a copy of the data (receiver owns it)
-            let data = buffer[..bytes_read].to_vec();
-            if decomp_tx1.send((data, bytes_read)).is_err() {
+            let data = buffer[..total_read].to_vec();
+            if decomp_tx1.send((data, total_read)).is_err() {
                 break; // Receiver dropped
             }
         }
@@ -789,13 +799,22 @@ pub(crate) fn paired_producer_thread_with_paths(
         // Reuse buffer to reduce allocations
         let mut buffer = vec![0u8; decomp_chunk_size];
         loop {
-            let bytes_read = reader.read(&mut buffer)?;
-            if bytes_read == 0 {
+            // Keep reading until buffer is full or EOF
+            // This is critical for gzip streams which return small chunks
+            let mut total_read = 0;
+            while total_read < decomp_chunk_size {
+                match reader.read(&mut buffer[total_read..])? {
+                    0 => break, // EOF
+                    n => total_read += n,
+                }
+            }
+
+            if total_read == 0 {
                 break;
             }
             // Send a copy of the data (receiver owns it)
-            let data = buffer[..bytes_read].to_vec();
-            if decomp_tx2.send((data, bytes_read)).is_err() {
+            let data = buffer[..total_read].to_vec();
+            if decomp_tx2.send((data, total_read)).is_err() {
                 break; // Receiver dropped
             }
         }
@@ -807,14 +826,15 @@ pub(crate) fn paired_producer_thread_with_paths(
     let mut carryover2 = Vec::new();
 
     loop {
-        // Receive pre-decompressed chunks from parallel decompressor threads
+        // With larger bounded channels (capacity 16), deadlock is unlikely
+        // Simple sequential receives work fine
         let (buffer1, bytes_read1) = match decomp_rx1.recv() {
             Ok(data) => data,
-            Err(_) => (Vec::new(), 0), // Channel closed = EOF
+            Err(_) => (Vec::new(), 0),
         };
         let (buffer2, bytes_read2) = match decomp_rx2.recv() {
             Ok(data) => data,
-            Err(_) => (Vec::new(), 0), // Channel closed = EOF
+            Err(_) => (Vec::new(), 0),
         };
 
         // Prepend carryover for R1
