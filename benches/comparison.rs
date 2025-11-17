@@ -54,11 +54,11 @@ fn bench_basic_filtering(c: &mut Criterion) {
     group.sample_size(10); // Reduce sample size for large dataset
 
     group.bench_function("fasterp", |b| {
-        b.iter(|| run_fasterp("test_data/huge_5m.fq", &[]))
+        b.iter(|| run_fasterp("test_data/huge_5m.fq", &[]));
     });
 
     group.bench_function("fastp", |b| {
-        b.iter(|| run_fastp("test_data/huge_5m.fq", &[]))
+        b.iter(|| run_fastp("test_data/huge_5m.fq", &[]));
     });
 
     group.finish();
@@ -74,7 +74,7 @@ fn bench_quality_trimming(c: &mut Criterion) {
                 "test_data/huge_5m.fq",
                 &["--cut-tail", "--cut-mean-quality", "20"],
             )
-        })
+        });
     });
 
     group.bench_function("fastp", |b| {
@@ -83,7 +83,7 @@ fn bench_quality_trimming(c: &mut Criterion) {
                 "test_data/huge_5m.fq",
                 &["--cut_tail", "--cut_mean_quality", "20"],
             )
-        })
+        });
     });
 
     group.finish();
@@ -109,7 +109,7 @@ fn bench_aggressive_trimming(c: &mut Criterion) {
                     "--trim-poly-g",
                 ],
             )
-        })
+        });
     });
 
     group.bench_function("fastp", |b| {
@@ -128,7 +128,7 @@ fn bench_aggressive_trimming(c: &mut Criterion) {
                     "--trim_poly_g",
                 ],
             )
-        })
+        });
     });
 
     group.finish();
@@ -140,22 +140,22 @@ fn bench_multithreading(c: &mut Criterion) {
 
     // fasterp single-threaded
     group.bench_function("fasterp_1thread", |b| {
-        b.iter(|| run_fasterp("test_data/huge_5m.fq", &["-t", "1"]))
+        b.iter(|| run_fasterp("test_data/huge_5m.fq", &["-t", "1"]));
     });
 
     // fasterp multi-threaded
     group.bench_function("fasterp_4threads", |b| {
-        b.iter(|| run_fasterp("test_data/huge_5m.fq", &["-t", "4"]))
+        b.iter(|| run_fasterp("test_data/huge_5m.fq", &["-t", "4"]));
     });
 
     // fastp single-threaded
     group.bench_function("fastp_1thread", |b| {
-        b.iter(|| run_fastp("test_data/huge_5m.fq", &["-w", "1"]))
+        b.iter(|| run_fastp("test_data/huge_5m.fq", &["-w", "1"]));
     });
 
     // fastp multi-threaded
     group.bench_function("fastp_4threads", |b| {
-        b.iter(|| run_fastp("test_data/huge_5m.fq", &["-w", "4"]))
+        b.iter(|| run_fastp("test_data/huge_5m.fq", &["-w", "4"]));
     });
 
     group.finish();

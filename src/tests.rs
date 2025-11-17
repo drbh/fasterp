@@ -2,12 +2,16 @@
 //!
 //! Tests cover:
 //! - Sliding window quality trimming (front and tail)
-//! - PolyG tail detection
-//! - PolyX tail detection
+//! - `PolyG` tail detection
+//! - `PolyX` tail detection
 //! - Full trimming integration
 //! - Statistics accumulation
 
 use super::*;
+use crate::trimming::{
+    TrimmingResult, TrimmingStats, detect_poly_g_tail, detect_poly_x_tail,
+    trim_front_sliding_window, trim_read, trim_tail_sliding_window,
+};
 
 // Sliding Window Trimming Tests
 

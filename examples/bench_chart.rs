@@ -1,6 +1,6 @@
 /// Example: Generate ASCII bar charts comparing fasterp vs fastp performance
 ///
-/// Usage: cargo run --release --example bench_chart
+/// Usage: cargo run --release --example `bench_chart`
 use std::process::Command;
 use std::time::Instant;
 
@@ -125,7 +125,7 @@ fn run_benchmark(input: &str, name: &str, extra_args: &[&str]) -> Option<BenchRe
                 if let Some(rest) = s.strip_prefix("--") {
                     format!("--{}", rest.replace('-', "_"))
                 } else {
-                    s.to_string()
+                    (*s).to_string()
                 }
             })
             .collect();

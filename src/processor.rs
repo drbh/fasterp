@@ -1,19 +1,19 @@
 //! Single-threaded FASTQ processing
 //!
 //! This module provides the streaming single-threaded processing path:
-//! - ParseState: FASTQ parsing state machine
-//! - FastqParser: Handles multiline sequences and missing newlines
-//! - StreamAccumulator: Single-threaded stats accumulator
-//! - process_fastq_stream: Main single-threaded entry point
+//! - `ParseState`: FASTQ parsing state machine
+//! - `FastqParser`: Handles multiline sequences and missing newlines
+//! - `StreamAccumulator`: Single-threaded stats accumulator
+//! - `process_fastq_stream`: Main single-threaded entry point
 
 use anyhow::Result;
 use indexmap::IndexMap;
 use std::io::{BufRead, Write};
 
-use crate::kmer::*;
+use crate::kmer::{base_idx, count_k5_2bit};
 use crate::simd;
-use crate::stats::*;
-use crate::trimming::*;
+use crate::stats::{PositionStats, SimpleStats};
+use crate::trimming::{TrimmingConfig, TrimmingResult, trim_read, trim_read_with_adapter};
 use crate::util;
 
 /// Calculate sequence complexity as percentage of bases different from next base
@@ -330,7 +330,7 @@ impl StreamAccumulator {
 
                 let qual_hist_ptr = self.pos.qual_hist.as_mut_ptr();
                 util::loop_seq_qual_indexed(seq_ptr, qual_ptr, len, |i, b, q| {
-                    let qval = (q - 33) as u64;
+                    let qval = u64::from(q - 33);
                     // Direct pointer arithmetic - no Vec::as_mut_slice overhead!
                     *total_sum_ptr.add(i) += qval;
                     *total_cnt_ptr.add(i) += 1;
@@ -386,7 +386,7 @@ impl StreamAccumulator {
 
                 let qual_hist_ptr = self.pos.qual_hist.as_mut_ptr();
                 util::loop_seq_qual_indexed(seq_ptr, qual_ptr, len, |i, b, q| {
-                    let qval = (q - 33) as u32;
+                    let qval = u32::from(q - 33);
                     qsum += qval;
                     if q >= 53 {
                         q20 += 1;
@@ -405,11 +405,11 @@ impl StreamAccumulator {
                     }
 
                     // Direct pointer arithmetic - no Vec::as_mut_slice overhead!
-                    *total_sum_ptr.add(i) += qval as u64;
+                    *total_sum_ptr.add(i) += u64::from(qval);
                     *total_cnt_ptr.add(i) += 1;
 
                     if let Some(bi) = base_idx(b) {
-                        *base_sum_ptrs[bi].add(i) += qval as u64;
+                        *base_sum_ptrs[bi].add(i) += u64::from(qval);
                         *base_cnt_ptrs[bi].add(i) += 1;
                     }
 
@@ -484,8 +484,8 @@ impl StreamAccumulator {
 
         // Check average quality (fastp -e logic)
         if average_qual > 0 && trimmed_len > 0 {
-            let mean_qual = trimmed_qsum as f64 / trimmed_len as f64;
-            if mean_qual < average_qual as f64 {
+            let mean_qual = f64::from(trimmed_qsum) / trimmed_len as f64;
+            if mean_qual < f64::from(average_qual) {
                 self.low_quality += 1;
                 return Ok(());
             }
@@ -530,7 +530,7 @@ impl StreamAccumulator {
         Ok(())
     }
 
-    /// Convert kmer_table to IndexMap for JSON output
+    /// Convert `kmer_table` to `IndexMap` for JSON output
     /// Uses static string cache - only 1024 allocations total (reused across calls)
     pub(crate) fn kmer_table_to_map(&self) -> IndexMap<String, usize> {
         let mut map = IndexMap::new();
@@ -546,7 +546,7 @@ impl StreamAccumulator {
         map
     }
 
-    /// Convert kmer_table_after to IndexMap for JSON output
+    /// Convert `kmer_table_after` to `IndexMap` for JSON output
     pub(crate) fn kmer_table_after_to_map(&self) -> IndexMap<String, usize> {
         let mut map = IndexMap::new();
         for code in 0..1024 {
@@ -592,7 +592,7 @@ impl PairedEndAccumulator {
         }
     }
 
-    /// Convert kmer tables to IndexMaps
+    /// Convert kmer tables to `IndexMaps`
     pub(crate) fn kmer_table_to_map_r1(&self) -> IndexMap<String, usize> {
         let mut map = IndexMap::new();
         for code in 0..1024 {
@@ -815,8 +815,8 @@ pub(crate) fn process_paired_fastq_stream<
                                 // Trim UMI from read1 sequence and quality
                                 seq1_after_umi = seq1[extraction.end_pos..].to_vec();
                                 qual1_after_umi = qual1[extraction.end_pos..].to_vec();
-                                seq2_after_umi = seq2.to_vec();
-                                qual2_after_umi = qual2.to_vec();
+                                seq2_after_umi = seq2.clone();
+                                qual2_after_umi = qual2.clone();
 
                                 final_header1 = &header1_with_umi[..];
                                 final_header2 = &header2_with_umi[..];
@@ -826,12 +826,12 @@ pub(crate) fn process_paired_fastq_stream<
                                 final_qual2 = &qual2_after_umi[..];
                             } else {
                                 // UMI extraction failed - use original (convert to owned for consistency)
-                                header1_with_umi = header1.to_vec();
-                                header2_with_umi = header2.to_vec();
-                                seq1_after_umi = seq1.to_vec();
-                                qual1_after_umi = qual1.to_vec();
-                                seq2_after_umi = seq2.to_vec();
-                                qual2_after_umi = qual2.to_vec();
+                                header1_with_umi = header1.clone();
+                                header2_with_umi = header2.clone();
+                                seq1_after_umi = seq1.clone();
+                                qual1_after_umi = qual1.clone();
+                                seq2_after_umi = seq2.clone();
+                                qual2_after_umi = qual2.clone();
 
                                 final_header1 = &header1_with_umi[..];
                                 final_header2 = &header2_with_umi[..];
@@ -857,8 +857,8 @@ pub(crate) fn process_paired_fastq_stream<
                                 );
 
                                 // Trim UMI from read2 sequence and quality
-                                seq1_after_umi = seq1.to_vec();
-                                qual1_after_umi = qual1.to_vec();
+                                seq1_after_umi = seq1.clone();
+                                qual1_after_umi = qual1.clone();
                                 seq2_after_umi = seq2[extraction.end_pos..].to_vec();
                                 qual2_after_umi = qual2[extraction.end_pos..].to_vec();
 
@@ -870,12 +870,12 @@ pub(crate) fn process_paired_fastq_stream<
                                 final_qual2 = &qual2_after_umi[..];
                             } else {
                                 // UMI extraction failed - use original (convert to owned for consistency)
-                                header1_with_umi = header1.to_vec();
-                                header2_with_umi = header2.to_vec();
-                                seq1_after_umi = seq1.to_vec();
-                                qual1_after_umi = qual1.to_vec();
-                                seq2_after_umi = seq2.to_vec();
-                                qual2_after_umi = qual2.to_vec();
+                                header1_with_umi = header1.clone();
+                                header2_with_umi = header2.clone();
+                                seq1_after_umi = seq1.clone();
+                                qual1_after_umi = qual1.clone();
+                                seq2_after_umi = seq2.clone();
+                                qual2_after_umi = qual2.clone();
 
                                 final_header1 = &header1_with_umi[..];
                                 final_header2 = &header2_with_umi[..];
@@ -887,12 +887,12 @@ pub(crate) fn process_paired_fastq_stream<
                         }
                         _ => {
                             // Other UMI locations not yet supported - use original
-                            header1_with_umi = header1.to_vec();
-                            header2_with_umi = header2.to_vec();
-                            seq1_after_umi = seq1.to_vec();
-                            qual1_after_umi = qual1.to_vec();
-                            seq2_after_umi = seq2.to_vec();
-                            qual2_after_umi = qual2.to_vec();
+                            header1_with_umi = header1.clone();
+                            header2_with_umi = header2.clone();
+                            seq1_after_umi = seq1.clone();
+                            qual1_after_umi = qual1.clone();
+                            seq2_after_umi = seq2.clone();
+                            qual2_after_umi = qual2.clone();
 
                             final_header1 = &header1_with_umi[..];
                             final_header2 = &header2_with_umi[..];
@@ -904,12 +904,12 @@ pub(crate) fn process_paired_fastq_stream<
                     }
                 } else {
                     // No UMI processing - use original (convert to owned for consistency)
-                    header1_with_umi = header1.to_vec();
-                    header2_with_umi = header2.to_vec();
-                    seq1_after_umi = seq1.to_vec();
-                    qual1_after_umi = qual1.to_vec();
-                    seq2_after_umi = seq2.to_vec();
-                    qual2_after_umi = qual2.to_vec();
+                    header1_with_umi = header1.clone();
+                    header2_with_umi = header2.clone();
+                    seq1_after_umi = seq1.clone();
+                    qual1_after_umi = qual1.clone();
+                    seq2_after_umi = seq2.clone();
+                    qual2_after_umi = qual2.clone();
 
                     final_header1 = &header1_with_umi[..];
                     final_header2 = &header2_with_umi[..];
@@ -1183,8 +1183,8 @@ pub(crate) fn process_paired_fastq_stream<
                     if (trimmed_stats1.unqualified as f64) > unqual_threshold1 {
                         result1_fail_quality = true;
                     } else if average_qual > 0 {
-                        let mean_qual1 = trimmed_stats1.qsum as f64 / rlen1 as f64;
-                        if mean_qual1 < average_qual as f64 {
+                        let mean_qual1 = f64::from(trimmed_stats1.qsum) / rlen1 as f64;
+                        if mean_qual1 < f64::from(average_qual) {
                             result1_fail_quality = true;
                         }
                     } else if trimmed_stats1.ncnt > n_limit {
@@ -1205,8 +1205,8 @@ pub(crate) fn process_paired_fastq_stream<
                     if (trimmed_stats2.unqualified as f64) > unqual_threshold2 {
                         result2_fail_quality = true;
                     } else if average_qual > 0 {
-                        let mean_qual2 = trimmed_stats2.qsum as f64 / rlen2 as f64;
-                        if mean_qual2 < average_qual as f64 {
+                        let mean_qual2 = f64::from(trimmed_stats2.qsum) / rlen2 as f64;
+                        if mean_qual2 < f64::from(average_qual) {
                             result2_fail_quality = true;
                         }
                     } else if trimmed_stats2.ncnt > n_limit {
@@ -1430,7 +1430,7 @@ pub(crate) fn track_position_stats(seq: &[u8], qual: &[u8], pos: &mut PositionSt
         let qual_hist_ptr = pos.qual_hist.as_mut_ptr();
 
         util::loop_seq_qual_indexed(seq_ptr, qual_ptr, len, |i, b, q| {
-            let qval = (q - 33) as u64;
+            let qval = u64::from(q - 33);
             *total_sum_ptr.add(i) += qval;
             *total_cnt_ptr.add(i) += 1;
 
@@ -1492,7 +1492,7 @@ fn process_read_stats(
 
             let qual_hist_ptr = pos.qual_hist.as_mut_ptr();
             util::loop_seq_qual_indexed(seq_ptr, qual_ptr, len, |i, b, q| {
-                let qval = (q - 33) as u64;
+                let qval = u64::from(q - 33);
                 *total_sum_ptr.add(i) += qval;
                 *total_cnt_ptr.add(i) += 1;
 
@@ -1545,7 +1545,7 @@ fn process_read_stats(
 
             let qual_hist_ptr = pos.qual_hist.as_mut_ptr();
             util::loop_seq_qual_indexed(seq_ptr, qual_ptr, len, |i, b, q| {
-                let qval = (q - 33) as u32;
+                let qval = u32::from(q - 33);
                 if q >= 53 {
                     q20 += 1;
                 }
@@ -1559,11 +1559,11 @@ fn process_read_stats(
                     gc += 1;
                 }
 
-                *total_sum_ptr.add(i) += qval as u64;
+                *total_sum_ptr.add(i) += u64::from(qval);
                 *total_cnt_ptr.add(i) += 1;
 
                 if let Some(bi) = base_idx(b) {
-                    *base_sum_ptrs[bi].add(i) += qval as u64;
+                    *base_sum_ptrs[bi].add(i) += u64::from(qval);
                     *base_cnt_ptrs[bi].add(i) += 1;
                 }
 

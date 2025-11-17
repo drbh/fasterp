@@ -1,4 +1,3 @@
-use assert_cmd::assert;
 use assert_cmd::cargo::cargo_bin;
 use predicates::prelude::*;
 use serde_json::Value;
@@ -655,7 +654,7 @@ fn test_multithreading_consistency() {
     let thread_counts = [1, 2, 4, 8];
     let mut outputs = Vec::new();
 
-    for threads in thread_counts.iter() {
+    for threads in &thread_counts {
         let output_fq = temp_dir.path().join(format!("output_t{threads}.fq"));
         let output_json = temp_dir.path().join(format!("output_t{threads}.json"));
 
@@ -5531,7 +5530,7 @@ fn test_adapter_auto_detection_se() {
             let seq_len = 80 + (i % 40);
             let sequence: String = (0..seq_len).map(|j| bases[(i + j) % 4]).collect();
 
-            let full_sequence = format!("{}{}", sequence, adapter_seq);
+            let full_sequence = format!("{sequence}{adapter_seq}");
             let quality = "I".repeat(full_sequence.len());
 
             test_data.push_str(&full_sequence);
@@ -5611,17 +5610,14 @@ fn test_adapter_auto_detection_se() {
     // With detection, adapters should be trimmed, so total bases should be significantly less
     assert!(
         total_bases_with < total_bases_without,
-        "Adapter trimming should reduce total bases. With detection: {} bp, without: {} bp",
-        total_bases_with,
-        total_bases_without
+        "Adapter trimming should reduce total bases. With detection: {total_bases_with} bp, without: {total_bases_without} bp"
     );
 
     // Expect at least 200,000 bases to be trimmed (7000 reads * ~30bp adapter each)
     let bases_trimmed = total_bases_without - total_bases_with;
     assert!(
         bases_trimmed > 200_000,
-        "Expected significant adapter trimming (>200k bases), got {} bases trimmed",
-        bases_trimmed
+        "Expected significant adapter trimming (>200k bases), got {bases_trimmed} bases trimmed"
     );
 
     // Read JSON to verify adapter was reported
@@ -5873,25 +5869,18 @@ fn test_adapter_trimming_matches_fastp_base_count() {
         .map(|(_, line)| line.len())
         .sum();
 
-    println!("Fasterp total bases: {}", fasterp_bases);
-    println!("Fastp total bases:   {}", fastp_bases);
+    println!("Fasterp total bases: {fasterp_bases}");
+    println!("Fastp total bases:   {fastp_bases}");
 
     // The outputs should have the same total bases
     // Allow a small tolerance for rounding differences, but the current bug
     // shows a 17-base difference on this 10k read dataset
-    let diff = if fasterp_bases > fastp_bases {
-        fasterp_bases - fastp_bases
-    } else {
-        fastp_bases - fasterp_bases
-    };
+    let diff = fasterp_bases.abs_diff(fastp_bases);
 
     assert!(
         diff == 0,
-        "Base count mismatch: fasterp={}, fastp={}, diff={} bases. \
-        This suggests different adapter trimming behavior between the tools.",
-        fasterp_bases,
-        fastp_bases,
-        diff
+        "Base count mismatch: fasterp={fasterp_bases}, fastp={fastp_bases}, diff={diff} bases. \
+        This suggests different adapter trimming behavior between the tools."
     );
 }
 
@@ -6397,9 +6386,9 @@ TGCAGGCACGGACGAACGTCTCACCGCCTGGCCATGAAAGCGGTAAATCGGACAAGGTTATCAGCTCTCATCGGCACTCT
     let fasterp_content = fs::read_to_string(&fasterp_r1).unwrap();
 
     println!("\n=== Fastp output ===");
-    println!("{}", fastp_content);
+    println!("{fastp_content}");
     println!("\n=== Fasterp output ===");
-    println!("{}", fasterp_content);
+    println!("{fasterp_content}");
 
     // Extract sequence lengths
     let fastp_seq = fastp_content.lines().nth(1).unwrap();
@@ -6546,9 +6535,9 @@ TGCAGGCACGGACGAACGTCTCACCGCCTGGCCATGAAAGCGGTAAATCGGACAAGGTTATCAGCTCTCATCGGCACTCT
     let fasterp_content = fs::read_to_string(&fasterp_r1).unwrap();
 
     println!("\n=== Fastp output ===");
-    println!("{}", fastp_content);
+    println!("{fastp_content}");
     println!("\n=== Fasterp output ===");
-    println!("{}", fasterp_content);
+    println!("{fasterp_content}");
 
     // Extract sequence lengths
     let fastp_seq = fastp_content.lines().nth(1).unwrap();
@@ -7695,8 +7684,8 @@ fn test_merge_basic_parity_with_fastp() {
     let fastp_count = count_fastq_reads(&fastp_merged);
     let fasterp_count = count_fastq_reads(&fasterp_merged);
 
-    println!("fastp merged reads: {}", fastp_count);
-    println!("fasterp merged reads: {}", fasterp_count);
+    println!("fastp merged reads: {fastp_count}");
+    println!("fasterp merged reads: {fasterp_count}");
 
     // Should have similar number of merged reads (allowing some variance due to implementation differences)
     assert!(fastp_count > 0, "fastp should have merged some reads");
@@ -7707,10 +7696,7 @@ fn test_merge_basic_parity_with_fastp() {
         ((fastp_count as f64 - fasterp_count as f64).abs() / fastp_count as f64) * 100.0;
     assert!(
         diff_ratio < 10.0,
-        "Merged read counts differ by more than 10%: fastp={}, fasterp={}, diff={}%",
-        fastp_count,
-        fasterp_count,
-        diff_ratio
+        "Merged read counts differ by more than 10%: fastp={fastp_count}, fasterp={fasterp_count}, diff={diff_ratio}%"
     );
 }
 
@@ -7728,8 +7714,8 @@ fn test_merge_with_include_unmerged() {
     let fastp_count = count_fastq_reads(&fastp_merged);
     let fasterp_count = count_fastq_reads(&fasterp_merged);
 
-    println!("fastp merged+unmerged reads: {}", fastp_count);
-    println!("fasterp merged+unmerged reads: {}", fasterp_count);
+    println!("fastp merged+unmerged reads: {fastp_count}");
+    println!("fasterp merged+unmerged reads: {fasterp_count}");
 
     // With include_unmerged, should have even more reads
     assert!(fastp_count > 0);
@@ -7740,10 +7726,7 @@ fn test_merge_with_include_unmerged() {
         ((fastp_count as f64 - fasterp_count as f64).abs() / fastp_count as f64) * 100.0;
     assert!(
         diff_ratio < 10.0,
-        "Merged+unmerged read counts differ by more than 10%: fastp={}, fasterp={}, diff={}%",
-        fastp_count,
-        fasterp_count,
-        diff_ratio
+        "Merged+unmerged read counts differ by more than 10%: fastp={fastp_count}, fasterp={fasterp_count}, diff={diff_ratio}%"
     );
 }
 
@@ -7758,15 +7741,14 @@ fn test_merge_header_format() {
     // Parse the merged file
     let reads = parse_fastq(&fasterp_merged);
 
-    assert!(reads.len() > 0, "Should have at least one merged read");
+    assert!(!reads.is_empty(), "Should have at least one merged read");
 
     // Check that merged reads have the correct header format
-    for (header, seq, qual) in reads.iter() {
+    for (header, seq, qual) in &reads {
         // Headers should contain "merged_XXX_YYY" tag
         assert!(
             header.contains("merged_"),
-            "Header should contain 'merged_' tag: {}",
-            header
+            "Header should contain 'merged_' tag: {header}"
         );
 
         // Sequence and quality should have same length
@@ -7777,7 +7759,7 @@ fn test_merge_header_format() {
         );
 
         // Sequence should not be empty
-        assert!(seq.len() > 0, "Merged sequence should not be empty");
+        assert!(!seq.is_empty(), "Merged sequence should not be empty");
     }
 }
 
@@ -7803,8 +7785,8 @@ fn test_merge_larger_dataset() {
     let fastp_count = count_fastq_reads(&fastp_merged);
     let fasterp_count = count_fastq_reads(&fasterp_merged);
 
-    println!("fastp merged reads (10k): {}", fastp_count);
-    println!("fasterp merged reads (10k): {}", fasterp_count);
+    println!("fastp merged reads (10k): {fastp_count}");
+    println!("fasterp merged reads (10k): {fasterp_count}");
 
     assert!(
         fastp_count > 100,
@@ -7820,10 +7802,7 @@ fn test_merge_larger_dataset() {
         ((fastp_count as f64 - fasterp_count as f64).abs() / fastp_count as f64) * 100.0;
     assert!(
         diff_ratio < 10.0,
-        "Large dataset merge counts differ by more than 10%: fastp={}, fasterp={}, diff={}%",
-        fastp_count,
-        fasterp_count,
-        diff_ratio
+        "Large dataset merge counts differ by more than 10%: fastp={fastp_count}, fasterp={fasterp_count}, diff={diff_ratio}%"
     );
 }
 
@@ -7838,14 +7817,12 @@ fn test_merge_quality_scores_preserved() {
     // Parse merged reads
     let reads = parse_fastq(&fasterp_merged);
 
-    for (header, seq, qual) in reads.iter() {
+    for (header, seq, qual) in &reads {
         // Quality scores should all be valid Phred+33 characters
         for &byte in qual.as_bytes() {
             assert!(
-                byte >= 33 && byte <= 126,
-                "Invalid quality score in {}: {}",
-                header,
-                byte
+                (33..=126).contains(&byte),
+                "Invalid quality score in {header}: {byte}"
             );
         }
 
@@ -7871,7 +7848,7 @@ fn test_merge_vs_no_merge_read_preservation() {
     let r1_count = count_fastq_reads(&r1_out);
     let r2_count = count_fastq_reads(&r2_out);
 
-    println!("Merged (with unmerged): {} reads", merged_all_count);
+    println!("Merged (with unmerged): {merged_all_count} reads");
     println!(
         "Normal PE: {} + {} = {} reads",
         r1_count,
@@ -7886,10 +7863,7 @@ fn test_merge_vs_no_merge_read_preservation() {
     let diff = (merged_all_count as i64 - expected_total as i64).abs();
     assert!(
         diff < 10,
-        "Total reads should be preserved: merged_all={}, r1+r2={}, diff={}",
-        merged_all_count,
-        expected_total,
-        diff
+        "Total reads should be preserved: merged_all={merged_all_count}, r1+r2={expected_total}, diff={diff}"
     );
 }
 
@@ -7979,18 +7953,12 @@ fn test_srr30151536_gzipped_paired_end() {
 
     assert!(
         r1_size_diff_pct < 10.0,
-        "R1 output sizes differ by more than 10%: fastp={}, fasterp={}, diff={}%",
-        fastp_r1_size,
-        fasterp_r1_size,
-        r1_size_diff_pct
+        "R1 output sizes differ by more than 10%: fastp={fastp_r1_size}, fasterp={fasterp_r1_size}, diff={r1_size_diff_pct}%"
     );
 
     assert!(
         r2_size_diff_pct < 10.0,
-        "R2 output sizes differ by more than 10%: fastp={}, fasterp={}, diff={}%",
-        fastp_r2_size,
-        fasterp_r2_size,
-        r2_size_diff_pct
+        "R2 output sizes differ by more than 10%: fastp={fastp_r2_size}, fasterp={fasterp_r2_size}, diff={r2_size_diff_pct}%"
     );
 }
 
@@ -8080,44 +8048,38 @@ fn test_srr22472290_gzipped_paired_end() {
 
     assert!(
         r1_size_diff_pct < 10.0,
-        "R1 output sizes differ by more than 10%: fastp={}, fasterp={}, diff={}%",
-        fastp_r1_size,
-        fasterp_r1_size,
-        r1_size_diff_pct
+        "R1 output sizes differ by more than 10%: fastp={fastp_r1_size}, fasterp={fasterp_r1_size}, diff={r1_size_diff_pct}%"
     );
 
     assert!(
         r2_size_diff_pct < 10.0,
-        "R2 output sizes differ by more than 10%: fastp={}, fasterp={}, diff={}%",
-        fastp_r2_size,
-        fasterp_r2_size,
-        r2_size_diff_pct
+        "R2 output sizes differ by more than 10%: fastp={fastp_r2_size}, fasterp={fasterp_r2_size}, diff={r2_size_diff_pct}%"
     );
 }
 /// Test case for the specific problematic read pair identified through binary search.
 /// This read pair (SRR22472290.464) is passed by fastp but filtered by fasterp,
-/// causing a discrepancy in the passed_filter_reads count.
+/// causing a discrepancy in the `passed_filter_reads` count.
 ///
 /// R1 is 42 bases, R2 is 76 bases with mixed quality scores.
-/// fastp: passes both reads (2 passed_filter_reads)
-/// fasterp: filters both reads (0 passed_filter_reads) - THIS IS THE BUG
+/// fastp: passes both reads (2 `passed_filter_reads`)
+/// fasterp: filters both reads (0 `passed_filter_reads`) - THIS IS THE BUG
 #[test]
 fn test_problematic_read_srr22472290_464() {
     let temp_dir = TempDir::new().unwrap();
 
     // The problematic read pair, isolated through binary search from 76,820 reads
     // Read ID: SRR22472290.464 NB502048:545:HN3F3AFX2:1:11103:15993:2863
-    let r1_fastq = r#"@SRR22472290.464 NB502048:545:HN3F3AFX2:1:11103:15993:2863/1
+    let r1_fastq = r"@SRR22472290.464 NB502048:545:HN3F3AFX2:1:11103:15993:2863/1
 GACTGGGGAGACGCCGAGTGAGGGCGAGCGCTGCTGTGGCG
 +
 AAAA/EA/E6EA/AE/E6E/EEA/EAE/EAE/EE//EE/EE
-"#;
+";
 
-    let r2_fastq = r#"@SRR22472290.464 NB502048:545:HN3F3AFX2:1:11103:15993:2863/2
+    let r2_fastq = r"@SRR22472290.464 NB502048:545:HN3F3AFX2:1:11103:15993:2863/2
 CGCCACAGCCGCGCTCGCCCTCACTCGGCGTCTACCCAGTCCTGTCTATTATACACAAAAGACGATGCCGACGAA
 +
 A/A//EEE/EA<EE/EEEEAA<EE//AEEEAAE/EE/EAEEAAA//A////AE/A<A//////////E///////
-"#;
+";
 
     // Write input files
     let input_r1 = temp_dir.path().join("problematic_r1.fq");
@@ -8201,17 +8163,17 @@ fn test_problematic_read_srr22472290_464_single_threaded() {
 
     // The problematic read pair, isolated through binary search from 76,820 reads
     // Read ID: SRR22472290.464 NB502048:545:HN3F3AFX2:1:11103:15993:2863
-    let r1_fastq = r#"@SRR22472290.464 NB502048:545:HN3F3AFX2:1:11103:15993:2863/1
+    let r1_fastq = r"@SRR22472290.464 NB502048:545:HN3F3AFX2:1:11103:15993:2863/1
 GACTGGGGAGACGCCGAGTGAGGGCGAGCGCTGCTGTGGCG
 +
 AAAA/EA/E6EA/AE/E6E/EEA/EAE/EAE/EE//EE/EE
-"#;
+";
 
-    let r2_fastq = r#"@SRR22472290.464 NB502048:545:HN3F3AFX2:1:11103:15993:2863/2
+    let r2_fastq = r"@SRR22472290.464 NB502048:545:HN3F3AFX2:1:11103:15993:2863/2
 CGCCACAGCCGCGCTCGCCCTCACTCGGCGTCTACCCAGTCCTGTCTATTATACACAAAAGACGATGCCGACGAA
 +
 A/A//EEE/EA<EE/EEEEAA<EE//AEEEAAE/EE/EAEEAAA//A////AE/A<A//////////E///////
-"#;
+";
 
     // Write input files
     let input_r1 = temp_dir.path().join("problematic_r1.fq");
@@ -8398,13 +8360,12 @@ GACTAAAACCAAGCGAGAATCTGAGATGGTTTTCTGTGGGGAAGTATATAAGGTCAGCATTGTAACCCCTGACT
         .as_u64()
         .unwrap();
 
-    println!("fastp passed: {}", fastp_passed);
-    println!("fasterp passed: {}", fasterp_passed);
+    println!("fastp passed: {fastp_passed}");
+    println!("fasterp passed: {fasterp_passed}");
 
     assert_eq!(
         fastp_passed, fasterp_passed,
-        "Failed: fastp passed {} reads, but fasterp passed {} reads",
-        fastp_passed, fasterp_passed
+        "Failed: fastp passed {fastp_passed} reads, but fasterp passed {fasterp_passed} reads"
     );
 }
 
@@ -8453,7 +8414,7 @@ IIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII
     let json_out = temp_dir.path().join("out.json");
 
     let status = Command::new(cargo_bin("fasterp"))
-        .args(&[
+        .args([
             "-i",
             r1_path.to_str().unwrap(),
             "-I",
@@ -8515,7 +8476,7 @@ IIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII
     let json_out = temp_dir.path().join("out.json");
 
     let status = Command::new(cargo_bin("fasterp"))
-        .args(&[
+        .args([
             "-i",
             r1_path.to_str().unwrap(),
             "-I",
@@ -8574,7 +8535,7 @@ IIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII
     let json_out = temp_dir.path().join("out.json");
 
     let status = Command::new(cargo_bin("fasterp"))
-        .args(&[
+        .args([
             "-i",
             r1_path.to_str().unwrap(),
             "-I",
@@ -8641,7 +8602,7 @@ AAAAAAAAAAAAAAACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGT
     let json_out = temp_dir.path().join("out.json");
 
     let status = Command::new(cargo_bin("fasterp"))
-        .args(&[
+        .args([
             "-i",
             r1_path.to_str().unwrap(),
             "-I",
@@ -8714,7 +8675,7 @@ IIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII
     let json_out = temp_dir.path().join("out.json");
 
     let status = Command::new(cargo_bin("fasterp"))
-        .args(&[
+        .args([
             "-i",
             r1_path.to_str().unwrap(),
             "-I",
@@ -8776,7 +8737,7 @@ IIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII
     let json_out = temp_dir.path().join("out.json");
 
     let status = Command::new(cargo_bin("fasterp"))
-        .args(&[
+        .args([
             "-i",
             r1_path.to_str().unwrap(),
             "-I",
@@ -8821,12 +8782,10 @@ fn test_multithreaded_overlap_consistency() {
 
     for i in 0..100 {
         r1_data.push_str(&format!(
-            "@read{}/1\nACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTAAAAAAAAAAAAAAAA\n+\nIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII\n",
-            i
+            "@read{i}/1\nACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTAAAAAAAAAAAAAAAA\n+\nIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII\n"
         ));
         r2_data.push_str(&format!(
-            "@read{}/2\nTTTTTTTTTTTTTTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGT\n+\nIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII\n",
-            i
+            "@read{i}/2\nTTTTTTTTTTTTTTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGT\n+\nIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII\n"
         ));
     }
 
@@ -8841,7 +8800,7 @@ fn test_multithreaded_overlap_consistency() {
     let json_st = temp_dir.path().join("st.json");
 
     let status = Command::new(cargo_bin("fasterp"))
-        .args(&[
+        .args([
             "-i",
             r1_path.to_str().unwrap(),
             "-I",
@@ -8868,7 +8827,7 @@ fn test_multithreaded_overlap_consistency() {
     let json_mt = temp_dir.path().join("mt.json");
 
     let status = Command::new(cargo_bin("fasterp"))
-        .args(&[
+        .args([
             "-i",
             r1_path.to_str().unwrap(),
             "-I",
@@ -8940,7 +8899,7 @@ IIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII
     let json_out = temp_dir.path().join("out.json");
 
     let status = Command::new(cargo_bin("fasterp"))
-        .args(&[
+        .args([
             "-i",
             r1_path.to_str().unwrap(),
             "-I",
@@ -9001,7 +8960,7 @@ IIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII
     let json_out = temp_dir.path().join("out.json");
 
     let status = Command::new(cargo_bin("fasterp"))
-        .args(&[
+        .args([
             "-i",
             r1_path.to_str().unwrap(),
             "-I",
@@ -9065,7 +9024,7 @@ IIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII
     let json_out = temp_dir.path().join("out.json");
 
     let status = Command::new(cargo_bin("fasterp"))
-        .args(&[
+        .args([
             "-i",
             r1_path.to_str().unwrap(),
             "-I",
@@ -9129,7 +9088,7 @@ IIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII
     let json_out = temp_dir.path().join("out.json");
 
     let status = Command::new(cargo_bin("fasterp"))
-        .args(&[
+        .args([
             "-i",
             r1_path.to_str().unwrap(),
             "-I",
@@ -9193,7 +9152,7 @@ IIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII
     let json_out = temp_dir.path().join("out.json");
 
     let status = Command::new(cargo_bin("fasterp"))
-        .args(&[
+        .args([
             "-i",
             r1_path.to_str().unwrap(),
             "-I",
@@ -9236,36 +9195,32 @@ fn test_mixed_overlapping_and_non_overlapping() {
     // Add 5 reads WITH overlap (should detect and trim adapters)
     for i in 0..5 {
         r1_data.push_str(&format!(
-            "@overlap_read{}/1\n\
+            "@overlap_read{i}/1\n\
             ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACAAAAAAAAAAAAAAAAAAAAAAAAAA\n\
             +\n\
-            IIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII\n",
-            i
+            IIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII\n"
         ));
         r2_data.push_str(&format!(
-            "@overlap_read{}/2\n\
+            "@overlap_read{i}/2\n\
             TTTTTTTTTTTTTTTTTTTTTTGTGTGTGTGTGTGTGTGTGTGTGTGTGTGTGTGTGTGTGTGTGTGTGTACGT\n\
             +\n\
-            IIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII\n",
-            i
+            IIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII\n"
         ));
     }
 
     // Add 5 reads WITHOUT overlap (longer inserts, no adapter contamination)
     for i in 5..10 {
         r1_data.push_str(&format!(
-            "@no_overlap_read{}/1\n\
+            "@no_overlap_read{i}/1\n\
             GGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGG\n\
             +\n\
-            IIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII\n",
-            i
+            IIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII\n"
         ));
         r2_data.push_str(&format!(
-            "@no_overlap_read{}/2\n\
+            "@no_overlap_read{i}/2\n\
             CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC\n\
             +\n\
-            IIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII\n",
-            i
+            IIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII\n"
         ));
     }
 
@@ -9279,7 +9234,7 @@ fn test_mixed_overlapping_and_non_overlapping() {
     let json_out = temp_dir.path().join("out.json");
 
     let status = Command::new(cargo_bin("fasterp"))
-        .args(&[
+        .args([
             "-i",
             r1_path.to_str().unwrap(),
             "-I",
@@ -9339,7 +9294,7 @@ IIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII
 
     // Enable polyG trimming with --trim-poly-g flag
     let status = Command::new(cargo_bin("fasterp"))
-        .args(&[
+        .args([
             "-i",
             r1_path.to_str().unwrap(),
             "-I",
@@ -9403,7 +9358,7 @@ IIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII
 
     // Set minimum length filter to 20bp
     let status = Command::new(cargo_bin("fasterp"))
-        .args(&[
+        .args([
             "-i",
             r1_path.to_str().unwrap(),
             "-I",
@@ -9476,7 +9431,7 @@ DDDDDIIHIIIIIIHHIIIIIIIIIIIIIIIIIIEHIGHEEHIIIIHI?GH
 
     // Set minimum length filter to 20bp
     let status = Command::new(cargo_bin("fasterp"))
-        .args(&[
+        .args([
             "-i",
             r1_path.to_str().unwrap(),
             "-I",
@@ -9504,7 +9459,7 @@ DDDDDIIHIIIIIIHHIIIIIIIIIIIIIIIIIIEHIGHEEHIIIIHI?GH
     let output_fq2 = temp_dir.path().join("fastp_out2.fq");
     let output_json = temp_dir.path().join("fastp_out.json");
 
-    let status = Command::new("/Users/drbh/.local/bin/fastp")
+    let status = Command::new("fastp")
         .arg("-i")
         .arg(&r1_path)
         .arg("-I")
@@ -9535,7 +9490,7 @@ DDDDDIIHIIIIIIHHIIIIIIIIIIIIIIIIIIEHIGHEEHIIIIHI?GH
 /// ```cpp
 /// while (offset > -(len2-overlapRequire)){  // BUG: should be >=
 /// ```
-/// This causes fastp to never check offset = -(read_length - min_overlap_length).
+/// This causes fastp to never check offset = -(`read_length` - `min_overlap_length`).
 ///
 /// **This test demonstrates:**
 /// Read pair SRR5808766.1362 has:
@@ -9547,7 +9502,7 @@ DDDDDIIHIIIIIIHHIIIIIIIIIIIIIIIIIIEHIGHEEHIIIIHI?GH
 /// - Trimmed portion contains 20 Q20+ bases and 1 Q16 base
 ///
 /// This explains the 20 Q20-base difference between fastp and fasterp.
-/// See fastp_offset_bug_analysis.md for detailed analysis.
+/// See `fastp_offset_bug_analysis.md` for detailed analysis.
 #[test]
 fn test_offset_negative_21_overlap_trimming_comparison() {
     let temp_dir = TempDir::new().unwrap();
@@ -9578,7 +9533,7 @@ D@@D@FHHHHH?HEHIE11FHHEHHII?HHHIIFEDCEHCHHC1FHFHCGE
     let fasterp_json = temp_dir.path().join("fasterp.json");
 
     let status = Command::new(cargo_bin("fasterp"))
-        .args(&[
+        .args([
             "-i",
             r1_path.to_str().unwrap(),
             "-I",
@@ -9602,8 +9557,8 @@ D@@D@FHHHHH?HEHIE11FHHEHHII?HHHIIFEDCEHCHHC1FHFHCGE
     let fastp_out2 = temp_dir.path().join("fastp_out2.fq");
     let fastp_json = temp_dir.path().join("fastp.json");
 
-    let status = Command::new("/Users/drbh/.local/bin/fastp")
-        .args(&[
+    let status = Command::new("fastp")
+        .args([
             "-i",
             r1_path.to_str().unwrap(),
             "-I",

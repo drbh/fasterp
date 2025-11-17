@@ -65,7 +65,7 @@ const LUT_BASE_TO_2BIT: [u8; 256] = {
     lut
 };
 
-/// Lookup table: base index for quality_curves (A=0, T=1, C=2, G=3)
+/// Lookup table: base index for `quality_curves` (A=0, T=1, C=2, G=3)
 /// Invalid bases map to 255 (sentinel value)
 const LUT_BASE_IDX: [u8; 256] = {
     let mut lut = [255u8; 256];
@@ -85,10 +85,14 @@ const LUT_BASE_IDX: [u8; 256] = {
 #[inline(always)]
 pub(crate) fn base_to_2bit(b: u8) -> Option<u32> {
     let code = LUT_BASE_TO_2BIT[b as usize];
-    if code == 255 { None } else { Some(code as u32) }
+    if code == 255 {
+        None
+    } else {
+        Some(u32::from(code))
+    }
 }
 
-/// Get base index for quality_curves: A=0, T=1, C=2, G=3
+/// Get base index for `quality_curves`: A=0, T=1, C=2, G=3
 /// Uses lookup table for O(1) performance
 #[inline(always)]
 pub(crate) fn base_idx(b: u8) -> Option<usize> {
@@ -148,7 +152,7 @@ pub(crate) fn kmer_to_str(code: usize) -> &'static str {
     unsafe { std::mem::transmute::<&str, &'static str>(cache[code].as_str()) }
 }
 
-/// Internal implementation of kmer_to_string
+/// Internal implementation of `kmer_to_string`
 fn kmer_to_string_impl(code: usize) -> String {
     let bases = [b'A', b'C', b'G', b'T'];
     let mut result = Vec::with_capacity(5);

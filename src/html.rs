@@ -4,7 +4,7 @@
 //! No external dependencies - just pure Rust string formatting.
 
 use crate::Args;
-use crate::stats::*;
+use crate::stats::{DetailedReadStats, FasterpReport, InsertSizeStats};
 use anyhow::{Context, Result};
 use std::fs::File;
 use std::io::Write;
@@ -490,10 +490,10 @@ fn write_kmer_table(html: &mut String, stats: &DetailedReadStats, title: &str) {
 
     // Calculate mean count for normalization
     let total_count: usize = kmer_vec.iter().map(|(_, c)| **c).sum();
-    let mean_count = if !kmer_vec.is_empty() {
-        total_count as f64 / kmer_vec.len() as f64
-    } else {
+    let mean_count = if kmer_vec.is_empty() {
         1.0
+    } else {
+        total_count as f64 / kmer_vec.len() as f64
     };
 
     // Create 16x16 grid (256 5-mers organized by first 3 and last 2 bases)
@@ -564,7 +564,7 @@ fn write_quality_histogram(
         html.push_str("var hist_trace = {\n");
         html.push_str("  x: [");
         let mut first = true;
-        for (q, _) in qual_hist.iter() {
+        for (q, _) in qual_hist {
             if !first {
                 html.push(',');
             }
@@ -574,7 +574,7 @@ fn write_quality_histogram(
         html.push_str("],\n  y: [");
 
         first = true;
-        for (_, count) in qual_hist.iter() {
+        for (_, count) in qual_hist {
             if !first {
                 html.push(',');
             }

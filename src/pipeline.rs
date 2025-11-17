@@ -9,17 +9,16 @@
 
 use anyhow::Result;
 use crossbeam_channel::{Receiver, Sender};
-use memchr;
 use std::collections::BTreeMap;
 use std::io::{IoSlice, Read, Write};
 use std::ops::Range;
 use std::sync::Arc;
 
-use crate::kmer::*;
+use crate::kmer::{base_idx, count_k5_2bit};
 use crate::processor::StreamAccumulator;
 use crate::simd;
-use crate::stats::*;
-use crate::trimming::*;
+use crate::stats::{PositionStats, SimpleStats};
+use crate::trimming::{TrimmingConfig, TrimmingResult, trim_read};
 
 /// Calculate sequence complexity as percentage of bases different from next base
 ///
@@ -48,16 +47,16 @@ fn calculate_complexity(seq: &[u8]) -> usize {
 /// A batch of FASTQ records parsed from a buffer
 ///
 /// Contains raw bytes and record positions (no String allocations)
-/// Each record is [header_start, seq_start, plus_start, qual_start] as byte offsets
+/// Each record is [`header_start`, `seq_start`, `plus_start`, `qual_start`] as byte offsets
 ///
 /// Uses Arc to allow zero-copy sharing of buffer between workers
 #[derive(Clone)]
 pub(crate) struct Batch {
     pub id: u64,
     pub buf: Arc<Vec<u8>>, // Shared buffer - no copying needed
-    /// Each element is [header_start, seq_start, plus_start, qual_start]
-    /// Lengths are implicit: header len = seq_start - header_start, etc.
-    /// Quality ends at the next record's header_start (or buf.len() for last record)
+    /// Each element is [`header_start`, `seq_start`, `plus_start`, `qual_start`]
+    /// Lengths are implicit: header len = `seq_start` - `header_start`, etc.
+    /// Quality ends at the next record's `header_start` (or `buf.len()` for last record)
     pub recs: Vec<[usize; 4]>,
 }
 
@@ -74,7 +73,7 @@ pub(crate) struct RecordPiece {
 
 /// Result from a worker thread (zero-copy version)
 ///
-/// Uses RecordPiece to avoid copying bytes - stores ranges instead
+/// Uses `RecordPiece` to avoid copying bytes - stores ranges instead
 pub(crate) struct WorkerResult {
     pub id: u64,
     pub pieces: Vec<RecordPiece>, // Zero-copy: ranges into shared buffers
@@ -155,7 +154,7 @@ pub(crate) struct PairedWorkerResult {
 
 /// Producer thread: read blocks and parse into batches
 ///
-/// Reads large blocks (batch_bytes) from input, parses FASTQ records,
+/// Reads large blocks (`batch_bytes`) from input, parses FASTQ records,
 /// and emits Batch structures with NO string allocations - just byte slices.
 ///
 /// Handles partial records at block boundaries by carrying them over to next batch.
@@ -201,22 +200,20 @@ pub(crate) fn producer_thread(
         // Decompression streams can return fewer bytes than requested even when more data exists.
         let is_eof = bytes_read == 0;
 
-        // Single-pass scan: find complete records AND line starts
+        // SIMD-accelerated newline scan using memchr (10-50x faster than naive loop)
         let mut complete_end = 0;
         let mut line_count = 0;
         let mut line_starts = vec![0];
 
-        for i in 0..actual_len {
-            if buffer[i] == b'\n' {
-                line_count += 1;
-                // After every 4 lines, we have a complete record
-                if line_count % 4 == 0 {
-                    complete_end = i + 1;
-                }
-                // Track line starts for parsing
-                if i + 1 < actual_len {
-                    line_starts.push(i + 1);
-                }
+        for newline_pos in memchr::memchr_iter(b'\n', &buffer[..actual_len]) {
+            line_count += 1;
+            // After every 4 lines, we have a complete record
+            if line_count % 4 == 0 {
+                complete_end = newline_pos + 1;
+            }
+            // Track line starts for parsing
+            if newline_pos + 1 < actual_len {
+                line_starts.push(newline_pos + 1);
             }
         }
 
@@ -348,7 +345,7 @@ pub(crate) fn worker_thread(
 
                 pos.ensure_capacity(seq.len());
                 for (i, (&b, &q)) in seq.iter().zip(qual).enumerate() {
-                    let qval = (q - 33) as u64;
+                    let qval = u64::from(q - 33);
                     pos.total_sum[i] += qval;
                     pos.total_cnt[i] += 1;
 
@@ -377,7 +374,7 @@ pub(crate) fn worker_thread(
 
                 pos.ensure_capacity(seq.len());
                 for (i, (&b, &q)) in seq.iter().zip(qual).enumerate() {
-                    let qval = (q - 33) as u32;
+                    let qval = u32::from(q - 33);
                     qsum += qval;
                     if q >= 53 {
                         q20 += 1;
@@ -395,11 +392,11 @@ pub(crate) fn worker_thread(
                         gc += 1;
                     }
 
-                    pos.total_sum[i] += qval as u64;
+                    pos.total_sum[i] += u64::from(qval);
                     pos.total_cnt[i] += 1;
 
                     if let Some(bi) = base_idx(b) {
-                        pos.base_sum[bi][i] += qval as u64;
+                        pos.base_sum[bi][i] += u64::from(qval);
                         pos.base_cnt[bi][i] += 1;
                     }
 
@@ -480,8 +477,8 @@ pub(crate) fn worker_thread(
 
             // Check average quality (fastp -e logic)
             if average_qual > 0 && trimmed_len > 0 {
-                let mean_qual = trimmed_qsum as f64 / trimmed_len as f64;
-                if mean_qual < average_qual as f64 {
+                let mean_qual = f64::from(trimmed_qsum) / trimmed_len as f64;
+                if mean_qual < f64::from(average_qual) {
                     low_quality += 1;
                     continue;
                 }
@@ -523,7 +520,7 @@ pub(crate) fn worker_thread(
             // Track position stats for after-filtering data (including histogram)
             pos_after.ensure_capacity(trimmed_len);
             for (i, (&b, &q)) in trimmed_seq.iter().zip(trimmed_qual).enumerate() {
-                let qval = (q - 33) as u64;
+                let qval = u64::from(q - 33);
                 pos_after.total_sum[i] += qval;
                 pos_after.total_cnt[i] += 1;
 
@@ -747,9 +744,9 @@ pub(crate) fn merger_thread(
 
 /// Paired-end producer thread: opens and reads both R1 and R2 files
 ///
-/// Opens files IN THIS THREAD to isolate GzDecoders from each other (workaround for flate2 bug).
+/// Opens files IN THIS THREAD to isolate `GzDecoders` from each other (workaround for flate2 bug).
 /// Reads blocks from both input files, parses FASTQ records, and emits
-/// PairedBatch structures with synchronized record counts.
+/// `PairedBatch` structures with synchronized record counts.
 pub(crate) fn paired_producer_thread_with_paths(
     input1: String,
     input2: String,
@@ -757,8 +754,8 @@ pub(crate) fn paired_producer_thread_with_paths(
     sender: Sender<Option<PairedBatch>>,
     num_workers: usize,
 ) -> Result<()> {
-    use std::io::Read;
     use crossbeam_channel::bounded;
+    use std::io::Read;
 
     // Create channels for decompressed data from dedicated decompressor threads
     let (decomp_tx1, decomp_rx1) = bounded::<(Vec<u8>, usize)>(2); // R1 decompressed chunks
@@ -769,13 +766,16 @@ pub(crate) fn paired_producer_thread_with_paths(
     let decomp_chunk_size = batch_bytes; // Use same size as batch_bytes
     let decomp_thread1 = std::thread::spawn(move || -> Result<()> {
         let mut reader = crate::io::open_input(&input1_clone)?;
+        // Reuse buffer to reduce allocations
+        let mut buffer = vec![0u8; decomp_chunk_size];
         loop {
-            let mut buffer = vec![0u8; decomp_chunk_size];
             let bytes_read = reader.read(&mut buffer)?;
             if bytes_read == 0 {
                 break;
             }
-            if decomp_tx1.send((buffer, bytes_read)).is_err() {
+            // Send a copy of the data (receiver owns it)
+            let data = buffer[..bytes_read].to_vec();
+            if decomp_tx1.send((data, bytes_read)).is_err() {
                 break; // Receiver dropped
             }
         }
@@ -786,13 +786,16 @@ pub(crate) fn paired_producer_thread_with_paths(
     let input2_clone = input2.clone();
     let decomp_thread2 = std::thread::spawn(move || -> Result<()> {
         let mut reader = crate::io::open_input(&input2_clone)?;
+        // Reuse buffer to reduce allocations
+        let mut buffer = vec![0u8; decomp_chunk_size];
         loop {
-            let mut buffer = vec![0u8; decomp_chunk_size];
             let bytes_read = reader.read(&mut buffer)?;
             if bytes_read == 0 {
                 break;
             }
-            if decomp_tx2.send((buffer, bytes_read)).is_err() {
+            // Send a copy of the data (receiver owns it)
+            let data = buffer[..bytes_read].to_vec();
+            if decomp_tx2.send((data, bytes_read)).is_err() {
                 break; // Receiver dropped
             }
         }
@@ -802,56 +805,42 @@ pub(crate) fn paired_producer_thread_with_paths(
     let mut batch_id = 0u64;
     let mut carryover1 = Vec::new();
     let mut carryover2 = Vec::new();
-    let mut buffer1 = vec![0u8; decomp_chunk_size];
-    let mut buffer2 = vec![0u8; decomp_chunk_size];
 
     loop {
         // Receive pre-decompressed chunks from parallel decompressor threads
-        let (chunk1, bytes_read1) = match decomp_rx1.recv() {
+        let (buffer1, bytes_read1) = match decomp_rx1.recv() {
             Ok(data) => data,
             Err(_) => (Vec::new(), 0), // Channel closed = EOF
         };
-        let (chunk2, bytes_read2) = match decomp_rx2.recv() {
+        let (buffer2, bytes_read2) = match decomp_rx2.recv() {
             Ok(data) => data,
             Err(_) => (Vec::new(), 0), // Channel closed = EOF
         };
-
-        // Copy received data into our reusable buffers
-        if bytes_read1 > buffer1.len() {
-            buffer1.resize(bytes_read1, 0);
-        }
-        if bytes_read2 > buffer2.len() {
-            buffer2.resize(bytes_read2, 0);
-        }
-        buffer1[..bytes_read1].copy_from_slice(&chunk1[..bytes_read1]);
-        buffer2[..bytes_read2].copy_from_slice(&chunk2[..bytes_read2]);
 
         // Prepend carryover for R1
         let carryover_len1 = carryover1.len();
-        let actual_len1 = if carryover_len1 > 0 {
-            if carryover_len1 + bytes_read1 > buffer1.len() {
-                buffer1.resize(carryover_len1 + bytes_read1, 0);
-            }
-            buffer1.copy_within(0..bytes_read1, carryover_len1);
-            buffer1[..carryover_len1].copy_from_slice(&carryover1);
+        let (data1, actual_len1) = if carryover_len1 > 0 {
+            let mut combined = Vec::with_capacity(carryover_len1 + bytes_read1);
+            combined.extend_from_slice(&carryover1);
+            combined.extend_from_slice(&buffer1[..bytes_read1]);
             carryover1.clear();
-            carryover_len1 + bytes_read1
+            let len = combined.len();
+            (combined, len)
         } else {
-            bytes_read1
+            (buffer1, bytes_read1)
         };
 
         // Prepend carryover for R2
         let carryover_len2 = carryover2.len();
-        let actual_len2 = if carryover_len2 > 0 {
-            if carryover_len2 + bytes_read2 > buffer2.len() {
-                buffer2.resize(carryover_len2 + bytes_read2, 0);
-            }
-            buffer2.copy_within(0..bytes_read2, carryover_len2);
-            buffer2[..carryover_len2].copy_from_slice(&carryover2);
+        let (data2, actual_len2) = if carryover_len2 > 0 {
+            let mut combined = Vec::with_capacity(carryover_len2 + bytes_read2);
+            combined.extend_from_slice(&carryover2);
+            combined.extend_from_slice(&buffer2[..bytes_read2]);
             carryover2.clear();
-            carryover_len2 + bytes_read2
+            let len = combined.len();
+            (combined, len)
         } else {
-            bytes_read2
+            (buffer2, bytes_read2)
         };
 
         // Check for EOF
@@ -870,10 +859,10 @@ pub(crate) fn paired_producer_thread_with_paths(
         let is_eof2 = bytes_read2 == 0;
 
         // Parse R1
-        let (complete_len1, mut recs1) = parse_fastq_buffer(&buffer1, actual_len1, is_eof1)?;
+        let (complete_len1, mut recs1) = parse_fastq_buffer(&data1, actual_len1, is_eof1)?;
 
         // Parse R2
-        let (complete_len2, mut recs2) = parse_fastq_buffer(&buffer2, actual_len2, is_eof2)?;
+        let (complete_len2, mut recs2) = parse_fastq_buffer(&data2, actual_len2, is_eof2)?;
 
         // Handle record count mismatch due to gzip decompression boundaries
         // Take the minimum number of complete records from both files
@@ -882,7 +871,19 @@ pub(crate) fn paired_producer_thread_with_paths(
         let adjusted_complete_len1;
         let adjusted_complete_len2;
 
-        if recs1.len() != recs2.len() {
+        if recs1.len() == recs2.len() {
+            // Same number of records - use all complete data
+            adjusted_complete_len1 = complete_len1;
+            adjusted_complete_len2 = complete_len2;
+
+            // Save incomplete data to carryover
+            if complete_len1 < actual_len1 {
+                carryover1.extend_from_slice(&data1[complete_len1..actual_len1]);
+            }
+            if complete_len2 < actual_len2 {
+                carryover2.extend_from_slice(&data2[complete_len2..actual_len2]);
+            }
+        } else {
             // Trim to same number of records
             if recs1.len() > num_pairs {
                 // R1 has more records - truncate and save excess to carryover
@@ -891,11 +892,10 @@ pub(crate) fn paired_producer_thread_with_paths(
                 if num_pairs > 0 {
                     let last_rec = recs1[num_pairs - 1];
                     // Find end of last record (after 4th line's newline)
-                    adjusted_complete_len1 = buffer1[last_rec[3]..complete_len1]
+                    adjusted_complete_len1 = data1[last_rec[3]..complete_len1]
                         .iter()
                         .position(|&b| b == b'\n')
-                        .map(|pos| last_rec[3] + pos + 1)
-                        .unwrap_or(complete_len1);
+                        .map_or(complete_len1, |pos| last_rec[3] + pos + 1);
                 } else {
                     adjusted_complete_len1 = 0;
                 }
@@ -905,11 +905,10 @@ pub(crate) fn paired_producer_thread_with_paths(
                 recs2.truncate(num_pairs);
                 if num_pairs > 0 {
                     let last_rec = recs2[num_pairs - 1];
-                    adjusted_complete_len2 = buffer2[last_rec[3]..complete_len2]
+                    adjusted_complete_len2 = data2[last_rec[3]..complete_len2]
                         .iter()
                         .position(|&b| b == b'\n')
-                        .map(|pos| last_rec[3] + pos + 1)
-                        .unwrap_or(complete_len2);
+                        .map_or(complete_len2, |pos| last_rec[3] + pos + 1);
                 } else {
                     adjusted_complete_len2 = 0;
                 }
@@ -918,30 +917,18 @@ pub(crate) fn paired_producer_thread_with_paths(
 
             // Save excess data to carryover
             if adjusted_complete_len1 < actual_len1 {
-                carryover1.extend_from_slice(&buffer1[adjusted_complete_len1..actual_len1]);
+                carryover1.extend_from_slice(&data1[adjusted_complete_len1..actual_len1]);
             }
             if adjusted_complete_len2 < actual_len2 {
-                carryover2.extend_from_slice(&buffer2[adjusted_complete_len2..actual_len2]);
-            }
-        } else {
-            // Same number of records - use all complete data
-            adjusted_complete_len1 = complete_len1;
-            adjusted_complete_len2 = complete_len2;
-
-            // Save incomplete data to carryover
-            if complete_len1 < actual_len1 {
-                carryover1.extend_from_slice(&buffer1[complete_len1..actual_len1]);
-            }
-            if complete_len2 < actual_len2 {
-                carryover2.extend_from_slice(&buffer2[complete_len2..actual_len2]);
+                carryover2.extend_from_slice(&data2[adjusted_complete_len2..actual_len2]);
             }
         }
 
         if !recs1.is_empty() {
             let batch = PairedBatch {
                 id: batch_id,
-                buf_r1: Arc::new(buffer1[..adjusted_complete_len1].to_vec()),
-                buf_r2: Arc::new(buffer2[..adjusted_complete_len2].to_vec()),
+                buf_r1: Arc::new(data1[..adjusted_complete_len1].to_vec()),
+                buf_r2: Arc::new(data2[..adjusted_complete_len2].to_vec()),
                 recs_r1: recs1,
                 recs_r2: recs2,
             };
@@ -959,7 +946,7 @@ pub(crate) fn paired_producer_thread_with_paths(
 }
 
 /// Helper function to parse FASTQ records from a buffer
-/// Returns (complete_len, records)
+/// Returns (`complete_len`, records)
 fn parse_fastq_buffer(
     buffer: &[u8],
     actual_len: usize,
@@ -1234,12 +1221,11 @@ pub(crate) fn paired_worker_thread(
             // Try overlap-based adapter trimming first
             // Always use overlap-based trimming when overlap is detected (fastp does this)
             let overlap_trimmed = if let Some(ref overlap) = overlap_result {
-                let trim_result = crate::overlap::trim_by_overlap_analysis(
+                crate::overlap::trim_by_overlap_analysis(
                     final_umi_seq1.len(),
                     final_umi_seq2.len(),
                     overlap,
-                );
-                trim_result
+                )
             } else {
                 None
             };
@@ -1450,14 +1436,14 @@ pub(crate) fn paired_worker_thread(
             // Check average quality (EITHER read fails = BOTH fail)
             if average_qual > 0 {
                 if !final_seq1.is_empty() {
-                    let mean_qual1 = trimmed_stats1.qsum as f64 / final_seq1.len() as f64;
-                    if mean_qual1 < average_qual as f64 {
+                    let mean_qual1 = f64::from(trimmed_stats1.qsum) / final_seq1.len() as f64;
+                    if mean_qual1 < f64::from(average_qual) {
                         fail_quality = true;
                     }
                 }
                 if !final_seq2.is_empty() {
-                    let mean_qual2 = trimmed_stats2.qsum as f64 / final_seq2.len() as f64;
-                    if mean_qual2 < average_qual as f64 {
+                    let mean_qual2 = f64::from(trimmed_stats2.qsum) / final_seq2.len() as f64;
+                    if mean_qual2 < f64::from(average_qual) {
                         fail_quality = true;
                     }
                 }
@@ -1717,7 +1703,7 @@ fn update_position_stats(pos: &mut PositionStats, seq: &[u8], qual: &[u8]) {
 
     for i in 0..seq.len() {
         let q = qual[i];
-        let qval = (q - 33) as u64;
+        let qval = u64::from(q - 33);
         let b = seq[i];
 
         pos.total_sum[i] += qval;
@@ -1770,246 +1756,237 @@ pub(crate) fn paired_merger_thread(
     let newline = [b'\n'];
 
     while let Ok(msg) = receiver.recv() {
-        match msg {
-            Some(result) => {
-                pending.insert(result.id, result);
+        if let Some(result) = msg {
+            pending.insert(result.id, result);
 
-                // Process all consecutive batches
-                while let Some(result) = pending.remove(&next_id) {
-                    // Write all passed records using vectored I/O with proper partial write handling
-                    for piece in &result.pieces {
-                        // Write R1 with partial write handling
-                        let b1 = &piece.r1.buf;
-                        let mut iov1 = [
-                            IoSlice::new(&b1[piece.r1.header.clone()]),
-                            IoSlice::new(&newline),
-                            IoSlice::new(&b1[piece.r1.seq.clone()]),
-                            IoSlice::new(&newline),
-                            IoSlice::new(&b1[piece.r1.plus.clone()]),
-                            IoSlice::new(&newline),
-                            IoSlice::new(&b1[piece.r1.qual.clone()]),
-                            IoSlice::new(&newline),
-                        ];
+            // Process all consecutive batches
+            while let Some(result) = pending.remove(&next_id) {
+                // Write all passed records using vectored I/O with proper partial write handling
+                for piece in &result.pieces {
+                    // Write R1 with partial write handling
+                    let b1 = &piece.r1.buf;
+                    let mut iov1 = [
+                        IoSlice::new(&b1[piece.r1.header.clone()]),
+                        IoSlice::new(&newline),
+                        IoSlice::new(&b1[piece.r1.seq.clone()]),
+                        IoSlice::new(&newline),
+                        IoSlice::new(&b1[piece.r1.plus.clone()]),
+                        IoSlice::new(&newline),
+                        IoSlice::new(&b1[piece.r1.qual.clone()]),
+                        IoSlice::new(&newline),
+                    ];
 
-                        let mut written = 0;
-                        let total: usize = iov1.iter().map(|s| s.len()).sum();
-                        while written < total {
-                            let n = writer1.write_vectored(&iov1)?;
-                            if n == 0 {
-                                return Err(std::io::Error::new(
-                                    std::io::ErrorKind::WriteZero,
-                                    "failed to write vectored R1",
-                                )
-                                .into());
-                            }
-                            written += n;
-                            // Advance the slices
-                            let mut skip = n;
-                            for slice in &mut iov1 {
-                                let len = slice.len();
-                                if skip >= len {
-                                    skip -= len;
-                                    *slice = IoSlice::new(&[]);
-                                } else {
-                                    let data = unsafe {
-                                        std::slice::from_raw_parts(
-                                            slice.as_ptr().add(skip),
-                                            len - skip,
-                                        )
-                                    };
-                                    *slice = IoSlice::new(data);
-                                    break;
-                                }
-                            }
+                    let mut written = 0;
+                    let total: usize = iov1.iter().map(|s| s.len()).sum();
+                    while written < total {
+                        let n = writer1.write_vectored(&iov1)?;
+                        if n == 0 {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::WriteZero,
+                                "failed to write vectored R1",
+                            )
+                            .into());
                         }
-
-                        // Write R2 with partial write handling
-                        let b2 = &piece.r2.buf;
-                        let mut iov2 = [
-                            IoSlice::new(&b2[piece.r2.header.clone()]),
-                            IoSlice::new(&newline),
-                            IoSlice::new(&b2[piece.r2.seq.clone()]),
-                            IoSlice::new(&newline),
-                            IoSlice::new(&b2[piece.r2.plus.clone()]),
-                            IoSlice::new(&newline),
-                            IoSlice::new(&b2[piece.r2.qual.clone()]),
-                            IoSlice::new(&newline),
-                        ];
-
-                        let mut written = 0;
-                        let total: usize = iov2.iter().map(|s| s.len()).sum();
-                        while written < total {
-                            let n = writer2.write_vectored(&iov2)?;
-                            if n == 0 {
-                                return Err(std::io::Error::new(
-                                    std::io::ErrorKind::WriteZero,
-                                    "failed to write vectored R2",
-                                )
-                                .into());
-                            }
-                            written += n;
-                            // Advance the slices
-                            let mut skip = n;
-                            for slice in &mut iov2 {
-                                let len = slice.len();
-                                if skip >= len {
-                                    skip -= len;
-                                    *slice = IoSlice::new(&[]);
-                                } else {
-                                    let data = unsafe {
-                                        std::slice::from_raw_parts(
-                                            slice.as_ptr().add(skip),
-                                            len - skip,
-                                        )
-                                    };
-                                    *slice = IoSlice::new(data);
-                                    break;
-                                }
+                        written += n;
+                        // Advance the slices
+                        let mut skip = n;
+                        for slice in &mut iov1 {
+                            let len = slice.len();
+                            if skip >= len {
+                                skip -= len;
+                                *slice = IoSlice::new(&[]);
+                            } else {
+                                let data = unsafe {
+                                    std::slice::from_raw_parts(slice.as_ptr().add(skip), len - skip)
+                                };
+                                *slice = IoSlice::new(data);
+                                break;
                             }
                         }
                     }
 
-                    // Merge stats - R1
-                    acc.before_r1.total_reads += result.before_r1.total_reads;
-                    acc.before_r1.total_bases += result.before_r1.total_bases;
-                    acc.before_r1.q20_bases += result.before_r1.q20_bases;
-                    acc.before_r1.q30_bases += result.before_r1.q30_bases;
-                    acc.before_r1.q40_bases += result.before_r1.q40_bases;
-                    acc.before_r1.gc_bases += result.before_r1.gc_bases;
+                    // Write R2 with partial write handling
+                    let b2 = &piece.r2.buf;
+                    let mut iov2 = [
+                        IoSlice::new(&b2[piece.r2.header.clone()]),
+                        IoSlice::new(&newline),
+                        IoSlice::new(&b2[piece.r2.seq.clone()]),
+                        IoSlice::new(&newline),
+                        IoSlice::new(&b2[piece.r2.plus.clone()]),
+                        IoSlice::new(&newline),
+                        IoSlice::new(&b2[piece.r2.qual.clone()]),
+                        IoSlice::new(&newline),
+                    ];
 
-                    acc.after_r1.total_reads += result.after_r1.total_reads;
-                    acc.after_r1.total_bases += result.after_r1.total_bases;
-                    acc.after_r1.q20_bases += result.after_r1.q20_bases;
-                    acc.after_r1.q30_bases += result.after_r1.q30_bases;
-                    acc.after_r1.q40_bases += result.after_r1.q40_bases;
-                    acc.after_r1.gc_bases += result.after_r1.gc_bases;
-
-                    // Merge stats - R2
-                    acc.before_r2.total_reads += result.before_r2.total_reads;
-                    acc.before_r2.total_bases += result.before_r2.total_bases;
-                    acc.before_r2.q20_bases += result.before_r2.q20_bases;
-                    acc.before_r2.q30_bases += result.before_r2.q30_bases;
-                    acc.before_r2.q40_bases += result.before_r2.q40_bases;
-                    acc.before_r2.gc_bases += result.before_r2.gc_bases;
-
-                    acc.after_r2.total_reads += result.after_r2.total_reads;
-                    acc.after_r2.total_bases += result.after_r2.total_bases;
-                    acc.after_r2.q20_bases += result.after_r2.q20_bases;
-                    acc.after_r2.q30_bases += result.after_r2.q30_bases;
-                    acc.after_r2.q40_bases += result.after_r2.q40_bases;
-                    acc.after_r2.gc_bases += result.after_r2.gc_bases;
-
-                    // Merge position stats - R1
-                    acc.pos_r1.ensure_capacity(result.pos_r1.total_sum.len());
-                    for i in 0..result.pos_r1.total_sum.len() {
-                        acc.pos_r1.total_sum[i] += result.pos_r1.total_sum[i];
-                        acc.pos_r1.total_cnt[i] += result.pos_r1.total_cnt[i];
-                        for b in 0..4 {
-                            acc.pos_r1.base_sum[b][i] += result.pos_r1.base_sum[b][i];
-                            acc.pos_r1.base_cnt[b][i] += result.pos_r1.base_cnt[b][i];
+                    let mut written = 0;
+                    let total: usize = iov2.iter().map(|s| s.len()).sum();
+                    while written < total {
+                        let n = writer2.write_vectored(&iov2)?;
+                        if n == 0 {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::WriteZero,
+                                "failed to write vectored R2",
+                            )
+                            .into());
+                        }
+                        written += n;
+                        // Advance the slices
+                        let mut skip = n;
+                        for slice in &mut iov2 {
+                            let len = slice.len();
+                            if skip >= len {
+                                skip -= len;
+                                *slice = IoSlice::new(&[]);
+                            } else {
+                                let data = unsafe {
+                                    std::slice::from_raw_parts(slice.as_ptr().add(skip), len - skip)
+                                };
+                                *slice = IoSlice::new(data);
+                                break;
+                            }
                         }
                     }
-                    // Merge quality histogram - R1 before filtering
-                    for (i, &count) in result.pos_r1.qual_hist.iter().enumerate() {
-                        acc.pos_r1.qual_hist[i] += count;
-                    }
-
-                    // Merge position stats - R2
-                    acc.pos_r2.ensure_capacity(result.pos_r2.total_sum.len());
-                    for i in 0..result.pos_r2.total_sum.len() {
-                        acc.pos_r2.total_sum[i] += result.pos_r2.total_sum[i];
-                        acc.pos_r2.total_cnt[i] += result.pos_r2.total_cnt[i];
-                        for b in 0..4 {
-                            acc.pos_r2.base_sum[b][i] += result.pos_r2.base_sum[b][i];
-                            acc.pos_r2.base_cnt[b][i] += result.pos_r2.base_cnt[b][i];
-                        }
-                    }
-                    // Merge quality histogram - R2 before filtering
-                    for (i, &count) in result.pos_r2.qual_hist.iter().enumerate() {
-                        acc.pos_r2.qual_hist[i] += count;
-                    }
-
-                    // Merge position stats after filtering - R1
-                    acc.pos_r1_after
-                        .ensure_capacity(result.pos_r1_after.total_sum.len());
-                    for i in 0..result.pos_r1_after.total_sum.len() {
-                        acc.pos_r1_after.total_sum[i] += result.pos_r1_after.total_sum[i];
-                        acc.pos_r1_after.total_cnt[i] += result.pos_r1_after.total_cnt[i];
-                        for b in 0..4 {
-                            acc.pos_r1_after.base_sum[b][i] += result.pos_r1_after.base_sum[b][i];
-                            acc.pos_r1_after.base_cnt[b][i] += result.pos_r1_after.base_cnt[b][i];
-                        }
-                    }
-
-                    // Merge position stats after filtering - R2
-                    acc.pos_r2_after
-                        .ensure_capacity(result.pos_r2_after.total_sum.len());
-                    for i in 0..result.pos_r2_after.total_sum.len() {
-                        acc.pos_r2_after.total_sum[i] += result.pos_r2_after.total_sum[i];
-                        acc.pos_r2_after.total_cnt[i] += result.pos_r2_after.total_cnt[i];
-                        for b in 0..4 {
-                            acc.pos_r2_after.base_sum[b][i] += result.pos_r2_after.base_sum[b][i];
-                            acc.pos_r2_after.base_cnt[b][i] += result.pos_r2_after.base_cnt[b][i];
-                        }
-                    }
-
-                    // Merge quality histograms for after filtering
-                    for (i, &count) in result.pos_r1_after.qual_hist.iter().enumerate() {
-                        acc.pos_r1_after.qual_hist[i] += count;
-                    }
-                    for (i, &count) in result.pos_r2_after.qual_hist.iter().enumerate() {
-                        acc.pos_r2_after.qual_hist[i] += count;
-                    }
-
-                    for (i, &count) in result.k5_r1.iter().enumerate() {
-                        acc.kmer_table_r1[i] += count;
-                    }
-                    for (i, &count) in result.k5_r2.iter().enumerate() {
-                        acc.kmer_table_r2[i] += count;
-                    }
-
-                    // Merge kmer tables for after filtering
-                    for (i, &count) in result.k5_r1_after.iter().enumerate() {
-                        acc.kmer_table_r1_after[i] += count;
-                    }
-                    for (i, &count) in result.k5_r2_after.iter().enumerate() {
-                        acc.kmer_table_r2_after[i] += count;
-                    }
-
-                    acc.too_short += result.too_short;
-                    acc.too_many_n += result.too_many_n;
-                    acc.low_quality += result.low_quality;
-                    acc.low_complexity += result.low_complexity;
-                    acc.invalid += result.invalid;
-                    acc.duplicated += result.duplicated;
-
-                    // Merge adapter trimming stats
-                    acc.adapter_trimmed_reads += result.adapter_trimmed_reads;
-                    acc.adapter_trimmed_bases += result.adapter_trimmed_bases;
-
-                    // Merge insert size histograms
-                    for (i, &count) in result.insert_size_histogram.iter().enumerate() {
-                        if i < acc.insert_size_histogram.len() {
-                            acc.insert_size_histogram[i] += count;
-                        }
-                    }
-                    acc.insert_size_unknown += result.insert_size_unknown;
-
-                    if result.pos_r1.total_sum.len() > acc.max_cycle_r1 {
-                        acc.max_cycle_r1 = result.pos_r1.total_sum.len();
-                    }
-                    if result.pos_r2.total_sum.len() > acc.max_cycle_r2 {
-                        acc.max_cycle_r2 = result.pos_r2.total_sum.len();
-                    }
-
-                    next_id += 1;
                 }
+
+                // Merge stats - R1
+                acc.before_r1.total_reads += result.before_r1.total_reads;
+                acc.before_r1.total_bases += result.before_r1.total_bases;
+                acc.before_r1.q20_bases += result.before_r1.q20_bases;
+                acc.before_r1.q30_bases += result.before_r1.q30_bases;
+                acc.before_r1.q40_bases += result.before_r1.q40_bases;
+                acc.before_r1.gc_bases += result.before_r1.gc_bases;
+
+                acc.after_r1.total_reads += result.after_r1.total_reads;
+                acc.after_r1.total_bases += result.after_r1.total_bases;
+                acc.after_r1.q20_bases += result.after_r1.q20_bases;
+                acc.after_r1.q30_bases += result.after_r1.q30_bases;
+                acc.after_r1.q40_bases += result.after_r1.q40_bases;
+                acc.after_r1.gc_bases += result.after_r1.gc_bases;
+
+                // Merge stats - R2
+                acc.before_r2.total_reads += result.before_r2.total_reads;
+                acc.before_r2.total_bases += result.before_r2.total_bases;
+                acc.before_r2.q20_bases += result.before_r2.q20_bases;
+                acc.before_r2.q30_bases += result.before_r2.q30_bases;
+                acc.before_r2.q40_bases += result.before_r2.q40_bases;
+                acc.before_r2.gc_bases += result.before_r2.gc_bases;
+
+                acc.after_r2.total_reads += result.after_r2.total_reads;
+                acc.after_r2.total_bases += result.after_r2.total_bases;
+                acc.after_r2.q20_bases += result.after_r2.q20_bases;
+                acc.after_r2.q30_bases += result.after_r2.q30_bases;
+                acc.after_r2.q40_bases += result.after_r2.q40_bases;
+                acc.after_r2.gc_bases += result.after_r2.gc_bases;
+
+                // Merge position stats - R1
+                acc.pos_r1.ensure_capacity(result.pos_r1.total_sum.len());
+                for i in 0..result.pos_r1.total_sum.len() {
+                    acc.pos_r1.total_sum[i] += result.pos_r1.total_sum[i];
+                    acc.pos_r1.total_cnt[i] += result.pos_r1.total_cnt[i];
+                    for b in 0..4 {
+                        acc.pos_r1.base_sum[b][i] += result.pos_r1.base_sum[b][i];
+                        acc.pos_r1.base_cnt[b][i] += result.pos_r1.base_cnt[b][i];
+                    }
+                }
+                // Merge quality histogram - R1 before filtering
+                for (i, &count) in result.pos_r1.qual_hist.iter().enumerate() {
+                    acc.pos_r1.qual_hist[i] += count;
+                }
+
+                // Merge position stats - R2
+                acc.pos_r2.ensure_capacity(result.pos_r2.total_sum.len());
+                for i in 0..result.pos_r2.total_sum.len() {
+                    acc.pos_r2.total_sum[i] += result.pos_r2.total_sum[i];
+                    acc.pos_r2.total_cnt[i] += result.pos_r2.total_cnt[i];
+                    for b in 0..4 {
+                        acc.pos_r2.base_sum[b][i] += result.pos_r2.base_sum[b][i];
+                        acc.pos_r2.base_cnt[b][i] += result.pos_r2.base_cnt[b][i];
+                    }
+                }
+                // Merge quality histogram - R2 before filtering
+                for (i, &count) in result.pos_r2.qual_hist.iter().enumerate() {
+                    acc.pos_r2.qual_hist[i] += count;
+                }
+
+                // Merge position stats after filtering - R1
+                acc.pos_r1_after
+                    .ensure_capacity(result.pos_r1_after.total_sum.len());
+                for i in 0..result.pos_r1_after.total_sum.len() {
+                    acc.pos_r1_after.total_sum[i] += result.pos_r1_after.total_sum[i];
+                    acc.pos_r1_after.total_cnt[i] += result.pos_r1_after.total_cnt[i];
+                    for b in 0..4 {
+                        acc.pos_r1_after.base_sum[b][i] += result.pos_r1_after.base_sum[b][i];
+                        acc.pos_r1_after.base_cnt[b][i] += result.pos_r1_after.base_cnt[b][i];
+                    }
+                }
+
+                // Merge position stats after filtering - R2
+                acc.pos_r2_after
+                    .ensure_capacity(result.pos_r2_after.total_sum.len());
+                for i in 0..result.pos_r2_after.total_sum.len() {
+                    acc.pos_r2_after.total_sum[i] += result.pos_r2_after.total_sum[i];
+                    acc.pos_r2_after.total_cnt[i] += result.pos_r2_after.total_cnt[i];
+                    for b in 0..4 {
+                        acc.pos_r2_after.base_sum[b][i] += result.pos_r2_after.base_sum[b][i];
+                        acc.pos_r2_after.base_cnt[b][i] += result.pos_r2_after.base_cnt[b][i];
+                    }
+                }
+
+                // Merge quality histograms for after filtering
+                for (i, &count) in result.pos_r1_after.qual_hist.iter().enumerate() {
+                    acc.pos_r1_after.qual_hist[i] += count;
+                }
+                for (i, &count) in result.pos_r2_after.qual_hist.iter().enumerate() {
+                    acc.pos_r2_after.qual_hist[i] += count;
+                }
+
+                for (i, &count) in result.k5_r1.iter().enumerate() {
+                    acc.kmer_table_r1[i] += count;
+                }
+                for (i, &count) in result.k5_r2.iter().enumerate() {
+                    acc.kmer_table_r2[i] += count;
+                }
+
+                // Merge kmer tables for after filtering
+                for (i, &count) in result.k5_r1_after.iter().enumerate() {
+                    acc.kmer_table_r1_after[i] += count;
+                }
+                for (i, &count) in result.k5_r2_after.iter().enumerate() {
+                    acc.kmer_table_r2_after[i] += count;
+                }
+
+                acc.too_short += result.too_short;
+                acc.too_many_n += result.too_many_n;
+                acc.low_quality += result.low_quality;
+                acc.low_complexity += result.low_complexity;
+                acc.invalid += result.invalid;
+                acc.duplicated += result.duplicated;
+
+                // Merge adapter trimming stats
+                acc.adapter_trimmed_reads += result.adapter_trimmed_reads;
+                acc.adapter_trimmed_bases += result.adapter_trimmed_bases;
+
+                // Merge insert size histograms
+                for (i, &count) in result.insert_size_histogram.iter().enumerate() {
+                    if i < acc.insert_size_histogram.len() {
+                        acc.insert_size_histogram[i] += count;
+                    }
+                }
+                acc.insert_size_unknown += result.insert_size_unknown;
+
+                if result.pos_r1.total_sum.len() > acc.max_cycle_r1 {
+                    acc.max_cycle_r1 = result.pos_r1.total_sum.len();
+                }
+                if result.pos_r2.total_sum.len() > acc.max_cycle_r2 {
+                    acc.max_cycle_r2 = result.pos_r2.total_sum.len();
+                }
+
+                next_id += 1;
             }
-            None => {
-                workers_done += 1;
-                if workers_done == num_workers {
-                    break;
-                }
+        } else {
+            workers_done += 1;
+            if workers_done == num_workers {
+                break;
             }
         }
     }

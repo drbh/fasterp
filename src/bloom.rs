@@ -19,7 +19,7 @@ pub struct DuplicateDetector {
     buf_len_in_bytes: usize,
     /// Number of hash buffers (determines number of hash functions)
     buf_num: usize,
-    /// Prime numbers for hashing (buf_num * PRIME_ARRAY_LEN)
+    /// Prime numbers for hashing (`buf_num` * `PRIME_ARRAY_LEN`)
     prime_arrays: Vec<u64>,
     /// Mask for prime array indexing
     offset_mask: usize,
@@ -122,7 +122,7 @@ impl DuplicateDetector {
     }
 
     /// Hash sequence to integer vector (matches fastp's seq2intvector)
-    /// For paired-end, call twice: once for R1 (pos_offset=0) and once for R2 (pos_offset=R1.len())
+    /// For paired-end, call twice: once for R1 (`pos_offset=0`) and once for R2 (`pos_offset=R1.len()`)
     fn seq2intvector(&self, data: &[u8], pos_offset: usize, output: &mut [u64]) {
         for (p, &base_char) in data.iter().enumerate() {
             let base: u64 = match base_char {

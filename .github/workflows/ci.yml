@@ -49,7 +49,7 @@ jobs:
       run: cargo build --release
 
     - name: Run tests
-      run: cargo test
+      run: cargo test --release
       env:
         RUST_BACKTRACE: 1
 

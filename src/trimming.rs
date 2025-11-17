@@ -145,10 +145,10 @@ pub(crate) fn trim_tail_sliding_window(qual: &[u8], window_size: usize, cutoff: 
         let window_qual = &qual[start..end_pos];
 
         // Calculate mean quality of window (Phred+33)
-        let sum: u32 = window_qual.iter().map(|&q| (q - 33) as u32).sum();
-        let mean_qual = sum as f64 / window_size as f64;
+        let sum: u32 = window_qual.iter().map(|&q| u32::from(q - 33)).sum();
+        let mean_qual = f64::from(sum) / window_size as f64;
 
-        if mean_qual >= cutoff as f64 {
+        if mean_qual >= f64::from(cutoff) {
             return end_pos; // Found acceptable window
         }
     }
@@ -180,10 +180,10 @@ pub(crate) fn trim_front_sliding_window(qual: &[u8], window_size: usize, cutoff:
         let end = start_pos + window_size;
         let window_qual = &qual[start_pos..end];
 
-        let sum: u32 = window_qual.iter().map(|&q| (q - 33) as u32).sum();
-        let mean_qual = sum as f64 / window_size as f64;
+        let sum: u32 = window_qual.iter().map(|&q| u32::from(q - 33)).sum();
+        let mean_qual = f64::from(sum) / window_size as f64;
 
-        if mean_qual >= cutoff as f64 {
+        if mean_qual >= f64::from(cutoff) {
             return start_pos; // Found acceptable window
         }
     }
@@ -256,18 +256,18 @@ pub(crate) fn detect_poly_x_tail(seq: &[u8], min_len: usize) -> usize {
 /// 3. Quality sliding window front trimming (if enabled)
 /// 4. Quality sliding window tail trimming (if enabled)
 /// 5. Adapter trimming
-/// 6. PolyG tail trimming
-/// 7. PolyX tail trimming
+/// 6. `PolyG` tail trimming
+/// 7. `PolyX` tail trimming
 /// 8. Maximum length trimming
 ///
 /// # Arguments
 /// * `seq` - Nucleotide sequence
 /// * `qual` - Quality scores
 /// * `config` - Trimming configuration
-/// * `adapter_override` - Optional adapter sequence to use instead of config.adapter_config.adapter_seq (for PE read2)
+/// * `adapter_override` - Optional adapter sequence to use instead of `config.adapter_config.adapter_seq` (for PE read2)
 ///
 /// # Returns
-/// TrimmingResult with start/end positions and statistics
+/// `TrimmingResult` with start/end positions and statistics
 pub(crate) fn trim_read(seq: &[u8], qual: &[u8], config: &TrimmingConfig) -> TrimmingResult {
     trim_read_with_adapter(seq, qual, config, None)
 }

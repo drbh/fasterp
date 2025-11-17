@@ -1,10 +1,10 @@
 //! Input/output handling with compression support
 //!
 //! This module provides I/O abstraction with automatic compression detection:
-//! - CompressionFormat: Detect compression from file extension or magic bytes
-//! - open_input(): Open input with auto-decompression (gzip support)
-//! - OutputWriter: Wrapper for BufWriter with optional compression
-//! - open_output(): Open output with optional compression
+//! - `CompressionFormat`: Detect compression from file extension or magic bytes
+//! - `open_input()`: Open input with auto-decompression (gzip support)
+//! - `OutputWriter`: Wrapper for `BufWriter` with optional compression
+//! - `open_output()`: Open output with optional compression
 
 use anyhow::{Context, Result};
 use flate2::Compression;
@@ -63,9 +63,11 @@ pub(crate) fn open_input(path: &str) -> Result<Box<dyn BufRead + Send>> {
 
         match format {
             CompressionFormat::Gzip => {
-                let decoder = GzDecoder::new(file);
-                // Use same 16MB buffer as uncompressed - decompression is fast enough
-                let reader = BufReader::with_capacity(16 * 1024 * 1024, decoder);
+                // Use larger input buffer for compressed file (64MB) to reduce syscalls
+                let buffered_file = BufReader::with_capacity(64 * 1024 * 1024, file);
+                let decoder = GzDecoder::new(buffered_file);
+                // Use 32MB output buffer for decompressed data
+                let reader = BufReader::with_capacity(32 * 1024 * 1024, decoder);
                 Ok(Box::new(reader))
             }
             CompressionFormat::None => {

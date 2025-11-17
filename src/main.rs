@@ -8,7 +8,6 @@
 use anyhow::{Context, Result};
 use clap::Parser;
 use crossbeam_channel::bounded;
-use indexmap::IndexMap;
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::thread;
@@ -29,11 +28,14 @@ mod trimming;
 mod umi;
 mod util;
 
-use io::*;
-use pipeline::*;
-use processor::*;
-use stats::*;
-use trimming::*;
+use io::open_input;
+use pipeline::{Batch, WorkerResult, merger_thread, producer_thread, worker_thread};
+use processor::{PairedEndAccumulator, process_fastq_stream, process_paired_fastq_stream};
+use stats::{
+    AdapterCuttingStats, DetailedReadStats, DuplicationStats, FasterpReport, FilteringResult,
+    InsertSizeStats, ReadStats, Summary,
+};
+use trimming::TrimmingConfig;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about = "A fast FASTQ preprocessor", long_about = None)]
@@ -251,7 +253,7 @@ struct Args {
     #[arg(long)]
     umi: bool,
 
-    /// UMI location: read1/read2/index1/index2/per_read/per_index (default: read1)
+    /// UMI location: `read1/read2/index1/index2/per_read/per_index` (default: read1)
     #[arg(long, default_value = "read1")]
     umi_loc: String,
 
@@ -299,7 +301,10 @@ fn create_trimming_config(args: &Args) -> TrimmingConfig {
     // Create adapter configuration
     let mut adapter_config = AdapterConfig::new();
 
-    if !args.disable_adapter_trimming {
+    if args.disable_adapter_trimming {
+        // If adapter trimming is disabled entirely, also disable auto-detection
+        adapter_config.detect_adapter_for_pe = false;
+    } else {
         // Set manual adapter sequences if provided
         if let Some(ref seq) = args.adapter_sequence {
             adapter_config.adapter_seq = Some(seq.as_bytes().to_vec());
@@ -314,9 +319,6 @@ fn create_trimming_config(args: &Args) -> TrimmingConfig {
             adapter_config.detect_adapter_for_pe = false;
         }
         // Otherwise keep the default (true, auto-detection enabled)
-    } else {
-        // If adapter trimming is disabled entirely, also disable auto-detection
-        adapter_config.detect_adapter_for_pe = false;
     }
 
     // Determine trim values - prefer read-specific args, fall back to generic
@@ -331,7 +333,7 @@ fn create_trimming_config(args: &Args) -> TrimmingConfig {
         args.trim_tail
     };
 
-    let config = TrimmingConfig {
+    TrimmingConfig {
         enable_trim_front: args.cut_front && args.cut_mean_quality > 0,
         enable_trim_tail: args.cut_tail && args.cut_mean_quality > 0 && !args.disable_trim_tail,
         cut_mean_quality: args.cut_mean_quality,
@@ -343,8 +345,7 @@ fn create_trimming_config(args: &Args) -> TrimmingConfig {
         enable_poly_x: args.trim_poly_x,
         poly_min_len: args.poly_g_min_len,
         adapter_config,
-    };
-    config
+    }
 }
 
 // Helper function to create TrimmingConfig for read2 in paired-end mode
@@ -354,7 +355,10 @@ fn create_trimming_config_r2(args: &Args) -> TrimmingConfig {
     // Create adapter configuration for R2
     let mut adapter_config = AdapterConfig::new();
 
-    if !args.disable_adapter_trimming {
+    if args.disable_adapter_trimming {
+        // If adapter trimming is disabled entirely, also disable auto-detection
+        adapter_config.detect_adapter_for_pe = false;
+    } else {
         // For R2, use adapter_seq_r2 if specified
         if let Some(ref seq) = args.adapter_sequence_r2 {
             adapter_config.adapter_seq = Some(seq.as_bytes().to_vec());
@@ -368,9 +372,6 @@ fn create_trimming_config_r2(args: &Args) -> TrimmingConfig {
             adapter_config.detect_adapter_for_pe = false;
         }
         // Otherwise keep the default (true, auto-detection enabled)
-    } else {
-        // If adapter trimming is disabled entirely, also disable auto-detection
-        adapter_config.detect_adapter_for_pe = false;
     }
 
     // Determine trim values for R2
@@ -398,7 +399,7 @@ fn create_trimming_config_r2(args: &Args) -> TrimmingConfig {
         args.max_len1
     };
 
-    let config = TrimmingConfig {
+    TrimmingConfig {
         enable_trim_front: args.cut_front && args.cut_mean_quality > 0,
         enable_trim_tail: args.cut_tail && args.cut_mean_quality > 0 && !args.disable_trim_tail,
         cut_mean_quality: args.cut_mean_quality,
@@ -410,8 +411,7 @@ fn create_trimming_config_r2(args: &Args) -> TrimmingConfig {
         enable_poly_x: args.trim_poly_x,
         poly_min_len: args.poly_g_min_len,
         adapter_config,
-    };
-    config
+    }
 }
 
 // Helper function to create OverlapConfig from CLI args
@@ -538,7 +538,7 @@ fn build_and_write_paired_end_report(
     } else {
         let dup_rate_r1 = stats::calculate_duplication_rate(&kmer_map_r1);
         let dup_rate_r2 = stats::calculate_duplication_rate(&kmer_map_r2);
-        (dup_rate_r1 + dup_rate_r2) / 2.0
+        f64::midpoint(dup_rate_r1, dup_rate_r2)
     };
 
     // Calculate combined before/after stats for summary
@@ -986,8 +986,8 @@ fn auto_detect_adapters_pe(
     eprintln!("Analyzing {} read pairs...", r1_seqs.len());
 
     // Convert to slices for detection
-    let r1_refs: Vec<&[u8]> = r1_seqs.iter().map(|v| v.as_slice()).collect();
-    let r2_refs: Vec<&[u8]> = r2_seqs.iter().map(|v| v.as_slice()).collect();
+    let r1_refs: Vec<&[u8]> = r1_seqs.iter().map(std::vec::Vec::as_slice).collect();
+    let r2_refs: Vec<&[u8]> = r2_seqs.iter().map(std::vec::Vec::as_slice).collect();
 
     let result = adapter::detect_adapters_from_pe_reads(
         r1_refs.into_iter(),
@@ -1047,7 +1047,7 @@ fn auto_detect_adapter_se(
     eprintln!("Analyzing {} reads...", seqs.len());
 
     // Convert to slices for detection
-    let seq_refs: Vec<&[u8]> = seqs.iter().map(|v| v.as_slice()).collect();
+    let seq_refs: Vec<&[u8]> = seqs.iter().map(std::vec::Vec::as_slice).collect();
 
     let result = adapter::detect_adapter_from_se_reads(
         seq_refs.into_iter(),
@@ -1093,9 +1093,9 @@ fn main() -> Result<()> {
     }
 
     // Determine number of threads
-    let mut num_threads = args.threads.unwrap_or_else(num_cpus::get);
+    let num_threads = args.threads.unwrap_or_else(num_cpus::get);
 
-    println!("Using {} thread(s) for processing", num_threads);
+    println!("Using {num_threads} thread(s) for processing");
 
     // Validate merge arguments
     if args.merge {
@@ -1140,7 +1140,9 @@ fn main() -> Result<()> {
 
     // Create duplicate detector for calculating duplication rate (separate from dedup)
     // Uses Bloom filter matching fastp's implementation
-    let dup_detector = if !args.dont_eval_duplication {
+    let dup_detector = if args.dont_eval_duplication {
+        None
+    } else {
         let accuracy = if args.dup_calc_accuracy > 0 {
             args.dup_calc_accuracy
         } else if args.dedup {
@@ -1149,8 +1151,6 @@ fn main() -> Result<()> {
             1 // Default to 1 otherwise (lower memory usage)
         };
         Some(std::sync::Arc::new(bloom::DuplicateDetector::new(accuracy)))
-    } else {
-        None
     };
 
     // Create split configuration from CLI args
@@ -1168,7 +1168,7 @@ fn main() -> Result<()> {
         // Skip auto-detection if either input is stdin (can't rewind)
         if trimming_config_r1.adapter_config.detect_adapter_for_pe
             && args.input != "-"
-            && args.input2.as_ref().map_or(true, |i2| i2 != "-")
+            && args.input2.as_ref().is_none_or(|i2| i2 != "-")
         {
             match auto_detect_adapters_pe(
                 &args.input,
@@ -1346,7 +1346,7 @@ fn main() -> Result<()> {
                         umi_config_clone,
                         dedup_config_clone,
                         dup_detector_clone,
-                    )
+                    );
                 });
                 workers.push(worker);
             }
@@ -1376,7 +1376,7 @@ fn main() -> Result<()> {
             // Wait for all threads
             producer.join().unwrap()?;
             for (index, worker) in workers.into_iter().enumerate() {
-                println!("Waiting for worker thread {} to finish...", index);
+                println!("Waiting for worker thread {index} to finish...");
                 worker.join().unwrap();
             }
             merger.join().unwrap()?
@@ -1504,7 +1504,7 @@ fn main() -> Result<()> {
                     complexity_thresh,
                     no_kmer,
                     trimming_config_clone,
-                )
+                );
             });
             workers.push(worker);
         }

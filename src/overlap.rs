@@ -83,7 +83,7 @@ pub fn reverse_complement(seq: &[u8]) -> Vec<u8> {
 
 /// Detect overlap between R1 and reverse-complement of R2
 ///
-/// This function tries different offset positions to find where R1 and R2_rc
+/// This function tries different offset positions to find where R1 and `R2_rc`
 /// overlap with acceptable differences.
 pub fn detect_overlap(
     r1_seq: &[u8],
@@ -127,19 +127,14 @@ pub fn detect_overlap(
             config.max_diff,
             (overlap_len * config.max_diff_percent) / 100,
         );
-        let mut differences = 0;
-        let mut i = 0;
 
-        // Count differences, but break early if we exceed limit before comparing 50 bases
-        for idx in 0..overlap_len {
-            if r1_seq[offset + idx] != r2_rc[idx] {
-                differences += 1;
-                if differences > overlap_diff_limit && idx < COMPLETE_COMPARE_REQUIRE {
-                    break; // Early exit - too many differences before reaching 50bp
-                }
-            }
-            i = idx + 1;
-        }
+        // Use SIMD-accelerated mismatch counting
+        let (differences, i) = crate::simd::count_mismatches(
+            &r1_seq[offset..offset + overlap_len],
+            &r2_rc[..overlap_len],
+            overlap_diff_limit,
+            COMPLETE_COMPARE_REQUIRE,
+        );
 
         let diff_percent = differences * 100 / overlap_len;
 
@@ -180,19 +175,14 @@ pub fn detect_overlap(
             config.max_diff,
             (overlap_len * config.max_diff_percent) / 100,
         );
-        let mut differences = 0;
-        let mut i = 0;
 
-        // Count differences, but break early if we exceed limit before comparing 50 bases
-        for idx in 0..overlap_len {
-            if r1_seq[idx] != r2_rc[offset + idx] {
-                differences += 1;
-                if differences > overlap_diff_limit && idx < COMPLETE_COMPARE_REQUIRE {
-                    break; // Early exit - too many differences before reaching 50bp
-                }
-            }
-            i = idx + 1;
-        }
+        // Use SIMD-accelerated mismatch counting
+        let (differences, i) = crate::simd::count_mismatches(
+            &r1_seq[..overlap_len],
+            &r2_rc[offset..offset + overlap_len],
+            overlap_diff_limit,
+            COMPLETE_COMPARE_REQUIRE,
+        );
 
         let diff_percent = differences * 100 / overlap_len;
 
@@ -297,7 +287,7 @@ pub fn correct_by_overlap(
 /// When R2 extends past R1 (negative offset), the non-overlapping parts
 /// are adapter sequences that should be trimmed.
 ///
-/// Returns (r1_trim_len, r2_trim_len) - the lengths to keep for each read.
+/// Returns (`r1_trim_len`, `r2_trim_len`) - the lengths to keep for each read.
 /// Returns None if overlap-based trimming should not be applied.
 pub fn trim_by_overlap_analysis(
     r1_len: usize,
@@ -331,7 +321,7 @@ pub fn trim_by_overlap_analysis(
 /// Merge two overlapping paired-end reads into a single read
 ///
 /// Returns (header, sequence, quality) for the merged read.
-/// The header includes "merged_XXX_YYY" where XXX is bases from R1, YYY from R2.
+/// The header includes "`merged_XXX_YYY`" where XXX is bases from R1, YYY from R2.
 pub fn merge_reads(
     r1_seq: &[u8],
     r1_qual: &[u8],
@@ -575,7 +565,7 @@ mod tests {
         let config = OverlapConfig::default();
         let overlap = detect_overlap(r1_seq, &r2, &config);
 
-        println!("Overlap result: {:?}", overlap);
+        println!("Overlap result: {overlap:?}");
 
         assert!(overlap.is_some(), "Should detect overlap");
         let overlap = overlap.unwrap();
@@ -607,7 +597,10 @@ mod tests {
         );
 
         // For perfect overlap with offset=0, merged length should equal original length
-        assert!(merged_seq.len() > 0, "Merged sequence should not be empty");
+        assert!(
+            !merged_seq.is_empty(),
+            "Merged sequence should not be empty"
+        );
     }
 
     #[test]
@@ -619,14 +612,14 @@ mod tests {
 
         // R1: 100 A's + 50 C's
         let mut r1_seq = vec![b'A'; 100];
-        r1_seq.extend_from_slice(&vec![b'C'; 50]);
+        r1_seq.extend_from_slice(&[b'C'; 50]);
 
         let r1_qual = vec![b'I'; 150];
         let r1_header = b"read1 1:N:0";
 
         // R2 reverse complement should have: 50 G's (rc of C) + 100 T's (rc of A)
         let mut r2_rc_seq = vec![b'G'; 50];
-        r2_rc_seq.extend_from_slice(&vec![b'T'; 100]);
+        r2_rc_seq.extend_from_slice(&[b'T'; 100]);
 
         // To get this as R2, we need to reverse complement it back
         let r2 = reverse_complement(&r2_rc_seq);
@@ -641,7 +634,7 @@ mod tests {
         };
         let overlap = detect_overlap(&r1_seq, &r2, &config);
 
-        println!("Partial overlap result: {:?}", overlap);
+        println!("Partial overlap result: {overlap:?}");
 
         if let Some(overlap) = overlap {
             println!(
@@ -1105,7 +1098,7 @@ mod tests {
 
         // R2_rc should be: [20bp of G] + [40bp of C]
         let mut r2_rc = vec![b'G'; 20];
-        r2_rc.extend_from_slice(&vec![b'C'; 40]);
+        r2_rc.extend_from_slice(&[b'C'; 40]);
 
         // Convert to R2 (reverse complement of r2_rc)
         let r2 = reverse_complement(&r2_rc);

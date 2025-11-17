@@ -2,14 +2,14 @@
 //!
 //! This module provides all data structures for tracking and reporting
 //! FASTQ processing statistics:
-//! - ReadStats: Basic read statistics
-//! - QualityCurves: Per-position quality distributions
-//! - DetailedReadStats: Combined read + quality stats
+//! - `ReadStats`: Basic read statistics
+//! - `QualityCurves`: Per-position quality distributions
+//! - `DetailedReadStats`: Combined read + quality stats
 //! - Summary: Before/after filtering summary
-//! - FilteringResult: Filtering outcome counts
-//! - FastpReport: Final JSON report structure
-//! - PositionStats: Position-specific quality tracking
-//! - SimpleStats: Simple statistics accumulator
+//! - `FilteringResult`: Filtering outcome counts
+//! - `FastpReport`: Final JSON report structure
+//! - `PositionStats`: Position-specific quality tracking
+//! - `SimpleStats`: Simple statistics accumulator
 
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
@@ -188,7 +188,7 @@ impl PositionStats {
         }
     }
 
-    /// Convert to QualityCurves for JSON output
+    /// Convert to `QualityCurves` for JSON output
     pub(crate) fn to_quality_curves(&self) -> QualityCurves {
         let mean: Vec<f64> = self
             .total_sum
@@ -228,7 +228,7 @@ impl PositionStats {
         }
     }
 
-    /// Convert to ContentCurves for JSON output (base content percentages per position)
+    /// Convert to `ContentCurves` for JSON output (base content percentages per position)
     pub(crate) fn to_content_curves(&self) -> ContentCurves {
         let mut a_pct = Vec::with_capacity(self.total_cnt.len());
         let mut t_pct = Vec::with_capacity(self.total_cnt.len());
@@ -273,7 +273,7 @@ impl PositionStats {
         }
     }
 
-    /// Convert quality histogram to IndexMap for JSON output
+    /// Convert quality histogram to `IndexMap` for JSON output
     pub(crate) fn to_qual_hist(&self) -> Option<IndexMap<u8, usize>> {
         let mut hist = IndexMap::new();
         for (q, &count) in self.qual_hist.iter().enumerate() {

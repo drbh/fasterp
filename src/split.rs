@@ -150,7 +150,17 @@ impl SplitWriter {
     }
 
     /// Write data and track lines
+    #[inline]
     pub fn write(&mut self, data: &[u8]) -> Result<()> {
+        // Fast path: no splitting mode
+        if matches!(self.config.mode, SplitMode::None) {
+            if let Some(ref mut writer) = self.current_writer {
+                writer.write_all(data)?;
+            }
+            return Ok(());
+        }
+
+        // Slow path: splitting enabled
         // Check if we need to open a new file
         if self.should_open_new_file() {
             self.open_next_file()?;
@@ -160,8 +170,8 @@ impl SplitWriter {
         if let Some(ref mut writer) = self.current_writer {
             writer.write_all(data)?;
 
-            // Count newlines to track lines
-            let newline_count = data.iter().filter(|&&b| b == b'\n').count();
+            // Count newlines to track lines using memchr (SIMD)
+            let newline_count = memchr::memchr_iter(b'\n', data).count();
             self.lines_in_current_file += newline_count;
         }
 

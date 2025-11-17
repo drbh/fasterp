@@ -33,9 +33,9 @@ pub enum UmiLocation {
     Index1,
     /// Extract from index2 read (separate file)
     Index2,
-    /// Extract from per_read locations
+    /// Extract from `per_read` locations
     PerRead,
-    /// Extract from per_index locations
+    /// Extract from `per_index` locations
     PerIndex,
 }
 
@@ -89,8 +89,8 @@ pub fn extract_umi(seq: &[u8], config: &UmiConfig) -> Option<UmiExtraction> {
 
 /// Add UMI to read header
 ///
-/// Formats header as: @original_header:PREFIX_UMISEQUENCE
-/// Example: @read1 -> @read1:UMI_ACGTACGT
+/// Formats header as: @`original_header:PREFIX_UMISEQUENCE`
+/// Example: @read1 -> @`read1:UMI_ACGTACGT`
 pub fn add_umi_to_header(header: &[u8], umi_seq: &[u8], prefix: &str) -> Vec<u8> {
     let mut new_header = header.to_vec();
     new_header.push(b':');

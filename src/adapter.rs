@@ -7,16 +7,14 @@
 //! - Auto-detection using PE overlap analysis
 //! - Mismatch-tolerant matching
 
-use once_cell::sync::Lazy;
 use rayon::prelude::*;
-use rustc_hash::FxHashMap;
 use std::cell::RefCell;
 use std::cmp::min;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 
 // Thread-local scratch buffers for adapter matching to avoid per-call heap allocations
 thread_local! {
-    static INSERTION_SCRATCH: RefCell<(Vec<u16>, Vec<u16>)> = RefCell::new((Vec::new(), Vec::new()));
+    static INSERTION_SCRATCH: RefCell<(Vec<u16>, Vec<u16>)> = const { RefCell::new((Vec::new(), Vec::new())) };
 }
 
 /// Configuration for adapter trimming
@@ -76,7 +74,7 @@ pub struct AdapterDetectionResult {
 /// * `min_frequency` - Minimum fraction of reads that must support an adapter (default: 0.01 = 1%)
 ///
 /// # Returns
-/// AdapterDetectionResult with detected adapters and confidence scores
+/// `AdapterDetectionResult` with detected adapters and confidence scores
 pub fn detect_adapters_from_pe_reads<'a>(
     r1_seqs: impl Iterator<Item = &'a [u8]>,
     r2_seqs: impl Iterator<Item = &'a [u8]>,
@@ -149,7 +147,7 @@ pub fn detect_adapters_from_pe_reads<'a>(
     let adapter_r2 = find_consensus_adapter(&adapter_r2_counts, threshold);
 
     let confidence = if total_reads > 0 {
-        reads_with_adapters as f64 / total_reads as f64
+        f64::from(reads_with_adapters) / total_reads as f64
     } else {
         0.0
     };
@@ -175,7 +173,7 @@ fn find_consensus_adapter(
     let mut best_adapter: Option<Vec<u8>> = None;
     let mut best_count = threshold;
 
-    for (adapter, &count) in adapter_counts.iter() {
+    for (adapter, &count) in adapter_counts {
         if count > best_count {
             best_count = count;
             best_adapter = Some(adapter.clone());
@@ -274,7 +272,7 @@ fn extend_kmer_to_adapter(seed: &[u8], high_freq_kmers: &[(Vec<u8>, usize)]) -> 
 //
 
 mod optimized {
-    use super::*;
+    use super::{IndexedParallelIterator, ParallelIterator, ParallelSlice};
 
     /// 2-bit encoding for DNA bases: A=00, C=01, G=10, T=11
     #[inline(always)]
@@ -311,21 +309,18 @@ mod optimized {
 
         #[inline(always)]
         fn push(&mut self, base: u8) -> Option<u32> {
-            match base_to_2bit(base) {
-                Some(bits) => {
-                    self.kmer_bits = ((self.kmer_bits << 2) | bits as u32) & self.mask;
-                    self.kmer_len += 1;
-                    if self.kmer_len >= self.k {
-                        Some(self.kmer_bits)
-                    } else {
-                        None
-                    }
-                }
-                None => {
-                    self.kmer_len = 0;
-                    self.kmer_bits = 0;
+            if let Some(bits) = base_to_2bit(base) {
+                self.kmer_bits = ((self.kmer_bits << 2) | u32::from(bits)) & self.mask;
+                self.kmer_len += 1;
+                if self.kmer_len >= self.k {
+                    Some(self.kmer_bits)
+                } else {
                     None
                 }
+            } else {
+                self.kmer_len = 0;
+                self.kmer_bits = 0;
+                None
             }
         }
 
@@ -399,7 +394,7 @@ mod optimized {
 
             for (pos, &base) in seq[start..].iter().enumerate() {
                 if let Some(kmer_idx) = encoder.push(base) {
-                    let kmer_slice = &seq[start + pos - K + 1..start + pos + 1];
+                    let kmer_slice = &seq[(start + pos - K + 1)..=(start + pos)];
 
                     if should_skip_kmer(kmer_slice, kmer_idx) {
                         continue;
@@ -487,32 +482,30 @@ mod optimized {
     }
 
     /// Pre-encoded known adapters (lazy initialization)
-    pub static KNOWN_ADAPTERS: Lazy<Vec<KnownAdapter>> = Lazy::new(|| {
-        let adapter_map = crate::adapter::adapters::get_known_adapters();
-        let mut result = Vec::new();
+    pub static KNOWN_ADAPTERS: std::sync::LazyLock<Vec<KnownAdapter>> =
+        std::sync::LazyLock::new(|| {
+            let adapter_map = crate::adapter::adapters::get_known_adapters();
+            let mut result = Vec::new();
 
-        for (seq_str, name) in adapter_map.iter() {
-            let seq = seq_str.as_bytes();
-            let windows = encode_all_windows(seq, 10);
+            for (seq_str, name) in adapter_map {
+                let seq = seq_str.as_bytes();
+                let windows = encode_all_windows(seq, 10);
 
-            result.push(KnownAdapter {
-                name,
-                full_seq: seq,
-                encoded_windows: windows,
-            });
-        }
+                result.push(KnownAdapter {
+                    name,
+                    full_seq: seq,
+                    encoded_windows: windows,
+                });
+            }
 
-        result
-    });
+            result
+        });
 
     /// Match candidate k-mer against known adapters
     pub fn match_known_adapter(kmer_bits: u32) -> Option<&'static KnownAdapter> {
-        for adapter in KNOWN_ADAPTERS.iter() {
-            if adapter.encoded_windows.contains(&kmer_bits) {
-                return Some(adapter);
-            }
-        }
-        None
+        KNOWN_ADAPTERS
+            .iter()
+            .find(|&adapter| adapter.encoded_windows.contains(&kmer_bits))
     }
 }
 
@@ -527,13 +520,13 @@ mod optimized {
 /// * `min_frequency` - Minimum fraction of reads that must contain a k-mer
 ///
 /// # Returns
-/// AdapterDetectionResult with detected adapter
+/// `AdapterDetectionResult` with detected adapter
 pub fn detect_adapter_from_se_reads<'a>(
     seqs: impl Iterator<Item = &'a [u8]>,
     sample_size: usize,
     _min_frequency: f64,
 ) -> AdapterDetectionResult {
-    use optimized::*;
+    use optimized::{count_k10_2bit_parallel, find_top_kmers, match_known_adapter};
 
     const K: usize = 10;
     const MIN_READS_FOR_DETECTION: usize = 10000;
@@ -558,7 +551,7 @@ pub fn detect_adapter_from_se_reads<'a>(
     let counts = count_k10_2bit_parallel(&seq_vec, START_POS);
 
     // Calculate total k-mers counted
-    let total_kmers: u64 = counts.iter().map(|&c| c as u64).sum();
+    let total_kmers: u64 = counts.iter().map(|&c| u64::from(c)).sum();
 
     if total_kmers == 0 {
         return AdapterDetectionResult {
@@ -591,7 +584,7 @@ pub fn detect_adapter_from_se_reads<'a>(
             return AdapterDetectionResult {
                 adapter_r1: Some(adapter.full_seq.to_vec()),
                 adapter_r2: None,
-                confidence: *count as f64 / total_reads as f64,
+                confidence: f64::from(*count) / total_reads as f64,
                 reads_analyzed: total_reads,
             };
         }
@@ -611,13 +604,13 @@ pub mod adapters {
     use std::collections::HashMap;
     use std::sync::OnceLock;
 
-    /// Illumina TruSeq Universal Adapter
+    /// Illumina `TruSeq` Universal Adapter
     pub const TRUSEQ_UNIVERSAL: &[u8] = b"AGATCGGAAGAGC";
 
-    /// Illumina TruSeq Read 1 Adapter
+    /// Illumina `TruSeq` Read 1 Adapter
     pub const TRUSEQ_READ1: &[u8] = b"AGATCGGAAGAGCACACGTCTGAACTCCAGTCA";
 
-    /// Illumina TruSeq Read 2 Adapter
+    /// Illumina `TruSeq` Read 2 Adapter
     pub const TRUSEQ_READ2: &[u8] = b"AGATCGGAAGAGCGTCGTGTAGGGAAAGAGTGT";
 
     /// Illumina Small RNA 3' Adapter
@@ -627,7 +620,7 @@ pub mod adapters {
     pub const NEXTERA: &[u8] = b"CTGTCTCTTATACACATCT";
 
     /// Get the comprehensive known adapters database
-    /// Returns a HashMap mapping adapter sequences to their descriptions
+    /// Returns a `HashMap` mapping adapter sequences to their descriptions
     pub fn get_known_adapters() -> &'static HashMap<&'static str, &'static str> {
         static KNOWN_ADAPTERS: OnceLock<HashMap<&'static str, &'static str>> = OnceLock::new();
         KNOWN_ADAPTERS.get_or_init(|| {
@@ -896,7 +889,7 @@ pub struct AdapterMatch {
 }
 
 /// Try exact matching with allowed mismatches (Stage 1)
-/// Supports negative start_pos for A-tailing (Illumina adapter dimer handling)
+/// Supports negative `start_pos` for A-tailing (Illumina adapter dimer handling)
 fn try_exact_match(
     seq: &[u8],
     adapter: &[u8],
@@ -958,10 +951,10 @@ fn try_exact_match(
 }
 
 /// Try matching with single insertion (Stage 2)
-/// Implements fastp's Matcher::matchWithOneInsertion algorithm exactly
+/// Implements fastp's `Matcher::matchWithOneInsertion` algorithm exactly
 ///
-/// ins_data: sequence with suspected insertion (longer, e.g., read)
-/// normal_data: reference sequence (baseline, e.g., adapter)
+/// `ins_data`: sequence with suspected insertion (longer, e.g., read)
+/// `normal_data`: reference sequence (baseline, e.g., adapter)
 /// cmplen: comparison length (calculated by caller based on insertion/deletion case)
 ///
 /// OPTIMIZED: Uses thread-local scratch buffers to avoid per-call heap allocations
@@ -998,33 +991,21 @@ fn try_insertion_match(
         right.fill(init);
 
         // Initialize first and last elements
-        left[0] = if ins_data[0].eq_ignore_ascii_case(&normal_data[0]) {
-            0
-        } else {
-            1
-        };
+        left[0] = u16::from(!ins_data[0].eq_ignore_ascii_case(&normal_data[0]));
 
         if cmplen >= ins_data.len() {
             return None;
         }
 
-        right[cmplen - 1] = if ins_data[cmplen].eq_ignore_ascii_case(&normal_data[cmplen - 1]) {
-            0
-        } else {
-            1
-        };
+        right[cmplen - 1] =
+            u16::from(!ins_data[cmplen].eq_ignore_ascii_case(&normal_data[cmplen - 1]));
 
         // Build left array with early termination
         for i in 1..cmplen {
             if i >= ins_data.len() {
                 return None;
             }
-            left[i] = left[i - 1]
-                + if !ins_data[i].eq_ignore_ascii_case(&normal_data[i]) {
-                    1
-                } else {
-                    0
-                };
+            left[i] = left[i - 1] + u16::from(!ins_data[i].eq_ignore_ascii_case(&normal_data[i]));
             if left[i] + right[cmplen - 1] > diff_limit {
                 break;
             }
@@ -1035,12 +1016,8 @@ fn try_insertion_match(
             if i + 1 >= ins_data.len() {
                 continue;
             }
-            right[i] = right[i + 1]
-                + if !ins_data[i + 1].eq_ignore_ascii_case(&normal_data[i]) {
-                    1
-                } else {
-                    0
-                };
+            right[i] =
+                right[i + 1] + u16::from(!ins_data[i + 1].eq_ignore_ascii_case(&normal_data[i]));
             if right[i] + left[0] > diff_limit {
                 for p in 0..i {
                     right[p] = init;
@@ -1106,11 +1083,11 @@ fn is_better_match(new_match: &AdapterMatch, current_best: &Option<AdapterMatch>
             }
 
             // Same position: prefer exact > deletion > insertion
-            use MatchType::*;
+            use MatchType::{Deletion, Exact, Insertion};
             match (&new_match.match_type, &best.match_type) {
-                (Exact, Insertion) | (Exact, Deletion) => true,
+                (Exact, Insertion | Deletion) => true,
                 (Deletion, Insertion) => true,
-                (Insertion, Exact) | (Deletion, Exact) | (Insertion, Deletion) => false,
+                (Insertion | Deletion, Exact) | (Insertion, Deletion) => false,
                 _ => new_match.mismatches < best.mismatches,
             }
         }
@@ -1207,7 +1184,7 @@ pub fn find_adapter(
 
 /// Trim adapter from sequence and quality
 ///
-/// Returns (trimmed_seq, trimmed_qual) as slices
+/// Returns (`trimmed_seq`, `trimmed_qual`) as slices
 pub fn trim_adapter<'a>(
     seq: &'a [u8],
     qual: &'a [u8],

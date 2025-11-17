@@ -16,7 +16,10 @@
 use std::arch::x86_64::*;
 
 #[cfg(target_arch = "aarch64")]
-use std::arch::aarch64::*;
+use std::arch::aarch64::{
+    uint8x16_t, vaddlvq_u8, vceqq_u8, vcgeq_u8, vcltq_u8, vdupq_n_u8, vld1q_u8, vmvnq_u8, vorrq_u8,
+    vshrq_n_u8, vsubq_u8,
+};
 
 /// Compute multiple stats in a single SIMD pass over sequence and quality data
 pub struct Stats {
@@ -47,9 +50,65 @@ pub fn is_simd_available() -> bool {
     }
 }
 
+/// Count mismatches between two equal-length byte slices using SIMD
+///
+/// Returns (`total_differences`, `positions_compared`)
+/// Stops early if differences exceeds `max_diff` and `positions_compared` < `min_complete`
+#[inline]
+pub fn count_mismatches(
+    seq1: &[u8],
+    seq2: &[u8],
+    max_diff: usize,
+    min_complete: usize,
+) -> (usize, usize) {
+    debug_assert_eq!(seq1.len(), seq2.len());
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") {
+            return unsafe { count_mismatches_avx2(seq1, seq2, max_diff, min_complete) };
+        }
+        return count_mismatches_scalar(seq1, seq2, max_diff, min_complete);
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    {
+        unsafe { count_mismatches_neon(seq1, seq2, max_diff, min_complete) }
+    }
+
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        count_mismatches_scalar(seq1, seq2, max_diff, min_complete)
+    }
+}
+
+/// Scalar mismatch counting with early termination
+#[inline]
+fn count_mismatches_scalar(
+    seq1: &[u8],
+    seq2: &[u8],
+    max_diff: usize,
+    min_complete: usize,
+) -> (usize, usize) {
+    let mut differences = 0;
+    let len = seq1.len();
+
+    for i in 0..len {
+        if seq1[i] != seq2[i] {
+            differences += 1;
+            // Early termination: too many differences before min_complete
+            if differences > max_diff && i < min_complete {
+                return (differences, i + 1);
+            }
+        }
+    }
+
+    (differences, len)
+}
+
 /// Compute all stats for a sequence/quality pair using SIMD when available
 ///
-/// qual_threshold: Phred quality threshold (e.g., 15). Bases with quality < threshold are counted as unqualified.
+/// `qual_threshold`: Phred quality threshold (e.g., 15). Bases with quality < threshold are counted as unqualified.
 /// Set to 0 to disable unqualified counting.
 #[inline]
 pub fn compute_stats(seq: &[u8], qual: &[u8], qual_threshold: u8) -> Stats {
@@ -76,7 +135,7 @@ pub fn compute_stats(seq: &[u8], qual: &[u8], qual_threshold: u8) -> Stats {
 }
 
 /// Scalar implementation (fallback)
-/// Used on x86_64 without AVX2 and non-x86_64/aarch64 platforms
+/// Used on `x86_64` without AVX2 and non-x86_64/aarch64 platforms
 #[inline]
 #[allow(dead_code)]
 fn compute_stats_scalar(seq: &[u8], qual: &[u8], qual_threshold: u8) -> Stats {
@@ -91,7 +150,7 @@ fn compute_stats_scalar(seq: &[u8], qual: &[u8], qual_threshold: u8) -> Stats {
     let qual_threshold_ascii = qual_threshold + 33; // Convert to ASCII
 
     for (&b, &q) in seq.iter().zip(qual) {
-        let qval = (q - 33) as u32;
+        let qval = u32::from(q - 33);
         qsum += qval;
 
         // Q20/Q30/Q40: quality thresholds
@@ -130,6 +189,58 @@ fn compute_stats_scalar(seq: &[u8], qual: &[u8], qual_threshold: u8) -> Stats {
         gc,
         unqualified,
     }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn count_mismatches_avx2(
+    seq1: &[u8],
+    seq2: &[u8],
+    max_diff: usize,
+    min_complete: usize,
+) -> (usize, usize) {
+    let len = seq1.len();
+    let mut differences = 0usize;
+    let mut i = 0usize;
+    let chunk_size = 32; // AVX2 processes 32 bytes (256-bit)
+
+    // Process 32 bytes at a time with AVX2
+    while i + chunk_size <= len {
+        // Load both sequences
+        let vec1 = _mm256_loadu_si256(seq1[i..].as_ptr() as *const __m256i);
+        let vec2 = _mm256_loadu_si256(seq2[i..].as_ptr() as *const __m256i);
+
+        // Compare: returns 0xFF for equal, 0x00 for not equal
+        let eq_mask = _mm256_cmpeq_epi8(vec1, vec2);
+
+        // Convert to movemask (1 bit per byte, 1 = equal)
+        let mask = _mm256_movemask_epi8(eq_mask) as u32;
+
+        // Count mismatches: count zeros in the mask
+        let matches = mask.count_ones() as usize;
+        let chunk_mismatches = chunk_size - matches;
+        differences += chunk_mismatches;
+
+        // Early termination check
+        if differences > max_diff && i < min_complete {
+            return (differences, i + chunk_size);
+        }
+
+        i += chunk_size;
+    }
+
+    // Scalar remainder
+    while i < len {
+        if seq1[i] != seq2[i] {
+            differences += 1;
+            if differences > max_diff && i < min_complete {
+                return (differences, i + 1);
+            }
+        }
+        i += 1;
+    }
+
+    (differences, len)
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -289,6 +400,59 @@ unsafe fn horizontal_sum_u8_to_u32(vec: __m256i) -> u32 {
 
 #[cfg(target_arch = "aarch64")]
 #[inline]
+unsafe fn count_mismatches_neon(
+    seq1: &[u8],
+    seq2: &[u8],
+    max_diff: usize,
+    min_complete: usize,
+) -> (usize, usize) {
+    let len = seq1.len();
+    let mut differences = 0usize;
+    let mut i = 0usize;
+    let chunk_size = 16; // NEON processes 16 bytes (128-bit)
+
+    unsafe {
+        // Process 16 bytes at a time with NEON
+        while i + chunk_size <= len {
+            // Load both sequences
+            let vec1 = vld1q_u8(seq1[i..].as_ptr());
+            let vec2 = vld1q_u8(seq2[i..].as_ptr());
+
+            // Compare: vceqq_u8 returns 0xFF for equal, 0x00 for not equal
+            let eq_mask = vceqq_u8(vec1, vec2);
+
+            // Invert to get mismatches (0xFF becomes 0x00, 0x00 becomes 0xFF)
+            let ne_mask = vmvnq_u8(eq_mask);
+
+            // Count mismatches in this chunk
+            let chunk_mismatches = count_set_bits_neon(ne_mask);
+            differences += chunk_mismatches;
+
+            // Early termination check
+            if differences > max_diff && i < min_complete {
+                return (differences, i + chunk_size);
+            }
+
+            i += chunk_size;
+        }
+    }
+
+    // Scalar remainder
+    while i < len {
+        if seq1[i] != seq2[i] {
+            differences += 1;
+            if differences > max_diff && i < min_complete {
+                return (differences, i + 1);
+            }
+        }
+        i += 1;
+    }
+
+    (differences, len)
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline]
 unsafe fn compute_stats_neon(seq: &[u8], qual: &[u8], qual_threshold: u8) -> Stats {
     let len = seq.len().min(qual.len());
     let mut qsum = 0u32;
@@ -369,7 +533,7 @@ unsafe fn compute_stats_neon(seq: &[u8], qual: &[u8], qual_threshold: u8) -> Sta
     for j in i..len {
         let b = seq[j];
         let q = qual[j];
-        let qval = (q - 33) as u32;
+        let qval = u32::from(q - 33);
         qsum += qval;
 
         if q >= 53 {
@@ -425,7 +589,7 @@ unsafe fn count_set_bits_neon(mask: uint8x16_t) -> usize {
 unsafe fn horizontal_sum_u8_to_u32_neon(vec: uint8x16_t) -> u32 {
     unsafe {
         // Widen and sum all bytes - vaddlvq_u8 returns u16
-        vaddlvq_u8(vec) as u32
+        u32::from(vaddlvq_u8(vec))
     }
 }
 
