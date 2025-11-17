@@ -87,6 +87,7 @@ impl<R: BufRead> FastqParser<R> {
 
     /// Read next record, returns Some((header, seq, plus, qual)) or None if EOF
     /// Handles multiline sequences and missing final newlines
+    #[allow(clippy::type_complexity)]
     pub fn next_record(&mut self) -> Result<Option<(Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>)>> {
         // Reset buffers
         self.header.clear();
@@ -270,6 +271,8 @@ impl StreamAccumulator {
     /// 4. Updates "after" statistics
     ///
     /// All in a single pass through the data with minimal allocations.
+    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_lines)]
     pub(crate) fn process_record(
         &mut self,
         header: &[u8],
@@ -330,19 +333,19 @@ impl StreamAccumulator {
 
                 let qual_hist_ptr = self.pos.qual_hist.as_mut_ptr();
                 util::loop_seq_qual_indexed(seq_ptr, qual_ptr, len, |i, b, q| {
-                    let qval = u64::from(q - 33);
+                    let quality_score = u64::from(q - 33);
                     // Direct pointer arithmetic - no Vec::as_mut_slice overhead!
-                    *total_sum_ptr.add(i) += qval;
+                    *total_sum_ptr.add(i) += quality_score;
                     *total_cnt_ptr.add(i) += 1;
 
                     if let Some(bi) = base_idx(b) {
-                        *base_sum_ptrs[bi].add(i) += qval;
+                        *base_sum_ptrs[bi].add(i) += quality_score;
                         *base_cnt_ptrs[bi].add(i) += 1;
                     }
 
                     // Track quality histogram
-                    if qval < 94 {
-                        *qual_hist_ptr.add(qval as usize) += 1;
+                    if quality_score < 94 {
+                        *qual_hist_ptr.add(quality_score as usize) += 1;
                     }
                 });
             }
@@ -386,8 +389,8 @@ impl StreamAccumulator {
 
                 let qual_hist_ptr = self.pos.qual_hist.as_mut_ptr();
                 util::loop_seq_qual_indexed(seq_ptr, qual_ptr, len, |i, b, q| {
-                    let qval = u32::from(q - 33);
-                    qsum += qval;
+                    let quality_u32 = u32::from(q - 33);
+                    qsum += quality_u32;
                     if q >= 53 {
                         q20 += 1;
                     }
@@ -405,17 +408,17 @@ impl StreamAccumulator {
                     }
 
                     // Direct pointer arithmetic - no Vec::as_mut_slice overhead!
-                    *total_sum_ptr.add(i) += u64::from(qval);
+                    *total_sum_ptr.add(i) += u64::from(quality_u32);
                     *total_cnt_ptr.add(i) += 1;
 
                     if let Some(bi) = base_idx(b) {
-                        *base_sum_ptrs[bi].add(i) += u64::from(qval);
+                        *base_sum_ptrs[bi].add(i) += u64::from(quality_u32);
                         *base_cnt_ptrs[bi].add(i) += 1;
                     }
 
                     // Track quality histogram
-                    if (qval as usize) < 94 {
-                        *qual_hist_ptr.add(qval as usize) += 1;
+                    if (quality_u32 as usize) < 94 {
+                        *qual_hist_ptr.add(quality_u32 as usize) += 1;
                     }
                 });
             }
@@ -522,7 +525,7 @@ impl StreamAccumulator {
         );
 
         // Track position stats for reads that passed filters (after filtering)
-        track_position_stats(trimmed_seq, trimmed_qual, &mut self.pos_after)?;
+        track_position_stats(trimmed_seq, trimmed_qual, &mut self.pos_after);
 
         // K-mer counting for after-filtering data
         count_k5_2bit(trimmed_seq, &mut self.kmer_table_after);
@@ -672,6 +675,7 @@ impl PairedEndAccumulator {
 /// Processes FASTQ records one-by-one with zero intermediate allocations.
 ///
 /// NO intermediate Vec<FastqRecord> allocation!
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn process_fastq_stream<R: BufRead, W: Write>(
     reader: R,
     writer: &mut W,
@@ -713,6 +717,8 @@ pub(crate) fn process_fastq_stream<R: BufRead, W: Write>(
 ///
 /// Processes two FASTQ files simultaneously, maintaining read pair synchronization.
 /// Read pairs pass/fail together - if either fails filtering, both are discarded.
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_lines)]
 pub(crate) fn process_paired_fastq_stream<
     R1: BufRead,
     R2: BufRead,
@@ -933,7 +939,7 @@ pub(crate) fn process_paired_fastq_stream<
                     final_qual1,
                     &mut acc.pos_r1,
                     &mut acc.kmer_table_r1,
-                )?;
+                );
                 acc.before_r1.add(
                     final_seq1.len(),
                     stats1.q20,
@@ -948,7 +954,7 @@ pub(crate) fn process_paired_fastq_stream<
                     final_qual2,
                     &mut acc.pos_r2,
                     &mut acc.kmer_table_r2,
-                )?;
+                );
                 acc.before_r2.add(
                     final_seq2.len(),
                     stats2.q20,
@@ -1304,7 +1310,7 @@ pub(crate) fn process_paired_fastq_stream<
                                     &merged_seq,
                                     &merged_qual,
                                     &mut acc.pos_r1_after,
-                                )?;
+                                );
 
                                 // Track kmers for merged read
                                 count_k5_2bit(&merged_seq, &mut acc.kmer_table_r1_after);
@@ -1346,12 +1352,12 @@ pub(crate) fn process_paired_fastq_stream<
                                 corrected_seq1,
                                 corrected_qual1,
                                 &mut acc.pos_r1_after,
-                            )?;
+                            );
                             track_position_stats(
                                 corrected_seq2,
                                 corrected_qual2,
                                 &mut acc.pos_r2_after,
-                            )?;
+                            );
 
                             // Track kmers for unmerged reads
                             count_k5_2bit(corrected_seq1, &mut acc.kmer_table_r1_after);
@@ -1390,8 +1396,8 @@ pub(crate) fn process_paired_fastq_stream<
                 );
 
                 // Track position stats for reads that passed filters (after filtering)
-                track_position_stats(corrected_seq1, corrected_qual1, &mut acc.pos_r1_after)?;
-                track_position_stats(corrected_seq2, corrected_qual2, &mut acc.pos_r2_after)?;
+                track_position_stats(corrected_seq1, corrected_qual1, &mut acc.pos_r1_after);
+                track_position_stats(corrected_seq2, corrected_qual2, &mut acc.pos_r2_after);
 
                 // Track kmers for reads that passed filters
                 count_k5_2bit(corrected_seq1, &mut acc.kmer_table_r1_after);
@@ -1404,7 +1410,7 @@ pub(crate) fn process_paired_fastq_stream<
 }
 
 /// Helper function to track position stats for a read (after filtering)
-pub(crate) fn track_position_stats(seq: &[u8], qual: &[u8], pos: &mut PositionStats) -> Result<()> {
+pub(crate) fn track_position_stats(seq: &[u8], qual: &[u8], pos: &mut PositionStats) {
     pos.ensure_capacity(seq.len());
 
     // SAFETY: We've validated seq.len() == qual.len(), and ensured capacity
@@ -1430,23 +1436,21 @@ pub(crate) fn track_position_stats(seq: &[u8], qual: &[u8], pos: &mut PositionSt
         let qual_hist_ptr = pos.qual_hist.as_mut_ptr();
 
         util::loop_seq_qual_indexed(seq_ptr, qual_ptr, len, |i, b, q| {
-            let qval = u64::from(q - 33);
-            *total_sum_ptr.add(i) += qval;
+            let quality_score = u64::from(q - 33);
+            *total_sum_ptr.add(i) += quality_score;
             *total_cnt_ptr.add(i) += 1;
 
             if let Some(bi) = base_idx(b) {
-                *base_sum_ptrs[bi].add(i) += qval;
+                *base_sum_ptrs[bi].add(i) += quality_score;
                 *base_cnt_ptrs[bi].add(i) += 1;
             }
 
             // Track quality histogram
-            if qval < 94 {
-                *qual_hist_ptr.add(qval as usize) += 1;
+            if quality_score < 94 {
+                *qual_hist_ptr.add(quality_score as usize) += 1;
             }
         });
     }
-
-    Ok(())
 }
 
 /// Helper function to process read statistics
@@ -1462,7 +1466,7 @@ fn process_read_stats(
     qual: &[u8],
     pos: &mut PositionStats,
     kmer_table: &mut [usize; 1024],
-) -> Result<ReadStats> {
+) -> ReadStats {
     // Compute basic stats using SIMD if available
     let stats = if simd::is_simd_available() {
         let s = simd::compute_stats(seq, qual, 0);
@@ -1492,18 +1496,18 @@ fn process_read_stats(
 
             let qual_hist_ptr = pos.qual_hist.as_mut_ptr();
             util::loop_seq_qual_indexed(seq_ptr, qual_ptr, len, |i, b, q| {
-                let qval = u64::from(q - 33);
-                *total_sum_ptr.add(i) += qval;
+                let quality_score = u64::from(q - 33);
+                *total_sum_ptr.add(i) += quality_score;
                 *total_cnt_ptr.add(i) += 1;
 
                 if let Some(bi) = base_idx(b) {
-                    *base_sum_ptrs[bi].add(i) += qval;
+                    *base_sum_ptrs[bi].add(i) += quality_score;
                     *base_cnt_ptrs[bi].add(i) += 1;
                 }
 
                 // Track quality histogram
-                if qval < 94 {
-                    *qual_hist_ptr.add(qval as usize) += 1;
+                if quality_score < 94 {
+                    *qual_hist_ptr.add(quality_score as usize) += 1;
                 }
             });
         }
@@ -1545,7 +1549,7 @@ fn process_read_stats(
 
             let qual_hist_ptr = pos.qual_hist.as_mut_ptr();
             util::loop_seq_qual_indexed(seq_ptr, qual_ptr, len, |i, b, q| {
-                let qval = u32::from(q - 33);
+                let quality_u32 = u32::from(q - 33);
                 if q >= 53 {
                     q20 += 1;
                 }
@@ -1559,17 +1563,17 @@ fn process_read_stats(
                     gc += 1;
                 }
 
-                *total_sum_ptr.add(i) += u64::from(qval);
+                *total_sum_ptr.add(i) += u64::from(quality_u32);
                 *total_cnt_ptr.add(i) += 1;
 
                 if let Some(bi) = base_idx(b) {
-                    *base_sum_ptrs[bi].add(i) += u64::from(qval);
+                    *base_sum_ptrs[bi].add(i) += u64::from(quality_u32);
                     *base_cnt_ptrs[bi].add(i) += 1;
                 }
 
                 // Track quality histogram
-                if (qval as usize) < 94 {
-                    *qual_hist_ptr.add(qval as usize) += 1;
+                if (quality_u32 as usize) < 94 {
+                    *qual_hist_ptr.add(quality_u32 as usize) += 1;
                 }
             });
         }
@@ -1580,5 +1584,5 @@ fn process_read_stats(
     // K-mer counting
     count_k5_2bit(seq, kmer_table);
 
-    Ok(stats)
+    stats
 }

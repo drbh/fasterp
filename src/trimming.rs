@@ -9,6 +9,7 @@
 use crate::adapter::AdapterConfig;
 
 /// Configuration for trimming operations
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone)]
 pub(crate) struct TrimmingConfig {
     // Sliding window trimming

@@ -106,7 +106,9 @@ pub fn detect_adapters_from_pe_reads<'a>(
             // Extract adapters based on offset direction
             if overlap_result.offset >= 0 {
                 // R1 extends past R2: adapter is at end of R1
-                let r1_adapter_start = overlap_result.offset as usize + overlap_result.overlap_len;
+                // SAFETY: offset is guaranteed to be non-negative by the if condition
+                let r1_adapter_start = usize::try_from(overlap_result.offset).unwrap_or(0)
+                    + overlap_result.overlap_len;
                 if r1_adapter_start < r1_seq.len() {
                     let adapter = r1_seq[r1_adapter_start..].to_vec();
                     if !adapter.is_empty() && adapter.len() >= 3 {
@@ -126,7 +128,8 @@ pub fn detect_adapters_from_pe_reads<'a>(
                 }
 
                 // Adapter in R2_rc is at the end (beyond overlap)
-                let r2_offset = (-overlap_result.offset) as usize;
+                // SAFETY: offset is negative here, so negating makes it positive
+                let r2_offset = usize::try_from(-overlap_result.offset).unwrap_or(0);
                 let r2_adapter_start = r2_offset + overlap_result.overlap_len;
                 if r2_adapter_start < r2_rc.len() {
                     let adapter_rc = r2_rc[r2_adapter_start..].to_vec();
@@ -141,7 +144,10 @@ pub fn detect_adapters_from_pe_reads<'a>(
     }
 
     // Find the most common adapters
-    let threshold = (total_reads as f64 * min_frequency) as usize;
+    // Threshold calculation: total_reads * min_frequency
+    // Using multiplication then floor division to avoid floating point
+    let min_freq_percent = (min_frequency * 1000.0) as u64;
+    let threshold = ((total_reads as u64 * min_freq_percent) / 1000) as usize;
 
     let adapter_r1 = find_consensus_adapter(&adapter_r1_counts, threshold);
     let adapter_r2 = find_consensus_adapter(&adapter_r2_counts, threshold);
@@ -185,97 +191,15 @@ fn find_consensus_adapter(
     best_adapter
 }
 
-/// Check if a k-mer is low complexity (too many repeats)
-/// Matches fastp's criteria: any base appears >= keylen-4 times
-fn is_low_complexity(kmer: &[u8]) -> bool {
-    if kmer.is_empty() {
-        return true;
-    }
-
-    let keylen = kmer.len();
-    let threshold = keylen.saturating_sub(4);
-
-    // Count each base (ATCG)
-    let mut counts = [0usize; 4];
-
-    for &base in kmer {
-        let upper = base.to_ascii_uppercase();
-        match upper {
-            b'A' => counts[0] += 1,
-            b'T' => counts[1] += 1,
-            b'C' => counts[2] += 1,
-            b'G' => counts[3] += 1,
-            _ => continue,
-        }
-    }
-
-    // Low complexity if any base appears >= keylen-4 times (like fastp)
-    counts.iter().any(|&count| count >= threshold)
-}
-
-/// Find a subsequence within a sequence
-fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    if needle.is_empty() || haystack.len() < needle.len() {
-        return None;
-    }
-
-    (0..=(haystack.len() - needle.len()))
-        .find(|&i| haystack[i..i + needle.len()].eq_ignore_ascii_case(needle))
-}
-
-/// Extend a seed k-mer into a longer adapter sequence using overlapping k-mers
-fn extend_kmer_to_adapter(seed: &[u8], high_freq_kmers: &[(Vec<u8>, usize)]) -> Vec<u8> {
-    let mut adapter = seed.to_vec();
-    let min_overlap = 8; // Minimum overlap between k-mers
-
-    // Try to extend to the right
-    loop {
-        let mut best_extension: Option<&Vec<u8>> = None;
-        let mut best_overlap_len = 0;
-
-        // Find k-mer that overlaps with the end of current adapter
-        for (kmer, _) in high_freq_kmers {
-            for overlap_len in (min_overlap..=kmer.len()).rev() {
-                if adapter.len() >= overlap_len {
-                    let adapter_suffix = &adapter[adapter.len() - overlap_len..];
-                    let kmer_prefix = &kmer[..overlap_len];
-
-                    if adapter_suffix.eq_ignore_ascii_case(kmer_prefix) {
-                        if overlap_len > best_overlap_len {
-                            best_overlap_len = overlap_len;
-                            best_extension = Some(kmer);
-                        }
-                        break;
-                    }
-                }
-            }
-        }
-
-        if let Some(ext_kmer) = best_extension {
-            // Extend adapter with non-overlapping part
-            adapter.extend_from_slice(&ext_kmer[best_overlap_len..]);
-
-            // Stop if we've extended enough (max adapter length ~40bp)
-            if adapter.len() >= 40 {
-                break;
-            }
-        } else {
-            break; // No more extensions found
-        }
-    }
-
-    adapter
-}
-
 //
 // ========== OPTIMIZED ADAPTER DETECTION (2-BIT FLAT COUNTER) ==========
 //
 
 mod optimized {
-    use super::{IndexedParallelIterator, ParallelIterator, ParallelSlice};
+    use super::{ParallelIterator, ParallelSlice};
 
     /// 2-bit encoding for DNA bases: A=00, C=01, G=10, T=11
-    #[inline(always)]
+    #[inline]
     const fn base_to_2bit(base: u8) -> Option<u8> {
         match base {
             b'A' | b'a' => Some(0),
@@ -295,7 +219,7 @@ mod optimized {
     }
 
     impl RollingKmerEncoder {
-        #[inline(always)]
+        #[inline]
         fn new(k: usize) -> Self {
             assert!(k <= 16, "K must be <= 16 for u32 encoding");
             let mask = (1u32 << (k * 2)) - 1;
@@ -307,7 +231,7 @@ mod optimized {
             }
         }
 
-        #[inline(always)]
+        #[inline]
         fn push(&mut self, base: u8) -> Option<u32> {
             if let Some(bits) = base_to_2bit(base) {
                 self.kmer_bits = ((self.kmer_bits << 2) | u32::from(bits)) & self.mask;
@@ -324,7 +248,7 @@ mod optimized {
             }
         }
 
-        #[inline(always)]
+        #[inline]
         fn reset(&mut self) {
             self.kmer_len = 0;
             self.kmer_bits = 0;
@@ -443,26 +367,8 @@ mod optimized {
         candidates
     }
 
-    /// Decode 2-bit k-mer to byte string
-    pub fn decode_kmer(kmer_bits: u32, k: usize) -> Vec<u8> {
-        let mut result = Vec::with_capacity(k);
-        for i in (0..k).rev() {
-            let bits = (kmer_bits >> (i * 2)) & 0b11;
-            let base = match bits {
-                0 => b'A',
-                1 => b'C',
-                2 => b'G',
-                3 => b'T',
-                _ => unreachable!(),
-            };
-            result.push(base);
-        }
-        result
-    }
-
     /// Known adapter with pre-encoded windows
     pub struct KnownAdapter {
-        pub name: &'static str,
         pub full_seq: &'static [u8],
         pub encoded_windows: Vec<u32>,
     }
@@ -487,12 +393,11 @@ mod optimized {
             let adapter_map = crate::adapter::adapters::get_known_adapters();
             let mut result = Vec::new();
 
-            for (seq_str, name) in adapter_map {
+            for seq_str in adapter_map.keys() {
                 let seq = seq_str.as_bytes();
                 let windows = encode_all_windows(seq, 10);
 
                 result.push(KnownAdapter {
-                    name,
                     full_seq: seq,
                     encoded_windows: windows,
                 });
@@ -604,28 +509,320 @@ pub mod adapters {
     use std::collections::HashMap;
     use std::sync::OnceLock;
 
-    /// Illumina `TruSeq` Universal Adapter
-    pub const TRUSEQ_UNIVERSAL: &[u8] = b"AGATCGGAAGAGC";
+    /// Add Illumina `TruSeq` and basic adapters
+    fn add_truseq_adapters(map: &mut HashMap<&'static str, &'static str>) {
+        map.insert(
+            "AGATCGGAAGAGCACACGTCTGAACTCCAGTCA",
+            ">Illumina TruSeq Adapter Read 1",
+        );
+        map.insert(
+            "AGATCGGAAGAGCGTCGTGTAGGGAAAGAGTGT",
+            ">Illumina TruSeq Adapter Read 2",
+        );
+        map.insert(
+            "GATCGTCGGACTGTAGAACTCTGAACGTGTAGA",
+            ">Illumina Small RNA Adapter Read 2",
+        );
+        map.insert("AATGATACGGCGACCACCGACAGGTTCAGAGTTCTACAGTCCGA", ">Illumina DpnII expression PCR Primer 2 | >Illumina NlaIII expression PCR Primer 2 | >Illumina Small RNA PCR Primer 2 | >Illumina DpnII Gex PCR Primer 2 | >Illumina NlaIII Gex PCR Primer 2");
+        map.insert(
+            "AATGATACGGCGACCACCGAGATCTACACGTTCAGAGTTCTACAGTCCGA",
+            ">Illumina RNA PCR Primer",
+        );
+        map.insert("AATGATACGGCGACCACCGAGATCTACACTCTTTCCCTACACGACGCTCTTCCGATCT", ">TruSeq_Universal_Adapter | >PrefixPE/1 | >PCR_Primer1 | >Illumina Single End PCR Primer 1 | >Illumina Paried End PCR Primer 1 | >Illumina Multiplexing PCR Primer 1.01 | >TruSeq Universal Adapter | >TruSeq_Universal_Adapter | >PrefixPE/1 | >PCR_Primer1");
+        map.insert("AATGATACGGCGACCACCGAGATCTACACTCTTTCCCTACACGACGCTCTTCCGATCTAGATCGGAAGAGCGGTTCAGCAGGAATGCCGAGACCGATCTCGTATGCCGTCTTCTGCTTG", ">pcr_dimer");
+        map.insert("AATGATACGGCGACCACCGAGATCTACACTCTTTCCCTACACGACGCTCTTCCGATCTCAAGCAGAAGACGGCATACGAGCTCTTCCGATCT", ">PCR_Primers");
+        map.insert("ACACTCTTTCCCTACACGACGCTCTTCCGATCT", ">Illumina Single End Sequencing Primer | >Illumina Paired End Adapter 1 | >Illumina Paried End Sequencing Primer 1 | >Illumina Multiplexing Adapter 2 | >Illumina Multiplexing Read1 Sequencing Primer");
+        map.insert(
+            "AGATCGGAAGAGCACACGTCTGAACTCCAGTCAC",
+            ">PE2_rc | >TruSeq3_IndexedAdapter | >PE2_rc | >TruSeq3_IndexedAdapter",
+        );
+        map.insert(
+            "AGATCGGAAGAGCACACGTCTGAACTCCAGTCACATCACGATCTCGTATGCCGTCTTCTGCTTG",
+            ">Reverse_adapter",
+        );
+        map.insert("AGATCGGAAGAGCGGTTCAGCAGGAATGCCGAG", ">TruSeq2_PE_r");
+        map.insert(
+            "AGATCGGAAGAGCGGTTCAGCAGGAATGCCGAGACCGATCTCGTATGCCGTCTTCTGCTTG",
+            ">PCR_Primer2_rc",
+        );
+        map.insert(
+            "AGATCGGAAGAGCGGTTCAGCAGGAATGCCGAGACCGATCTCGTATGCCGTCTTCTGCTTGAAA",
+            ">PhiX_read1_adapter",
+        );
+        map.insert(
+            "AGATCGGAAGAGCGTCGTGTAGGGAAAGAGTGTA",
+            ">PE1_rc | >TruSeq3_UniversalAdapter | >PE1_rc | >TruSeq3_UniversalAdapter",
+        );
+        map.insert(
+            "AGATCGGAAGAGCGTCGTGTAGGGAAAGAGTGTAGATCTCGGTGGTCGCCGTATCATT",
+            ">PCR_Primer1_rc",
+        );
+        map.insert(
+            "AGATCGGAAGAGCGTCGTGTAGGGAAAGAGTGTAGATCTCGGTGGTCGCCGTATCATTAAAAAA",
+            ">PhiX_read2_adapter",
+        );
+        map.insert("AGATCGGAAGAGCTCGTATGCCGTCTTCTGCTTG", ">TruSeq2_SE");
+    }
 
-    /// Illumina `TruSeq` Read 1 Adapter
-    pub const TRUSEQ_READ1: &[u8] = b"AGATCGGAAGAGCACACGTCTGAACTCCAGTCA";
-
-    /// Illumina `TruSeq` Read 2 Adapter
-    pub const TRUSEQ_READ2: &[u8] = b"AGATCGGAAGAGCGTCGTGTAGGGAAAGAGTGT";
-
-    /// Illumina Small RNA 3' Adapter
-    pub const SMALL_RNA_3P: &[u8] = b"TGGAATTCTCGGGTGCCAAGG";
-
-    /// Nextera Transposase Sequence
-    pub const NEXTERA: &[u8] = b"CTGTCTCTTATACACATCT";
+    /// Add Illumina RNA PCR Primer Index adapters
+    #[allow(clippy::too_many_lines)]
+    fn add_rna_pcr_index_adapters(map: &mut HashMap<&'static str, &'static str>) {
+        map.insert(
+            "CAAGCAGAAGACGGCATACGAGATAAAATGGTGACTGGAGTTCCTTGGCACCCGAGAATTCCA",
+            ">RNA PCR Primer, Index 35",
+        );
+        map.insert(
+            "CAAGCAGAAGACGGCATACGAGATAAGCTAGTGACTGGAGTTC",
+            ">Illumina PCR Primer Index 10",
+        );
+        map.insert(
+            "CAAGCAGAAGACGGCATACGAGATAAGCTAGTGACTGGAGTTCCTTGGCACCCGAGAATTCCA",
+            ">RNA PCR Primer, Index 10",
+        );
+        map.insert(
+            "CAAGCAGAAGACGGCATACGAGATACATCGGTGACTGGAGTTC",
+            ">Illumina PCR Primer Index 2",
+        );
+        map.insert(
+            "CAAGCAGAAGACGGCATACGAGATACATCGGTGACTGGAGTTCCTTGGCACCCGAGAATTCCA",
+            ">RNA PCR Primer, Index 2",
+        );
+        map.insert(
+            "CAAGCAGAAGACGGCATACGAGATAGCTAGGTGACTGGAGTTCCTTGGCACCCGAGAATTCCA",
+            ">RNA PCR Primer, Index 38",
+        );
+        map.insert(
+            "CAAGCAGAAGACGGCATACGAGATAGGAATGTGACTGGAGTTCCTTGGCACCCGAGAATTCCA",
+            ">RNA PCR Primer, Index 27",
+        );
+        map.insert(
+            "CAAGCAGAAGACGGCATACGAGATATCAGTGTGACTGGAGTTCCTTGGCACCCGAGAATTCCA",
+            ">RNA PCR Primer, Index 25",
+        );
+        map.insert(
+            "CAAGCAGAAGACGGCATACGAGATATCGTGGTGACTGGAGTTCCTTGGCACCCGAGAATTCCA",
+            ">RNA PCR Primer, Index 31",
+        );
+        map.insert(
+            "CAAGCAGAAGACGGCATACGAGATATTATAGTGACTGGAGTTCCTTGGCACCCGAGAATTCCA",
+            ">RNA PCR Primer, Index 44",
+        );
+        map.insert(
+            "CAAGCAGAAGACGGCATACGAGATATTCCGGTGACTGGAGTTCCTTGGCACCCGAGAATTCCA",
+            ">RNA PCR Primer, Index 37",
+        );
+        map.insert(
+            "CAAGCAGAAGACGGCATACGAGATATTGGCGTGACTGGAGTTC",
+            ">Illumina PCR Primer Index 6",
+        );
+        map.insert(
+            "CAAGCAGAAGACGGCATACGAGATATTGGCGTGACTGGAGTTCCTTGGCACCCGAGAATTCCA",
+            ">RNA PCR Primer, Index 6",
+        );
+        map.insert(
+            "CAAGCAGAAGACGGCATACGAGATCACTGTGTGACTGGAGTTC",
+            ">Illumina PCR Primer Index 5",
+        );
+        map.insert(
+            "CAAGCAGAAGACGGCATACGAGATCACTGTGTGACTGGAGTTCCTTGGCACCCGAGAATTCCA",
+            ">RNA PCR Primer, Index 5",
+        );
+        map.insert(
+            "CAAGCAGAAGACGGCATACGAGATCCACTCGTGACTGGAGTTCCTTGGCACCCGAGAATTCCA",
+            ">RNA PCR Primer, Index 23",
+        );
+        map.insert(
+            "CAAGCAGAAGACGGCATACGAGATCCGGTGGTGACTGGAGTTCCTTGGCACCCGAGAATTCCA",
+            ">RNA PCR Primer, Index 30",
+        );
+        map.insert(
+            "CAAGCAGAAGACGGCATACGAGATCGAAACGTGACTGGAGTTCCTTGGCACCCGAGAATTCCA",
+            ">RNA PCR Primer, Index 21",
+        );
+        map.insert(
+            "CAAGCAGAAGACGGCATACGAGATCGATTAGTGACTGGAGTTCCTTGGCACCCGAGAATTCCA",
+            ">RNA PCR Primer, Index 42",
+        );
+        map.insert(
+            "CAAGCAGAAGACGGCATACGAGATCGCCTGGTGACTGGAGTTCCTTGGCACCCGAGAATTCCA",
+            ">RNA PCR Primer, Index 33",
+        );
+        map.insert("CAAGCAGAAGACGGCATACGAGATCGGTCTCGGCATTCCTGCTGAACCGCTCTTCCGATCT", ">PrefixPE/2 | >PCR_Primer2 | >Illumina Paired End PCR Primer 2 | >PrefixPE/2 | >PCR_Primer2");
+        map.insert(
+            "CAAGCAGAAGACGGCATACGAGATCGTACGGTGACTGGAGTTCCTTGGCACCCGAGAATTCCA",
+            ">RNA PCR Primer, Index 22",
+        );
+        map.insert(
+            "CAAGCAGAAGACGGCATACGAGATCGTGATGTGACTGGAGTTC",
+            ">Illumina PCR Primer Index 1",
+        );
+        map.insert(
+            "CAAGCAGAAGACGGCATACGAGATCGTGATGTGACTGGAGTTCCTTGGCACCCGAGAATTCCA",
+            ">RNA PCR Primer, Index 1",
+        );
+        map.insert(
+            "CAAGCAGAAGACGGCATACGAGATCTCTACGTGACTGGAGTTCCTTGGCACCCGAGAATTCCA",
+            ">RNA PCR Primer, Index 17",
+        );
+        map.insert(
+            "CAAGCAGAAGACGGCATACGAGATCTGATCGTGACTGGAGTTC",
+            ">Illumina PCR Primer Index 9",
+        );
+        map.insert(
+            "CAAGCAGAAGACGGCATACGAGATCTGATCGTGACTGGAGTTCCTTGGCACCCGAGAATTCCA",
+            ">RNA PCR Primer, Index 9",
+        );
+        map.insert(
+            "CAAGCAGAAGACGGCATACGAGATCTTCGAGTGACTGGAGTTCCTTGGCACCCGAGAATTCCA",
+            ">RNA PCR Primer, Index 47",
+        );
+        map.insert(
+            "CAAGCAGAAGACGGCATACGAGATCTTTTGGTGACTGGAGTTCCTTGGCACCCGAGAATTCCA",
+            ">RNA PCR Primer, Index 28",
+        );
+        map.insert(
+            "CAAGCAGAAGACGGCATACGAGATGAATGAGTGACTGGAGTTCCTTGGCACCCGAGAATTCCA",
+            ">RNA PCR Primer, Index 45",
+        );
+        map.insert(
+            "CAAGCAGAAGACGGCATACGAGATGATCTGGTGACTGGAGTTC",
+            ">Illumina PCR Primer Index 7",
+        );
+        map.insert(
+            "CAAGCAGAAGACGGCATACGAGATGATCTGGTGACTGGAGTTCCTTGGCACCCGAGAATTCCA",
+            ">RNA PCR Primer, Index 7",
+        );
+        map.insert(
+            "CAAGCAGAAGACGGCATACGAGATGCCATGGTGACTGGAGTTCCTTGGCACCCGAGAATTCCA",
+            ">RNA PCR Primer, Index 34",
+        );
+        map.insert(
+            "CAAGCAGAAGACGGCATACGAGATGCCTAAGTGACTGGAGTTC",
+            ">Illumina PCR Primer Index 3",
+        );
+        map.insert(
+            "CAAGCAGAAGACGGCATACGAGATGCCTAAGTGACTGGAGTTCCTTGGCACCCGAGAATTCCA",
+            ">RNA PCR Primer, Index 3",
+        );
+        map.insert(
+            "CAAGCAGAAGACGGCATACGAGATGCGGACGTGACTGGAGTTCCTTGGCACCCGAGAATTCCA",
+            ">RNA PCR Primer, Index 18",
+        );
+        map.insert(
+            "CAAGCAGAAGACGGCATACGAGATGCTACCGTGACTGGAGTTCCTTGGCACCCGAGAATTCCA",
+            ">RNA PCR Primer, Index 24",
+        );
+        map.insert(
+            "CAAGCAGAAGACGGCATACGAGATGCTCATGTGACTGGAGTTCCTTGGCACCCGAGAATTCCA",
+            ">RNA PCR Primer, Index 26",
+        );
+        map.insert(
+            "CAAGCAGAAGACGGCATACGAGATGCTGTAGTGACTGGAGTTCCTTGGCACCCGAGAATTCCA",
+            ">RNA PCR Primer, Index 43",
+        );
+        map.insert(
+            "CAAGCAGAAGACGGCATACGAGATGGAACTGTGACTGGAGTTCCTTGGCACCCGAGAATTCCA",
+            ">RNA PCR Primer, Index 14",
+        );
+        map.insert(
+            "CAAGCAGAAGACGGCATACGAGATGGACGGGTGACTGGAGTTCCTTGGCACCCGAGAATTCCA",
+            ">RNA PCR Primer, Index 16",
+        );
+        map.insert(
+            "CAAGCAGAAGACGGCATACGAGATGGCCACGTGACTGGAGTTCCTTGGCACCCGAGAATTCCA",
+            ">RNA PCR Primer, Index 20",
+        );
+        map.insert(
+            "CAAGCAGAAGACGGCATACGAGATGTAGCCGTGACTGGAGTTC",
+            ">Illumina PCR Primer Index 11",
+        );
+        map.insert(
+            "CAAGCAGAAGACGGCATACGAGATGTAGCCGTGACTGGAGTTCCTTGGCACCCGAGAATTCCA",
+            ">RNA PCR Primer, Index 11",
+        );
+        map.insert(
+            "CAAGCAGAAGACGGCATACGAGATGTATAGGTGACTGGAGTTCCTTGGCACCCGAGAATTCCA",
+            ">RNA PCR Primer, Index 39",
+        );
+        map.insert(
+            "CAAGCAGAAGACGGCATACGAGATGTCGTCGTGACTGGAGTTCCTTGGCACCCGAGAATTCCA",
+            ">RNA PCR Primer, Index 41",
+        );
+        map.insert(
+            "CAAGCAGAAGACGGCATACGAGATTACAAGGTGACTGGAGTTC",
+            ">Illumina PCR Primer Index 12",
+        );
+        map.insert(
+            "CAAGCAGAAGACGGCATACGAGATTACAAGGTGACTGGAGTTCCTTGGCACCCGAGAATTCCA",
+            ">RNA PCR Primer, Index 12",
+        );
+        map.insert(
+            "CAAGCAGAAGACGGCATACGAGATTAGTTGGTGACTGGAGTTCCTTGGCACCCGAGAATTCCA",
+            ">RNA PCR Primer, Index 29",
+        );
+        map.insert(
+            "CAAGCAGAAGACGGCATACGAGATTCAAGTGTGACTGGAGTTC",
+            ">Illumina PCR Primer Index 8",
+        );
+        map.insert(
+            "CAAGCAGAAGACGGCATACGAGATTCAAGTGTGACTGGAGTTCCTTGGCACCCGAGAATTCCA",
+            ">RNA PCR Primer, Index 8",
+        );
+        map.insert(
+            "CAAGCAGAAGACGGCATACGAGATTCGGGAGTGACTGGAGTTCCTTGGCACCCGAGAATTCCA",
+            ">RNA PCR Primer, Index 46",
+        );
+        map.insert(
+            "CAAGCAGAAGACGGCATACGAGATTCTGAGGTGACTGGAGTTCCTTGGCACCCGAGAATTCCA",
+            ">RNA PCR Primer, Index 40",
+        );
+        map.insert(
+            "CAAGCAGAAGACGGCATACGAGATTGACATGTGACTGGAGTTCCTTGGCACCCGAGAATTCCA",
+            ">RNA PCR Primer, Index 15",
+        );
+        map.insert(
+            "CAAGCAGAAGACGGCATACGAGATTGAGTGGTGACTGGAGTTCCTTGGCACCCGAGAATTCCA",
+            ">RNA PCR Primer, Index 32",
+        );
+        map.insert(
+            "CAAGCAGAAGACGGCATACGAGATTGCCGAGTGACTGGAGTTCCTTGGCACCCGAGAATTCCA",
+            ">RNA PCR Primer, Index 48",
+        );
+        map.insert(
+            "CAAGCAGAAGACGGCATACGAGATTGGTCAGTGACTGGAGTTC",
+            ">Illumina PCR Primer Index 4",
+        );
+        map.insert(
+            "CAAGCAGAAGACGGCATACGAGATTGGTCAGTGACTGGAGTTCCTTGGCACCCGAGAATTCCA",
+            ">RNA PCR Primer, Index 4",
+        );
+        map.insert(
+            "CAAGCAGAAGACGGCATACGAGATTGTTGGGTGACTGGAGTTCCTTGGCACCCGAGAATTCCA",
+            ">RNA PCR Primer, Index 36",
+        );
+        map.insert(
+            "CAAGCAGAAGACGGCATACGAGATTTGACTGTGACTGGAGTTCCTTGGCACCCGAGAATTCCA",
+            ">RNA PCR Primer, Index 13",
+        );
+        map.insert(
+            "CAAGCAGAAGACGGCATACGAGATTTTCACGTGACTGGAGTTCCTTGGCACCCGAGAATTCCA",
+            ">RNA PCR Primer, Index 19",
+        );
+        map.insert(
+            "CAAGCAGAAGACGGCATACGAGCTCTTCCGATCT",
+            ">Illumina Single End Adapter 2 | >Illumina Single End PCR Primer 2",
+        );
+    }
 
     /// Get the comprehensive known adapters database
     /// Returns a `HashMap` mapping adapter sequences to their descriptions
+    #[allow(clippy::too_many_lines)]
     pub fn get_known_adapters() -> &'static HashMap<&'static str, &'static str> {
         static KNOWN_ADAPTERS: OnceLock<HashMap<&'static str, &'static str>> = OnceLock::new();
         KNOWN_ADAPTERS.get_or_init(|| {
             let mut map = HashMap::new();
-            map.insert("AGATCGGAAGAGCACACGTCTGAACTCCAGTCA", ">Illumina TruSeq Adapter Read 1");
+            add_truseq_adapters(&mut map);
+            add_rna_pcr_index_adapters(&mut map);
             map.insert("AGATCGGAAGAGCGTCGTGTAGGGAAAGAGTGT", ">Illumina TruSeq Adapter Read 2");
             map.insert("GATCGTCGGACTGTAGAACTCTGAACGTGTAGA", ">Illumina Small RNA Adapter Read 2");
             map.insert("AATGATACGGCGACCACCGACAGGTTCAGAGTTCTACAGTCCGA", ">Illumina DpnII expression PCR Primer 2 | >Illumina NlaIII expression PCR Primer 2 | >Illumina Small RNA PCR Primer 2 | >Illumina DpnII Gex PCR Primer 2 | >Illumina NlaIII Gex PCR Primer 2");
@@ -880,8 +1077,6 @@ pub enum MatchType {
 pub struct AdapterMatch {
     /// Position where adapter starts
     pub position: usize,
-    /// Number of matching bases
-    pub matched_bases: usize,
     /// Number of mismatches
     pub mismatches: usize,
     /// Type of match found
@@ -941,7 +1136,6 @@ fn try_exact_match(
     if mismatches <= allowed_mismatches && matches + mismatches >= min_overlap {
         Some(AdapterMatch {
             position: start_pos.max(0) as usize,
-            matched_bases: matches,
             mismatches,
             match_type: MatchType::Exact,
         })
@@ -1019,9 +1213,7 @@ fn try_insertion_match(
             right[i] =
                 right[i + 1] + u16::from(!ins_data[i + 1].eq_ignore_ascii_case(&normal_data[i]));
             if right[i] + left[0] > diff_limit {
-                for p in 0..i {
-                    right[p] = init;
-                }
+                right[..i].fill(init);
                 break;
             }
         }
@@ -1035,7 +1227,6 @@ fn try_insertion_match(
             if diff <= diff_limit {
                 return Some(AdapterMatch {
                     position: 0,
-                    matched_bases: cmplen - diff as usize,
                     mismatches: diff as usize,
                     match_type: MatchType::Insertion,
                 });
@@ -1070,7 +1261,9 @@ fn try_deletion_match(
 }
 
 /// Check if new match is better than current best
-fn is_better_match(new_match: &AdapterMatch, current_best: &Option<AdapterMatch>) -> bool {
+fn is_better_match(new_match: &AdapterMatch, current_best: Option<&AdapterMatch>) -> bool {
+    use MatchType::{Deletion, Exact, Insertion};
+
     match current_best {
         None => true,
         Some(best) => {
@@ -1083,10 +1276,8 @@ fn is_better_match(new_match: &AdapterMatch, current_best: &Option<AdapterMatch>
             }
 
             // Same position: prefer exact > deletion > insertion
-            use MatchType::{Deletion, Exact, Insertion};
             match (&new_match.match_type, &best.match_type) {
-                (Exact, Insertion | Deletion) => true,
-                (Deletion, Insertion) => true,
+                (Exact, Insertion | Deletion) | (Deletion, Insertion) => true,
                 (Insertion | Deletion, Exact) | (Insertion, Deletion) => false,
                 _ => new_match.mismatches < best.mismatches,
             }
@@ -1132,7 +1323,7 @@ pub fn find_adapter(
     // Fastp tries negative positions for adapters >= 16bp
     for pos in start..=end {
         if let Some(match_result) = try_exact_match(seq, adapter, pos, min_overlap) {
-            if is_better_match(&match_result, &best_match) {
+            if is_better_match(&match_result, best_match.as_ref()) {
                 best_match = Some(match_result);
             }
         }
@@ -1155,7 +1346,7 @@ pub fn find_adapter(
         let cmplen = min(remaining.saturating_sub(1), adapter.len());
         // Match fastp: always compare from position 0, passing only cmplen
         if let Some(match_result) = try_insertion_match(seq, adapter, cmplen, min_overlap) {
-            if is_better_match(&match_result, &best_match) {
+            if is_better_match(&match_result, best_match.as_ref()) {
                 // Adjust position to match loop variable (fastp returns pos from loop)
                 let mut adjusted_match = match_result;
                 adjusted_match.position = pos;
@@ -1170,7 +1361,7 @@ pub fn find_adapter(
     for pos in 0..=(seq.len() - match_req) {
         let cmplen = min(seq.len() - pos, adapter.len().saturating_sub(1));
         if let Some(match_result) = try_deletion_match(seq, adapter, cmplen, min_overlap) {
-            if is_better_match(&match_result, &best_match) {
+            if is_better_match(&match_result, best_match.as_ref()) {
                 let mut adjusted_match = match_result;
                 adjusted_match.position = pos;
                 best_match = Some(adjusted_match);
@@ -1182,33 +1373,6 @@ pub fn find_adapter(
     best_match
 }
 
-/// Trim adapter from sequence and quality
-///
-/// Returns (`trimmed_seq`, `trimmed_qual`) as slices
-pub fn trim_adapter<'a>(
-    seq: &'a [u8],
-    qual: &'a [u8],
-    adapter_match: &AdapterMatch,
-) -> (&'a [u8], &'a [u8]) {
-    // Trim everything from the adapter position onwards
-    let trim_pos = adapter_match.position;
-    (&seq[..trim_pos], &qual[..trim_pos])
-}
-
-/// Detect adapter using paired-end overlap information
-///
-/// Deprecated: Use `detect_adapters_from_pe_reads` instead for batch detection.
-/// This function is kept for compatibility but returns None.
-#[deprecated(note = "Use detect_adapters_from_pe_reads for PE adapter auto-detection")]
-pub fn detect_adapter_from_pe_overlap(
-    _seq1: &[u8],
-    _seq2: &[u8],
-    _min_overlap: usize,
-) -> (Option<AdapterMatch>, Option<AdapterMatch>) {
-    // Use detect_adapters_from_pe_reads for actual detection
-    (None, None)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1216,7 +1380,7 @@ mod tests {
     #[test]
     fn test_exact_adapter_match() {
         let seq = b"ACGTACGTACGTAGATCGGAAGAGC";
-        let adapter = adapters::TRUSEQ_UNIVERSAL;
+        let adapter = b"AGATCGGAAGAGC";
 
         let result = find_adapter(seq, adapter, 10, 2);
         assert!(result.is_some());
@@ -1229,7 +1393,7 @@ mod tests {
     #[test]
     fn test_adapter_with_mismatch() {
         let seq = b"ACGTACGTACGTAGATCGGAAGAGX"; // X instead of C
-        let adapter = adapters::TRUSEQ_UNIVERSAL;
+        let adapter = b"AGATCGGAAGAGC";
 
         let result = find_adapter(seq, adapter, 10, 2);
         assert!(result.is_some());
@@ -1243,7 +1407,7 @@ mod tests {
     fn test_partial_adapter_at_end() {
         // Only partial adapter at the end of read
         let seq = b"ACGTACGTACGTACGTAGATCGGAA"; // Only first 9 bases of adapter
-        let adapter = adapters::TRUSEQ_UNIVERSAL;
+        let adapter = b"AGATCGGAAGAGC";
 
         // Should not match with min_overlap=10
         let result = find_adapter(seq, adapter, 10, 2);
@@ -1257,30 +1421,17 @@ mod tests {
     #[test]
     fn test_no_adapter() {
         let seq = b"ACGTACGTACGTACGTACGTACGTACGTACGT";
-        let adapter = adapters::TRUSEQ_UNIVERSAL;
+        let adapter = b"AGATCGGAAGAGC";
 
         let result = find_adapter(seq, adapter, 10, 2);
         assert!(result.is_none());
     }
 
     #[test]
-    fn test_trim_adapter() {
-        let seq = b"ACGTACGTACGTAGATCGGAAGAGC";
-        let qual = b"############IIIIIIIIIIIII";
-        let adapter = adapters::TRUSEQ_UNIVERSAL;
-
-        let adapter_match = find_adapter(seq, adapter, 10, 2).unwrap();
-        let (trimmed_seq, trimmed_qual) = trim_adapter(seq, qual, &adapter_match);
-
-        assert_eq!(trimmed_seq, b"ACGTACGTACGT");
-        assert_eq!(trimmed_qual, b"############");
-    }
-
-    #[test]
     fn test_adapter_too_many_mismatches() {
         // 3 mismatches (XXX), but max_mismatches=2
         let seq = b"ACGTACGTACGTAGATCGGAAXXXC";
-        let adapter = adapters::TRUSEQ_UNIVERSAL;
+        let adapter = b"AGATCGGAAGAGC";
 
         let result = find_adapter(seq, adapter, 10, 2);
         assert!(result.is_none());
@@ -1289,7 +1440,7 @@ mod tests {
     #[test]
     fn test_case_insensitive_matching() {
         let seq = b"ACGTACGTACGTagatcggaagagc"; // lowercase adapter
-        let adapter = adapters::TRUSEQ_UNIVERSAL; // uppercase
+        let adapter = b"AGATCGGAAGAGC"; // uppercase
 
         let result = find_adapter(seq, adapter, 10, 2);
         assert!(result.is_some());

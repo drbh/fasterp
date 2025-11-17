@@ -21,8 +21,6 @@ pub struct OverlapResult {
     pub offset: isize,
     /// Length of overlapping region
     pub overlap_len: usize,
-    /// Number of differences in overlap region
-    pub differences: usize,
 }
 
 /// Configuration for overlap detection
@@ -53,14 +51,6 @@ pub struct CorrectionStats {
     pub corrected: usize,
     /// Number of mismatches not corrected (quality ambiguous)
     pub uncorrected: usize,
-}
-
-impl CorrectionStats {
-    /// Merge statistics from another correction operation
-    pub fn merge(&mut self, other: &CorrectionStats) {
-        self.corrected += other.corrected;
-        self.uncorrected += other.uncorrected;
-    }
 }
 
 /// Reverse complement a single base
@@ -94,14 +84,15 @@ pub fn detect_overlap(
         return None;
     }
 
+    // Fastp's complete_compare_require - for long overlaps (>50bp), accept even with high diff
+    #[allow(clippy::items_after_statements)]
+    const COMPLETE_COMPARE_REQUIRE: usize = 50;
+
     // Create reverse complement of R2
     let r2_rc = reverse_complement(r2_seq);
 
     let r1_len = r1_seq.len();
     let r2_len = r2_rc.len();
-
-    // Fastp's complete_compare_require - for long overlaps (>50bp), accept even with high diff
-    const COMPLETE_COMPARE_REQUIRE: usize = 50;
 
     // Try different offset positions
     // IMPORTANT: Fastp returns the FIRST valid overlap it finds, not the best one.
@@ -136,8 +127,6 @@ pub fn detect_overlap(
             COMPLETE_COMPARE_REQUIRE,
         );
 
-        let diff_percent = differences * 100 / overlap_len;
-
         // Check if overlap meets criteria
         // Fastp's logic: accept if either:
         // 1. Within calculated overlap-specific limits
@@ -152,7 +141,6 @@ pub fn detect_overlap(
                 overlapped: true,
                 offset: offset as isize,
                 overlap_len,
-                differences,
             });
         }
     }
@@ -184,8 +172,6 @@ pub fn detect_overlap(
             COMPLETE_COMPARE_REQUIRE,
         );
 
-        let diff_percent = differences * 100 / overlap_len;
-
         // Check if overlap meets criteria
         // Same lenient logic for long overlaps
         let within_strict_limits = differences <= overlap_diff_limit;
@@ -198,20 +184,12 @@ pub fn detect_overlap(
                 overlapped: true,
                 offset: -(offset as isize),
                 overlap_len,
-                differences,
             });
         }
     }
 
     // No valid overlap found
     None
-}
-
-/// Count differences between two sequences of equal length
-#[inline]
-fn count_differences(seq1: &[u8], seq2: &[u8]) -> usize {
-    debug_assert_eq!(seq1.len(), seq2.len());
-    seq1.iter().zip(seq2.iter()).filter(|(a, b)| a != b).count()
 }
 
 /// Correct bases in overlapping region using quality scores
@@ -421,15 +399,6 @@ mod tests {
     }
 
     #[test]
-    fn test_count_differences() {
-        assert_eq!(count_differences(b"AAAA", b"AAAA"), 0);
-        assert_eq!(count_differences(b"AAAA", b"AAAT"), 1);
-        assert_eq!(count_differences(b"AAAA", b"TTTT"), 4);
-        assert_eq!(count_differences(b"ACGT", b"ACGT"), 0);
-        assert_eq!(count_differences(b"ACGT", b"TGCA"), 4);
-    }
-
-    #[test]
     fn test_overlap_detection_no_overlap() {
         let config = OverlapConfig::default();
 
@@ -456,7 +425,6 @@ mod tests {
 
         let overlap = result.unwrap();
         assert!(overlap.overlapped);
-        assert_eq!(overlap.differences, 0);
         assert!(overlap.overlap_len >= config.min_overlap_len);
     }
 
@@ -496,7 +464,6 @@ mod tests {
             overlapped: true,
             offset: 0,
             overlap_len: 4,
-            differences: 1,
         };
 
         let stats = correct_by_overlap(
@@ -524,7 +491,6 @@ mod tests {
             overlapped: true,
             offset: 0,
             overlap_len: 4,
-            differences: 1,
         };
 
         let stats = correct_by_overlap(
@@ -559,7 +525,6 @@ mod tests {
         // For perfect overlap, R2 should be reverse complement of R1
         let r2 = reverse_complement(r1_seq);
         let r2_qual: Vec<u8> = r1_qual.iter().rev().copied().collect();
-        let r2_header = b"read1 2:N:0";
 
         // Detect overlap
         let config = OverlapConfig::default();
@@ -624,7 +589,6 @@ mod tests {
         // To get this as R2, we need to reverse complement it back
         let r2 = reverse_complement(&r2_rc_seq);
         let r2_qual = vec![b'I'; 150];
-        let r2_header = b"read1 2:N:0";
 
         // Detect overlap with relaxed config
         let config = OverlapConfig {
@@ -660,24 +624,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_stats_merge() {
-        let mut stats1 = CorrectionStats {
-            corrected: 10,
-            uncorrected: 5,
-        };
-
-        let stats2 = CorrectionStats {
-            corrected: 3,
-            uncorrected: 2,
-        };
-
-        stats1.merge(&stats2);
-
-        assert_eq!(stats1.corrected, 13);
-        assert_eq!(stats1.uncorrected, 7);
-    }
-
     // ===== WORKING CASES =====
 
     #[test]
@@ -696,7 +642,6 @@ mod tests {
             overlapped: true,
             offset: 10,      // R1 extends by 10bp
             overlap_len: 50, // 50bp overlap
-            differences: 0,
         };
 
         let (merged_header, merged_seq, merged_qual) =
@@ -747,12 +692,9 @@ mod tests {
     fn test_merge_reads_no_overlap_detected() {
         // Test case where reads don't overlap at all
         let r1_seq = b"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"; // All A's
-        let r1_qual = b"IIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII";
-        let r1_header = b"read4 1:N:0";
 
         // R2: All C's - no overlap with R1
         let r2 = b"CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC";
-        let r2_qual = b"IIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII";
 
         let config = OverlapConfig::default();
         let overlap = detect_overlap(r1_seq, r2, &config);
@@ -767,13 +709,10 @@ mod tests {
     fn test_merge_reads_insufficient_overlap_length() {
         // Test case where overlap is too short (below min_overlap_len)
         let r1_seq = b"AAAAAAAAAAAAAAAAAAAAAAAACGTACGT"; // 25 A's + 7 bases
-        let r1_qual = b"IIIIIIIIIIIIIIIIIIIIIIIIIIIIII";
-        let r1_header = b"read5 1:N:0";
 
         // R2_rc: Last 10 bases of R1 (overlap only 7bp, below default 30bp min)
         let r2_rc_seq = &r1_seq[22..]; // Last 7 bases
         let r2 = reverse_complement(r2_rc_seq);
-        let r2_qual = b"IIIIIII";
 
         let config = OverlapConfig::default(); // min_overlap_len = 30
         let overlap = detect_overlap(r1_seq, &r2, &config);
@@ -789,8 +728,6 @@ mod tests {
     fn test_merge_reads_too_many_differences() {
         // Test case where overlap has too many mismatches
         let r1_seq = b"ACGTACGTACGTACGTACGTACGTACGTACGTACGT"; // 35bp
-        let r1_qual = b"IIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII";
-        let r1_header = b"read6 1:N:0";
 
         // R2: Similar to R1_rc but with many mismatches
         let mut r2: Vec<u8> = reverse_complement(r1_seq);
@@ -798,7 +735,6 @@ mod tests {
         for i in (0..r2.len()).step_by(3) {
             r2[i] = b'N'; // Every 3rd base is N (mismatch)
         }
-        let r2_qual = b"IIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII";
 
         let config = OverlapConfig {
             min_overlap_len: 30,
@@ -819,11 +755,8 @@ mod tests {
     fn test_merge_reads_completely_non_overlapping() {
         // Test case where reads are from different fragments entirely
         let r1_seq = b"GGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGG"; // All G's
-        let r1_qual = b"IIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII";
-        let r1_header = b"read7 1:N:0";
 
         let r2_seq = b"TTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTT"; // All T's
-        let r2_qual = b"IIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII";
 
         let config = OverlapConfig::default();
         let overlap = detect_overlap(r1_seq, r2_seq, &config);
@@ -876,7 +809,6 @@ mod tests {
         let ov = overlap.unwrap();
         assert!(ov.overlapped);
         assert_eq!(ov.overlap_len, 60, "Should find full 60bp overlap");
-        assert_eq!(ov.differences, 10, "Should count all 10 differences");
         // Accepted via lenient mode: i=60 > 50, even though diff=10 > limit=5
     }
 
@@ -940,7 +872,6 @@ mod tests {
 
         assert!(overlap.is_some(), "Should accept with diff=5 <= limit=5");
         let ov = overlap.unwrap();
-        assert_eq!(ov.differences, 5);
         assert_eq!(ov.overlap_len, 50);
     }
 
@@ -977,7 +908,6 @@ mod tests {
             "Should accept via lenient mode: i=51 > 50"
         );
         let ov = overlap.unwrap();
-        assert_eq!(ov.differences, 6, "Should have 6 differences");
         assert_eq!(ov.overlap_len, 51);
     }
 
@@ -1051,8 +981,6 @@ mod tests {
         let overlap = detect_overlap(&r1, &r2, &config);
 
         assert!(overlap.is_some(), "Should accept with diff=5 at limit");
-        let ov = overlap.unwrap();
-        assert_eq!(ov.differences, 5);
     }
 
     #[test]
@@ -1180,7 +1108,6 @@ mod tests {
         let ov = overlap.unwrap();
         assert_eq!(ov.offset, -18, "Should have offset=-18");
         assert_eq!(ov.overlap_len, 57, "Should have 57bp overlap");
-        assert_eq!(ov.differences, 7, "Should have 7 differences");
         // Passes via lenient mode: all 57 bases compared (>50)
     }
 
@@ -1192,7 +1119,6 @@ mod tests {
             overlapped: true,
             offset: -20,
             overlap_len: 50,
-            differences: 3,
         };
 
         let r1_len = 75;
@@ -1215,7 +1141,6 @@ mod tests {
             overlapped: true,
             offset: 20,
             overlap_len: 50,
-            differences: 3,
         };
 
         let r1_len = 75;
@@ -1287,7 +1212,6 @@ mod tests {
             "Should accept long overlap via lenient mode"
         );
         let ov = overlap.unwrap();
-        assert_eq!(ov.differences, 6);
         assert_eq!(ov.overlap_len, 60);
     }
 }

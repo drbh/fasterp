@@ -56,8 +56,6 @@ impl Default for UmiConfig {
 pub struct UmiExtraction {
     /// The extracted UMI sequence
     pub umi_seq: Vec<u8>,
-    /// Start position in original read (after skip)
-    pub start_pos: usize,
     /// End position in original read
     pub end_pos: usize,
 }
@@ -82,7 +80,6 @@ pub fn extract_umi(seq: &[u8], config: &UmiConfig) -> Option<UmiExtraction> {
 
     Some(UmiExtraction {
         umi_seq: seq[total_umi_start..total_umi_end].to_vec(),
-        start_pos: total_umi_start,
         end_pos: total_umi_end,
     })
 }
@@ -98,61 +95,6 @@ pub fn add_umi_to_header(header: &[u8], umi_seq: &[u8], prefix: &str) -> Vec<u8>
     new_header.push(b'_');
     new_header.extend_from_slice(umi_seq);
     new_header
-}
-
-/// Statistics for UMI processing
-#[derive(Debug, Default, Clone)]
-pub struct UmiStats {
-    /// Total reads processed
-    pub total_reads: usize,
-    /// Reads with UMI extracted successfully
-    pub umi_extracted: usize,
-    /// Reads where UMI extraction failed (too short)
-    pub umi_failed: usize,
-    /// Reads removed as duplicates (if deduplication enabled)
-    pub duplicates_removed: usize,
-}
-
-impl UmiStats {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn record_extraction(&mut self, success: bool) {
-        self.total_reads += 1;
-        if success {
-            self.umi_extracted += 1;
-        } else {
-            self.umi_failed += 1;
-        }
-    }
-
-    pub fn record_duplicate(&mut self) {
-        self.duplicates_removed += 1;
-    }
-
-    pub fn merge(&mut self, other: &UmiStats) {
-        self.total_reads += other.total_reads;
-        self.umi_extracted += other.umi_extracted;
-        self.umi_failed += other.umi_failed;
-        self.duplicates_removed += other.duplicates_removed;
-    }
-
-    pub fn extraction_rate(&self) -> f64 {
-        if self.total_reads == 0 {
-            0.0
-        } else {
-            (self.umi_extracted as f64 / self.total_reads as f64) * 100.0
-        }
-    }
-
-    pub fn duplication_rate(&self) -> f64 {
-        if self.total_reads == 0 {
-            0.0
-        } else {
-            (self.duplicates_removed as f64 / self.total_reads as f64) * 100.0
-        }
-    }
 }
 
 #[cfg(test)]
@@ -173,7 +115,6 @@ mod tests {
         let extraction = extract_umi(seq, &config).unwrap();
 
         assert_eq!(extraction.umi_seq, b"ACGTACGT");
-        assert_eq!(extraction.start_pos, 0);
         assert_eq!(extraction.end_pos, 8);
     }
 
@@ -191,7 +132,6 @@ mod tests {
         let extraction = extract_umi(seq, &config).unwrap();
 
         assert_eq!(extraction.umi_seq, b"ACGTAC");
-        assert_eq!(extraction.start_pos, 2);
         assert_eq!(extraction.end_pos, 8);
     }
 
@@ -259,60 +199,6 @@ mod tests {
         let extraction = extract_umi(seq, &config);
 
         assert!(extraction.is_none());
-    }
-
-    #[test]
-    fn test_umi_stats_basic() {
-        let mut stats = UmiStats::new();
-        assert_eq!(stats.total_reads, 0);
-        assert_eq!(stats.umi_extracted, 0);
-        assert_eq!(stats.umi_failed, 0);
-
-        stats.record_extraction(true);
-        assert_eq!(stats.total_reads, 1);
-        assert_eq!(stats.umi_extracted, 1);
-        assert_eq!(stats.umi_failed, 0);
-
-        stats.record_extraction(false);
-        assert_eq!(stats.total_reads, 2);
-        assert_eq!(stats.umi_extracted, 1);
-        assert_eq!(stats.umi_failed, 1);
-    }
-
-    #[test]
-    fn test_umi_stats_merge() {
-        let mut stats1 = UmiStats {
-            total_reads: 100,
-            umi_extracted: 95,
-            umi_failed: 5,
-            duplicates_removed: 0,
-        };
-
-        let stats2 = UmiStats {
-            total_reads: 50,
-            umi_extracted: 48,
-            umi_failed: 2,
-            duplicates_removed: 0,
-        };
-
-        stats1.merge(&stats2);
-
-        assert_eq!(stats1.total_reads, 150);
-        assert_eq!(stats1.umi_extracted, 143);
-        assert_eq!(stats1.umi_failed, 7);
-        assert_eq!(stats1.duplicates_removed, 0);
-    }
-
-    #[test]
-    fn test_umi_stats_extraction_rate() {
-        let stats = UmiStats {
-            total_reads: 100,
-            umi_extracted: 95,
-            umi_failed: 5,
-            duplicates_removed: 0,
-        };
-
-        assert_eq!(stats.extraction_rate(), 95.0);
     }
 
     #[test]

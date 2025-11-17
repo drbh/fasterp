@@ -83,6 +83,10 @@ pub fn count_mismatches(
 }
 
 /// Scalar mismatch counting with early termination
+#[cfg(any(
+    target_arch = "x86_64",
+    not(any(target_arch = "x86_64", target_arch = "aarch64"))
+))]
 #[inline]
 fn count_mismatches_scalar(
     seq1: &[u8],
@@ -150,8 +154,8 @@ fn compute_stats_scalar(seq: &[u8], qual: &[u8], qual_threshold: u8) -> Stats {
     let qual_threshold_ascii = qual_threshold + 33; // Convert to ASCII
 
     for (&b, &q) in seq.iter().zip(qual) {
-        let qval = u32::from(q - 33);
-        qsum += qval;
+        let quality_u32 = u32::from(q - 33);
+        qsum += quality_u32;
 
         // Q20/Q30/Q40: quality thresholds
         if q >= 53 {
@@ -329,8 +333,8 @@ unsafe fn compute_stats_avx2(seq: &[u8], qual: &[u8], qual_threshold: u8) -> Sta
     for j in i..len {
         let b = seq[j];
         let q = qual[j];
-        let qval = (q - 33) as u32;
-        qsum += qval;
+        let quality_u32 = (q - 33) as u32;
+        qsum += quality_u32;
 
         if q >= 53 {
             q20 += 1;
@@ -533,8 +537,8 @@ unsafe fn compute_stats_neon(seq: &[u8], qual: &[u8], qual_threshold: u8) -> Sta
     for j in i..len {
         let b = seq[j];
         let q = qual[j];
-        let qval = u32::from(q - 33);
-        qsum += qval;
+        let quality_u32 = u32::from(q - 33);
+        qsum += quality_u32;
 
         if q >= 53 {
             q20 += 1;

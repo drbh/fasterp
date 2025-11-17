@@ -90,6 +90,7 @@ pub(crate) struct Summary {
     pub read2_after_filtering: Option<ReadStats>,
 }
 
+#[allow(clippy::struct_field_names)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct FilteringResult {
     pub passed_filter_reads: usize,
@@ -204,8 +205,8 @@ impl PositionStats {
             .collect();
 
         let mut curves = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
-        for i in 0..4 {
-            curves[i] = self.base_sum[i]
+        for (i, curve) in curves.iter_mut().enumerate() {
+            *curve = self.base_sum[i]
                 .iter()
                 .zip(&self.base_cnt[i])
                 .enumerate()
@@ -235,31 +236,31 @@ impl PositionStats {
         let mut c_pct = Vec::with_capacity(self.total_cnt.len());
         let mut g_pct = Vec::with_capacity(self.total_cnt.len());
         let mut n_pct = Vec::with_capacity(self.total_cnt.len());
-        let mut gc_pct = Vec::with_capacity(self.total_cnt.len());
+        let mut gc_content_pct = Vec::with_capacity(self.total_cnt.len());
 
         for pos in 0..self.total_cnt.len() {
             let total = self.total_cnt[pos] as f64;
             if total > 0.0 {
-                let a = self.base_cnt[0].get(pos).copied().unwrap_or(0) as f64;
-                let t = self.base_cnt[1].get(pos).copied().unwrap_or(0) as f64;
-                let c = self.base_cnt[2].get(pos).copied().unwrap_or(0) as f64;
-                let g = self.base_cnt[3].get(pos).copied().unwrap_or(0) as f64;
-                let bases_sum = a + t + c + g;
-                let n = total - bases_sum;
+                let count_a = self.base_cnt[0].get(pos).copied().unwrap_or(0) as f64;
+                let count_t = self.base_cnt[1].get(pos).copied().unwrap_or(0) as f64;
+                let count_c = self.base_cnt[2].get(pos).copied().unwrap_or(0) as f64;
+                let count_g = self.base_cnt[3].get(pos).copied().unwrap_or(0) as f64;
+                let bases_sum = count_a + count_t + count_c + count_g;
+                let count_n = total - bases_sum;
 
-                a_pct.push(a * 100.0 / total);
-                t_pct.push(t * 100.0 / total);
-                c_pct.push(c * 100.0 / total);
-                g_pct.push(g * 100.0 / total);
-                n_pct.push(n * 100.0 / total);
-                gc_pct.push((g + c) * 100.0 / total);
+                a_pct.push(count_a * 100.0 / total);
+                t_pct.push(count_t * 100.0 / total);
+                c_pct.push(count_c * 100.0 / total);
+                g_pct.push(count_g * 100.0 / total);
+                n_pct.push(count_n * 100.0 / total);
+                gc_content_pct.push((count_g + count_c) * 100.0 / total);
             } else {
                 a_pct.push(0.0);
                 t_pct.push(0.0);
                 c_pct.push(0.0);
                 g_pct.push(0.0);
                 n_pct.push(0.0);
-                gc_pct.push(0.0);
+                gc_content_pct.push(0.0);
             }
         }
 
@@ -269,7 +270,7 @@ impl PositionStats {
             c: c_pct,
             g: g_pct,
             n: n_pct,
-            gc: gc_pct,
+            gc: gc_content_pct,
         }
     }
 

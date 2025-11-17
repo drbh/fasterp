@@ -6,6 +6,7 @@
 use crate::Args;
 use crate::stats::{DetailedReadStats, FasterpReport, InsertSizeStats};
 use anyhow::{Context, Result};
+use std::fmt::Write as FmtWrite;
 use std::fs::File;
 use std::io::Write;
 
@@ -89,6 +90,7 @@ fn write_css(html: &mut String) {
     html.push_str("</style>\n");
 }
 
+#[allow(clippy::too_many_lines)]
 fn write_body(html: &mut String, report: &FasterpReport, args: &Args) {
     // Header
     html.push_str("<h1>fasterp Quality Control Report</h1>\n");
@@ -420,7 +422,7 @@ fn write_base_contents_chart(
     html.push_str("<h2>");
     html.push_str(title);
     html.push_str("</h2>\n");
-    html.push_str(&format!("<div id='{div_id}' class='chart'></div>\n"));
+    let _ = writeln!(html, "<div id='{div_id}' class='chart'></div>");
     html.push_str("<script>\n");
 
     // Create traces for A, T, C, G, N, GC using real data
@@ -434,7 +436,7 @@ fn write_base_contents_chart(
     ];
 
     for (base_name, color, data) in &bases {
-        html.push_str(&format!("var {}_trace = {{\n", base_name.to_lowercase()));
+        let _ = writeln!(html, "var {}_trace = {{", base_name.to_lowercase());
         html.push_str("  x: [");
         for i in 0..data.len() {
             if i > 0 {
@@ -448,13 +450,13 @@ fn write_base_contents_chart(
             if i > 0 {
                 html.push(',');
             }
-            html.push_str(&format!("{val:.2}"));
+            let _ = write!(html, "{val:.2}");
         }
 
         html.push_str("],\n");
-        html.push_str(&format!("  name: '{base_name}',\n"));
+        let _ = writeln!(html, "  name: '{base_name}',");
         html.push_str("  type: 'scatter',\n  mode: 'lines',\n");
-        html.push_str(&format!("  line: {{color: '{color}', width: 1}},\n"));
+        let _ = writeln!(html, "  line: {{color: '{color}', width: 1}},");
         html.push_str("  opacity: 0.8\n");
         html.push_str("};\n");
     }
@@ -473,7 +475,7 @@ fn write_base_contents_chart(
     html.push_str("  paper_bgcolor: '#242424',\n");
     html.push_str("  plot_bgcolor: '#2a2a2a'\n");
     html.push_str("};\n");
-    html.push_str(&format!("Plotly.newPlot('{div_id}', data, layout);\n"));
+    let _ = writeln!(html, "Plotly.newPlot('{div_id}', data, layout);");
     html.push_str("</script>\n");
 }
 
@@ -502,7 +504,10 @@ fn write_kmer_table(html: &mut String, stats: &DetailedReadStats, title: &str) {
     let bases = ['A', 'T', 'C', 'G'];
     for b1 in &bases {
         for b2 in &bases {
-            html.push_str(&format!("<td style='color:#666; font-weight:bold; text-align:center; padding:1px; font-size:3px;'>{b1}{b2}</td>"));
+            let _ = write!(
+                html,
+                "<td style='color:#666; font-weight:bold; text-align:center; padding:1px; font-size:3px;'>{b1}{b2}</td>"
+            );
         }
     }
     html.push_str("</tr>\n");
@@ -512,7 +517,10 @@ fn write_kmer_table(html: &mut String, stats: &DetailedReadStats, title: &str) {
         for b2 in &bases {
             for b3 in &bases {
                 html.push_str("<tr>");
-                html.push_str(&format!("<td style='color:#666; font-weight:bold; padding:1px; font-size:3px;'>{b1}{b2}{b3}</td>"));
+                let _ = write!(
+                    html,
+                    "<td style='color:#666; font-weight:bold; padding:1px; font-size:3px;'>{b1}{b2}{b3}</td>"
+                );
 
                 // For each 2-mer suffix
                 for b4 in &bases {
@@ -529,12 +537,13 @@ fn write_kmer_table(html: &mut String, stats: &DetailedReadStats, title: &str) {
                         } else {
                             0.5
                         };
-                        let frac = frac.max(0.01).min(1.0);
+                        let frac = frac.clamp(0.01, 1.0);
                         let gray = ((1.0 - frac) * 255.0) as u8;
 
-                        html.push_str(&format!(
+                        let _ = write!(
+                            html,
                             "<td style='background:#{gray:02x}{gray:02x}{gray:02x}; text-align:center; padding:1px; cursor:help; font-size:3px;' title='{kmer}:{count} ({prop:.2}x mean)'>"
-                        ));
+                        );
                         html.push_str(&kmer);
                         html.push_str("</td>");
                     }
@@ -558,7 +567,7 @@ fn write_quality_histogram(
     html.push_str("</h2>\n");
 
     if let Some(ref qual_hist) = stats.qual_hist {
-        html.push_str(&format!("<div id='{div_id}' class='chart'></div>\n"));
+        let _ = writeln!(html, "<div id='{div_id}' class='chart'></div>");
         html.push_str("<script>\n");
 
         html.push_str("var hist_trace = {\n");
@@ -597,18 +606,19 @@ fn write_quality_histogram(
         html.push_str("  paper_bgcolor: '#242424',\n");
         html.push_str("  plot_bgcolor: '#2a2a2a'\n");
         html.push_str("};\n");
-        html.push_str(&format!("Plotly.newPlot('{div_id}', data, layout);\n"));
+        let _ = writeln!(html, "Plotly.newPlot('{div_id}', data, layout);");
         html.push_str("</script>\n");
     } else {
         html.push_str("<p>No quality histogram data available</p>\n");
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn write_quality_chart(html: &mut String, stats: &DetailedReadStats, title: &str, div_id: &str) {
     html.push_str("<h2>");
     html.push_str(title);
     html.push_str("</h2>\n");
-    html.push_str(&format!("<div id='{div_id}' class='chart'></div>\n"));
+    let _ = writeln!(html, "<div id='{div_id}' class='chart'></div>");
     html.push_str("<script>\n");
 
     // Mean quality trace
@@ -625,7 +635,7 @@ fn write_quality_chart(html: &mut String, stats: &DetailedReadStats, title: &str
         if i > 0 {
             html.push(',');
         }
-        html.push_str(&format!("{val:.2}"));
+        let _ = write!(html, "{val:.2}");
     }
     html.push_str("],\n  name: 'Mean',\n  type: 'scatter',\n  mode: 'lines',\n");
     html.push_str("  line: {color: '#333', width: 2}\n");
@@ -645,7 +655,7 @@ fn write_quality_chart(html: &mut String, stats: &DetailedReadStats, title: &str
         if i > 0 {
             html.push(',');
         }
-        html.push_str(&format!("{val:.2}"));
+        let _ = write!(html, "{val:.2}");
     }
     html.push_str("],\n  name: 'A',\n  type: 'scatter',\n  mode: 'lines',\n");
     html.push_str("  line: {color: '#8dd3c7', width: 1},\n  opacity: 0.6\n");
@@ -665,7 +675,7 @@ fn write_quality_chart(html: &mut String, stats: &DetailedReadStats, title: &str
         if i > 0 {
             html.push(',');
         }
-        html.push_str(&format!("{val:.2}"));
+        let _ = write!(html, "{val:.2}");
     }
     html.push_str("],\n  name: 'T',\n  type: 'scatter',\n  mode: 'lines',\n");
     html.push_str("  line: {color: '#bebada', width: 1},\n  opacity: 0.6\n");
@@ -685,7 +695,7 @@ fn write_quality_chart(html: &mut String, stats: &DetailedReadStats, title: &str
         if i > 0 {
             html.push(',');
         }
-        html.push_str(&format!("{val:.2}"));
+        let _ = write!(html, "{val:.2}");
     }
     html.push_str("],\n  name: 'C',\n  type: 'scatter',\n  mode: 'lines',\n");
     html.push_str("  line: {color: '#fb8072', width: 1},\n  opacity: 0.6\n");
@@ -705,7 +715,7 @@ fn write_quality_chart(html: &mut String, stats: &DetailedReadStats, title: &str
         if i > 0 {
             html.push(',');
         }
-        html.push_str(&format!("{val:.2}"));
+        let _ = write!(html, "{val:.2}");
     }
     html.push_str("],\n  name: 'G',\n  type: 'scatter',\n  mode: 'lines',\n");
     html.push_str("  line: {color: '#80b1d3', width: 1},\n  opacity: 0.6\n");
@@ -724,7 +734,7 @@ fn write_quality_chart(html: &mut String, stats: &DetailedReadStats, title: &str
     html.push_str("  paper_bgcolor: '#242424',\n");
     html.push_str("  plot_bgcolor: '#2a2a2a'\n");
     html.push_str("};\n");
-    html.push_str(&format!("Plotly.newPlot('{div_id}', data, layout);\n"));
+    let _ = writeln!(html, "Plotly.newPlot('{div_id}', data, layout);");
     html.push_str("</script>\n");
 }
 
@@ -821,16 +831,6 @@ fn add_row(html: &mut String, label: &str, value: &str) {
     html.push_str(label);
     html.push_str("</td><td class='value'>");
     html.push_str(value);
-    html.push_str("</td></tr>\n");
-}
-
-fn add_row_3col(html: &mut String, label: &str, before: &str, after: &str) {
-    html.push_str("<tr><td class='col1'>");
-    html.push_str(label);
-    html.push_str("</td><td class='value'>");
-    html.push_str(before);
-    html.push_str("</td><td class='value'>");
-    html.push_str(after);
     html.push_str("</td></tr>\n");
 }
 

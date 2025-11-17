@@ -1,5 +1,3 @@
-use assert_cmd::cargo::cargo_bin;
-use predicates::prelude::*;
 use serde_json::Value;
 use std::fs;
 use std::path::PathBuf;
@@ -40,7 +38,7 @@ fn run_fasterp(input: &str, temp_dir: &TempDir) -> (PathBuf, PathBuf) {
     let output_fq = temp_dir.path().join("fasterp_output.fq");
     let output_json = temp_dir.path().join("fasterp_output.json");
 
-    let status = Command::new(cargo_bin("fasterp"))
+    let status = Command::new(assert_cmd::cargo::cargo_bin!("fasterp"))
         .arg("-i")
         .arg(test_data_path(input))
         .arg("-o")
@@ -152,7 +150,7 @@ fn run_fasterp_pe(input1: &str, input2: &str, temp_dir: &TempDir) -> (PathBuf, P
     let output2 = temp_dir.path().join("fasterp_R2.fq");
     let output_json = temp_dir.path().join("fasterp_pe.json");
 
-    let status = Command::new(cargo_bin("fasterp"))
+    let status = Command::new(assert_cmd::cargo::cargo_bin!("fasterp"))
         .arg("-i")
         .arg(test_data_path(input1))
         .arg("-I")
@@ -204,7 +202,7 @@ fn test_basic_filtering_matches_fastp() {
     assert!(status.success());
 
     // Run fasterp
-    let status = Command::new(cargo_bin("fasterp"))
+    let status = Command::new(assert_cmd::cargo::cargo_bin!("fasterp"))
         .arg("-i")
         .arg(&input_path)
         .arg("-o")
@@ -290,7 +288,7 @@ fn test_length_filtering_matches_fastp() {
     assert!(status.success());
 
     // Run fasterp with length filter
-    let status = Command::new(cargo_bin("fasterp"))
+    let status = Command::new(assert_cmd::cargo::cargo_bin!("fasterp"))
         .arg("-i")
         .arg(test_data_path("small_1k.fq"))
         .arg("-o")
@@ -342,7 +340,7 @@ fn test_quality_filtering_matches_fastp() {
     assert!(status.success());
 
     // Run fasterp with quality filter
-    let status = Command::new(cargo_bin("fasterp"))
+    let status = Command::new(assert_cmd::cargo::cargo_bin!("fasterp"))
         .arg("-i")
         .arg(test_data_path("small_1k.fq"))
         .arg("-o")
@@ -371,7 +369,7 @@ fn test_quality_filtering_matches_fastp() {
 
 #[test]
 fn test_cli_help_works() {
-    let output = Command::new(cargo_bin("fasterp"))
+    let output = Command::new(assert_cmd::cargo::cargo_bin!("fasterp"))
         .arg("--help")
         .output()
         .expect("Failed to run fasterp");
@@ -383,7 +381,7 @@ fn test_cli_help_works() {
 
 #[test]
 fn test_cli_version_works() {
-    let output = Command::new(cargo_bin("fasterp"))
+    let output = Command::new(assert_cmd::cargo::cargo_bin!("fasterp"))
         .arg("--version")
         .output()
         .expect("Failed to run fasterp");
@@ -395,7 +393,7 @@ fn test_cli_version_works() {
 
 #[test]
 fn test_cli_missing_input_fails() {
-    let output = Command::new(cargo_bin("fasterp"))
+    let output = Command::new(assert_cmd::cargo::cargo_bin!("fasterp"))
         .arg("-o")
         .arg("out.fq")
         .output()
@@ -428,7 +426,7 @@ fn test_gzip_input_decompression() {
     assert!(status.success());
 
     // Run fasterp on gzipped input (single-threaded mode required for gzip input)
-    let status = Command::new(cargo_bin("fasterp"))
+    let status = Command::new(assert_cmd::cargo::cargo_bin!("fasterp"))
         .arg("-i")
         .arg(&input_gz)
         .arg("-o")
@@ -478,7 +476,7 @@ fn test_gzip_output_compression() {
     let output_json = temp_dir.path().join("output.json");
 
     // Run fasterp with gzip output
-    let status = Command::new(cargo_bin("fasterp"))
+    let status = Command::new(assert_cmd::cargo::cargo_bin!("fasterp"))
         .arg("-i")
         .arg(&input_fq)
         .arg("-o")
@@ -508,7 +506,7 @@ fn test_gzip_output_compression() {
     let uncompressed_fq = temp_dir.path().join("uncompressed.fq");
     let uncompressed_json = temp_dir.path().join("uncompressed.json");
 
-    let status = Command::new(cargo_bin("fasterp"))
+    let status = Command::new(assert_cmd::cargo::cargo_bin!("fasterp"))
         .arg("-i")
         .arg(&input_fq)
         .arg("-o")
@@ -541,7 +539,7 @@ fn test_gzip_compression_levels() {
         let output_gz = temp_dir.path().join(format!("output_level_{level}.fq.gz"));
         let output_json = temp_dir.path().join(format!("output_level_{level}.json"));
 
-        let status = Command::new(cargo_bin("fasterp"))
+        let status = Command::new(assert_cmd::cargo::cargo_bin!("fasterp"))
             .arg("-i")
             .arg(&input_fq)
             .arg("-o")
@@ -614,7 +612,7 @@ fn test_n_base_filtering_matches_fastp() {
         assert!(status.success());
 
         // Run fasterp
-        let status = Command::new(cargo_bin("fasterp"))
+        let status = Command::new(assert_cmd::cargo::cargo_bin!("fasterp"))
             .arg("-i")
             .arg(&input_fq)
             .arg("-o")
@@ -658,7 +656,7 @@ fn test_multithreading_consistency() {
         let output_fq = temp_dir.path().join(format!("output_t{threads}.fq"));
         let output_json = temp_dir.path().join(format!("output_t{threads}.json"));
 
-        let status = Command::new(cargo_bin("fasterp"))
+        let status = Command::new(assert_cmd::cargo::cargo_bin!("fasterp"))
             .arg("-i")
             .arg(&input_fq)
             .arg("-o")
@@ -698,7 +696,7 @@ fn test_multithreading_json_consistency() {
     let output_4t_json = temp_dir.path().join("output_4t.json");
 
     // 1 thread
-    let status = Command::new(cargo_bin("fasterp"))
+    let status = Command::new(assert_cmd::cargo::cargo_bin!("fasterp"))
         .arg("-i")
         .arg(&input_fq)
         .arg("-o")
@@ -714,7 +712,7 @@ fn test_multithreading_json_consistency() {
     assert!(status.success());
 
     // 4 threads
-    let status = Command::new(cargo_bin("fasterp"))
+    let status = Command::new(assert_cmd::cargo::cargo_bin!("fasterp"))
         .arg("-i")
         .arg(&input_fq)
         .arg("-o")
@@ -745,7 +743,7 @@ fn test_multithreading_large_dataset() {
     let output_8t_json = temp_dir.path().join("output_8t.json");
 
     // 1 thread
-    let status = Command::new(cargo_bin("fasterp"))
+    let status = Command::new(assert_cmd::cargo::cargo_bin!("fasterp"))
         .arg("-i")
         .arg(&input_fq)
         .arg("-o")
@@ -761,7 +759,7 @@ fn test_multithreading_large_dataset() {
     assert!(status.success());
 
     // 8 threads
-    let status = Command::new(cargo_bin("fasterp"))
+    let status = Command::new(assert_cmd::cargo::cargo_bin!("fasterp"))
         .arg("-i")
         .arg(&input_fq)
         .arg("-o")
@@ -800,7 +798,7 @@ fn test_stdin_input() {
 
     // Run fasterp with stdin (single-threaded mode required for stdin)
     let input_file = std::fs::File::open(&input_fq).unwrap();
-    let status = Command::new(cargo_bin("fasterp"))
+    let status = Command::new(assert_cmd::cargo::cargo_bin!("fasterp"))
         .arg("-i")
         .arg("-")
         .arg("-o")
@@ -820,7 +818,7 @@ fn test_stdin_input() {
     let expected_fq = temp_dir.path().join("expected.fq");
     let expected_json = temp_dir.path().join("expected.json");
 
-    let status = Command::new(cargo_bin("fasterp"))
+    let status = Command::new(assert_cmd::cargo::cargo_bin!("fasterp"))
         .arg("-i")
         .arg(&input_fq)
         .arg("-o")
@@ -849,7 +847,7 @@ fn test_stdin_stdout_pipeline() {
 
     // Run fasterp with stdin and stdout (single-threaded mode required)
     let input_file = std::fs::File::open(&input_fq).unwrap();
-    let output = Command::new(cargo_bin("fasterp"))
+    let output = Command::new(assert_cmd::cargo::cargo_bin!("fasterp"))
         .arg("-i")
         .arg("-")
         .arg("-o")
@@ -903,7 +901,7 @@ fn test_combined_filters_matches_fastp() {
     assert!(status.success());
 
     // Run fasterp with same filters
-    let status = Command::new(cargo_bin("fasterp"))
+    let status = Command::new(assert_cmd::cargo::cargo_bin!("fasterp"))
         .arg("-i")
         .arg(&input_fq)
         .arg("-o")
@@ -963,7 +961,7 @@ fn test_strict_combined_filters() {
         .expect("Failed to run fastp");
     assert!(status.success());
 
-    let status = Command::new(cargo_bin("fasterp"))
+    let status = Command::new(assert_cmd::cargo::cargo_bin!("fasterp"))
         .arg("-i")
         .arg(&input_fq)
         .arg("-o")
@@ -1024,7 +1022,7 @@ fn test_unqualified_percent_boundary_40_percent() {
     fs::write(&input_fq, record).unwrap();
 
     // Run with -q 9 (default -u 40)
-    let status = Command::new(cargo_bin("fasterp"))
+    let status = Command::new(assert_cmd::cargo::cargo_bin!("fasterp"))
         .arg("-i")
         .arg(&input_fq)
         .arg("-o")
@@ -1085,7 +1083,7 @@ fn test_unqualified_percent_exact_40_percent() {
     fs::write(&input_fq, record).unwrap();
 
     // Run with -q 9 -u 40
-    let status = Command::new(cargo_bin("fasterp"))
+    let status = Command::new(assert_cmd::cargo::cargo_bin!("fasterp"))
         .arg("-i")
         .arg(&input_fq)
         .arg("-o")
@@ -1141,7 +1139,7 @@ fn test_average_quality_filter() {
     fs::write(&input_fq, input_data).unwrap();
 
     // Run with -e 18 (require mean quality >= 18)
-    let status = Command::new(cargo_bin("fasterp"))
+    let status = Command::new(assert_cmd::cargo::cargo_bin!("fasterp"))
         .arg("-i")
         .arg(&input_fq)
         .arg("-o")
@@ -1198,7 +1196,7 @@ fn test_max_length_trimming() {
     fs::write(&input_fq, record).unwrap();
 
     // Run with -b 100 (trim to max 100bp)
-    let status = Command::new(cargo_bin("fasterp"))
+    let status = Command::new(assert_cmd::cargo::cargo_bin!("fasterp"))
         .arg("-i")
         .arg(&input_fq)
         .arg("-o")
@@ -1263,7 +1261,7 @@ fn test_combined_q_u_and_e_filters() {
     fs::write(&input_fq, input_data).unwrap();
 
     // Run with -q 9 -u 40 AND -e 15
-    let status = Command::new(cargo_bin("fasterp"))
+    let status = Command::new(assert_cmd::cargo::cargo_bin!("fasterp"))
         .arg("-i")
         .arg(&input_fq)
         .arg("-o")
@@ -1327,7 +1325,7 @@ fn test_n_base_limit_exact_boundary() {
     fs::write(&input_fq, input_data).unwrap();
 
     // Run with -n 5 (allow up to 5 Ns)
-    let status = Command::new(cargo_bin("fasterp"))
+    let status = Command::new(assert_cmd::cargo::cargo_bin!("fasterp"))
         .arg("-i")
         .arg(&input_fq)
         .arg("-o")
@@ -1383,7 +1381,7 @@ fn test_length_filter_after_trimming() {
 
     // Trim 10bp from front, 40bp from tail (leaves 50bp)
     // Then require min length of 60bp
-    let status = Command::new(cargo_bin("fasterp"))
+    let status = Command::new(assert_cmd::cargo::cargo_bin!("fasterp"))
         .arg("-i")
         .arg(&input_fq)
         .arg("-o")
@@ -1434,7 +1432,7 @@ fn test_empty_output_all_filtered() {
     fs::write(&input_fq, input_data).unwrap();
 
     // Use extreme filter that should filter everything
-    let status = Command::new(cargo_bin("fasterp"))
+    let status = Command::new(assert_cmd::cargo::cargo_bin!("fasterp"))
         .arg("-i")
         .arg(&input_fq)
         .arg("-o")
@@ -1485,7 +1483,7 @@ fn test_invalid_quality_threshold() {
     let output_json = temp_dir.path().join("output.json");
 
     // Quality threshold of 0 should be treated as disabled
-    let status = Command::new(cargo_bin("fasterp"))
+    let status = Command::new(assert_cmd::cargo::cargo_bin!("fasterp"))
         .arg("-i")
         .arg(&input_fq)
         .arg("-o")
@@ -1531,7 +1529,7 @@ fn test_xlarge_dataset_500k() {
     let output_json = temp_dir.path().join("output.json");
 
     // Just verify it completes successfully
-    let status = Command::new(cargo_bin("fasterp"))
+    let status = Command::new(assert_cmd::cargo::cargo_bin!("fasterp"))
         .arg("-i")
         .arg(&input_fq)
         .arg("-o")
@@ -1566,7 +1564,7 @@ fn test_different_batch_sizes_consistent() {
         let output_fq = temp_dir.path().join(format!("output_batch_{i}.fq"));
         let output_json = temp_dir.path().join(format!("output_batch_{i}.json"));
 
-        let status = Command::new(cargo_bin("fasterp"))
+        let status = Command::new(assert_cmd::cargo::cargo_bin!("fasterp"))
             .arg("-i")
             .arg(&input_fq)
             .arg("-o")
@@ -1606,7 +1604,7 @@ fn test_json_report_structure() {
     let output_fq = temp_dir.path().join("output.fq");
     let output_json = temp_dir.path().join("output.json");
 
-    let status = Command::new(cargo_bin("fasterp"))
+    let status = Command::new(assert_cmd::cargo::cargo_bin!("fasterp"))
         .arg("-i")
         .arg(&input_fq)
         .arg("-o")
@@ -1664,7 +1662,7 @@ fn test_output_order_preserved_multithreading() {
     let output_mt = temp_dir.path().join("output_mt.fq");
 
     // Single-threaded
-    let status = Command::new(cargo_bin("fasterp"))
+    let status = Command::new(assert_cmd::cargo::cargo_bin!("fasterp"))
         .arg("-i")
         .arg(&input_fq)
         .arg("-o")
@@ -1680,7 +1678,7 @@ fn test_output_order_preserved_multithreading() {
     assert!(status.success());
 
     // Multi-threaded
-    let status = Command::new(cargo_bin("fasterp"))
+    let status = Command::new(assert_cmd::cargo::cargo_bin!("fasterp"))
         .arg("-i")
         .arg(&input_fq)
         .arg("-o")
@@ -1737,7 +1735,7 @@ fn test_sliding_window_tail_trimming_matches_fastp() {
     assert!(status.success());
 
     // Run fasterp with same settings
-    let status = Command::new(cargo_bin("fasterp"))
+    let status = Command::new(assert_cmd::cargo::cargo_bin!("fasterp"))
         .arg("-i")
         .arg(&input_path)
         .arg("-o")
@@ -1787,7 +1785,7 @@ fn test_sliding_window_front_trimming_matches_fastp() {
     assert!(status.success());
 
     // Run fasterp with same settings
-    let status = Command::new(cargo_bin("fasterp"))
+    let status = Command::new(assert_cmd::cargo::cargo_bin!("fasterp"))
         .arg("-i")
         .arg(&input_path)
         .arg("-o")
@@ -1837,7 +1835,7 @@ fn test_sliding_window_both_ends_matches_fastp() {
     assert!(status.success());
 
     // Run fasterp with same settings
-    let status = Command::new(cargo_bin("fasterp"))
+    let status = Command::new(assert_cmd::cargo::cargo_bin!("fasterp"))
         .arg("-i")
         .arg(&input_path)
         .arg("-o")
@@ -1886,7 +1884,7 @@ fn test_fixed_front_trimming_matches_fastp() {
     assert!(status.success());
 
     // Run fasterp with same settings
-    let status = Command::new(cargo_bin("fasterp"))
+    let status = Command::new(assert_cmd::cargo::cargo_bin!("fasterp"))
         .arg("-i")
         .arg(&input_path)
         .arg("-o")
@@ -1931,7 +1929,7 @@ fn test_fixed_tail_trimming_matches_fastp() {
     assert!(status.success());
 
     // Run fasterp with same settings
-    let status = Command::new(cargo_bin("fasterp"))
+    let status = Command::new(assert_cmd::cargo::cargo_bin!("fasterp"))
         .arg("-i")
         .arg(&input_path)
         .arg("-o")
@@ -1978,7 +1976,7 @@ fn test_fixed_both_ends_trimming_matches_fastp() {
     assert!(status.success());
 
     // Run fasterp with same settings
-    let status = Command::new(cargo_bin("fasterp"))
+    let status = Command::new(assert_cmd::cargo::cargo_bin!("fasterp"))
         .arg("-i")
         .arg(&input_path)
         .arg("-o")
@@ -2026,7 +2024,7 @@ fn test_poly_g_trimming_matches_fastp() {
     assert!(status.success());
 
     // Run fasterp with same settings
-    let status = Command::new(cargo_bin("fasterp"))
+    let status = Command::new(assert_cmd::cargo::cargo_bin!("fasterp"))
         .arg("-i")
         .arg(&input_path)
         .arg("-o")
@@ -2073,7 +2071,7 @@ fn test_poly_x_trimming_matches_fastp() {
     assert!(status.success());
 
     // Run fasterp with same settings
-    let status = Command::new(cargo_bin("fasterp"))
+    let status = Command::new(assert_cmd::cargo::cargo_bin!("fasterp"))
         .arg("-i")
         .arg(&input_path)
         .arg("-o")
@@ -2127,7 +2125,7 @@ fn test_combined_trimming_and_filtering_matches_fastp() {
     assert!(status.success());
 
     // Run fasterp with same settings
-    let status = Command::new(cargo_bin("fasterp"))
+    let status = Command::new(assert_cmd::cargo::cargo_bin!("fasterp"))
         .arg("-i")
         .arg(&input_path)
         .arg("-o")
@@ -2181,7 +2179,7 @@ fn test_disable_tail_trimming_matches_fastp() {
     assert!(status.success());
 
     // Run fasterp with same settings
-    let status = Command::new(cargo_bin("fasterp"))
+    let status = Command::new(assert_cmd::cargo::cargo_bin!("fasterp"))
         .arg("-i")
         .arg(&input_path)
         .arg("-o")
@@ -2237,7 +2235,7 @@ fn test_aggressive_trimming_matches_fastp() {
     assert!(status.success());
 
     // Run fasterp with same settings
-    let status = Command::new(cargo_bin("fasterp"))
+    let status = Command::new(assert_cmd::cargo::cargo_bin!("fasterp"))
         .arg("-i")
         .arg(&input_path)
         .arg("-o")
@@ -2277,7 +2275,7 @@ fn test_trimming_with_multithreading_consistency() {
     let json_mt = temp_dir.path().join("output_mt.json");
 
     // Single-threaded with trimming
-    let status = Command::new(cargo_bin("fasterp"))
+    let status = Command::new(assert_cmd::cargo::cargo_bin!("fasterp"))
         .arg("-i")
         .arg(&input_path)
         .arg("-o")
@@ -2299,7 +2297,7 @@ fn test_trimming_with_multithreading_consistency() {
     assert!(status.success());
 
     // Multi-threaded with trimming
-    let status = Command::new(cargo_bin("fasterp"))
+    let status = Command::new(assert_cmd::cargo::cargo_bin!("fasterp"))
         .arg("-i")
         .arg(&input_path)
         .arg("-o")
@@ -2391,7 +2389,7 @@ fn test_paired_end_quality_filtering() {
     assert!(status.success());
 
     // Run fasterp with same parameters
-    let status = Command::new(cargo_bin("fasterp"))
+    let status = Command::new(assert_cmd::cargo::cargo_bin!("fasterp"))
         .arg("-i")
         .arg(test_data_path("pe_medium_R1.fq"))
         .arg("-I")
@@ -2465,7 +2463,7 @@ fn test_paired_end_length_filtering() {
     assert!(status.success());
 
     // Run fasterp with same parameters
-    let status = Command::new(cargo_bin("fasterp"))
+    let status = Command::new(assert_cmd::cargo::cargo_bin!("fasterp"))
         .arg("-i")
         .arg(test_data_path("pe_small_R1.fq"))
         .arg("-I")
@@ -2541,7 +2539,7 @@ fn test_paired_end_combined_filters() {
     assert!(status.success());
 
     // Run fasterp with same parameters
-    let status = Command::new(cargo_bin("fasterp"))
+    let status = Command::new(assert_cmd::cargo::cargo_bin!("fasterp"))
         .arg("-i")
         .arg(test_data_path("pe_medium_R1.fq"))
         .arg("-I")
@@ -2614,7 +2612,7 @@ fn test_adapter_trimming_single_end_custom_adapter() {
     assert!(status.success());
 
     // Run fasterp with same adapter
-    let status = Command::new(cargo_bin("fasterp"))
+    let status = Command::new(assert_cmd::cargo::cargo_bin!("fasterp"))
         .arg("-i")
         .arg(test_data_path("R1.fq"))
         .arg("-o")
@@ -2661,7 +2659,7 @@ fn test_disable_adapter_trimming() {
     assert!(status.success());
 
     // Run fasterp with adapter trimming disabled
-    let status = Command::new(cargo_bin("fasterp"))
+    let status = Command::new(assert_cmd::cargo::cargo_bin!("fasterp"))
         .arg("-i")
         .arg(test_data_path("R1.fq"))
         .arg("-o")
@@ -2714,7 +2712,7 @@ fn test_adapter_trimming_with_quality_filter() {
     assert!(status.success());
 
     // Run fasterp with same parameters
-    let status = Command::new(cargo_bin("fasterp"))
+    let status = Command::new(assert_cmd::cargo::cargo_bin!("fasterp"))
         .arg("-i")
         .arg(test_data_path("small_1k.fq"))
         .arg("-o")
@@ -2769,7 +2767,7 @@ fn test_adapter_5base_perfect_match() {
     assert!(status.success());
 
     // Run fasterp
-    let status = Command::new(cargo_bin("fasterp"))
+    let status = Command::new(assert_cmd::cargo::cargo_bin!("fasterp"))
         .arg("-i")
         .arg(&test_input)
         .arg("-o")
@@ -2820,7 +2818,7 @@ fn test_adapter_8base_with_mismatch() {
         .expect("Failed to run fastp");
 
     // Run fasterp
-    Command::new(cargo_bin("fasterp"))
+    Command::new(assert_cmd::cargo::cargo_bin!("fasterp"))
         .arg("-i")
         .arg(&test_input)
         .arg("-o")
@@ -2870,7 +2868,7 @@ fn test_adapter_5base_with_mismatch_not_trimmed() {
         .expect("Failed to run fastp");
 
     // Run fasterp
-    Command::new(cargo_bin("fasterp"))
+    Command::new(assert_cmd::cargo::cargo_bin!("fasterp"))
         .arg("-i")
         .arg(&test_input)
         .arg("-o")
@@ -2929,7 +2927,7 @@ fn test_paired_end_asymmetric_tail_trimming() {
     assert!(status.success());
 
     // Run fasterp with same parameters
-    let status = Command::new(cargo_bin("fasterp"))
+    let status = Command::new(assert_cmd::cargo::cargo_bin!("fasterp"))
         .arg("-i")
         .arg(test_data_path("pe_small_R1.fq"))
         .arg("-I")
@@ -3004,7 +3002,7 @@ fn test_adapter_at_exact_minimum_length() {
         .expect("Failed to run fastp");
 
     // Run fasterp
-    Command::new(cargo_bin("fasterp"))
+    Command::new(assert_cmd::cargo::cargo_bin!("fasterp"))
         .arg("-i")
         .arg(&test_input)
         .arg("-o")
@@ -3064,7 +3062,7 @@ fn test_adapter_below_minimum_length() {
         .expect("Failed to run fastp");
 
     // Run fasterp
-    Command::new(cargo_bin("fasterp"))
+    Command::new(assert_cmd::cargo::cargo_bin!("fasterp"))
         .arg("-i")
         .arg(&test_input)
         .arg("-o")
@@ -3125,7 +3123,7 @@ fn test_extreme_quality_filter_with_adapters() {
         .expect("Failed to run fastp");
     assert!(status.success());
 
-    let status = Command::new(cargo_bin("fasterp"))
+    let status = Command::new(assert_cmd::cargo::cargo_bin!("fasterp"))
         .arg("-i")
         .arg(test_data_path("pe_small_R1.fq"))
         .arg("-o")
@@ -3194,7 +3192,7 @@ fn test_extreme_quality_filter_with_adapters_med() {
         .expect("Failed to run fastp");
     assert!(status.success());
 
-    let status = Command::new(cargo_bin("fasterp"))
+    let status = Command::new(assert_cmd::cargo::cargo_bin!("fasterp"))
         .arg("-i")
         .arg(test_data_path("pe_medium_R1.fq"))
         .arg("-o")
@@ -3307,7 +3305,7 @@ AGCTGCATCGCTTTAGTATCTAGCGAAGCGTTAGGCGACCGCTGCCCTAGTTGACTAGACTGCTGTCCGGAATTTTGAGA
     assert!(status.success());
 
     // Run fasterp
-    let status = Command::new(cargo_bin("fasterp"))
+    let status = Command::new(assert_cmd::cargo::cargo_bin!("fasterp"))
         .arg("-i")
         .arg(&test_r1)
         .arg("-I")
@@ -3394,7 +3392,7 @@ fn test_low_complexity_filter_basic() {
         .expect("Failed to run fastp");
 
     // Run fasterp with same parameters
-    Command::new(cargo_bin("fasterp"))
+    Command::new(assert_cmd::cargo::cargo_bin!("fasterp"))
         .arg("-i")
         .arg(&test_input)
         .arg("-o")
@@ -3447,7 +3445,7 @@ fn test_low_complexity_with_quality_filter() {
     assert!(status.success());
 
     // Run fasterp with same parameters
-    let status = Command::new(cargo_bin("fasterp"))
+    let status = Command::new(assert_cmd::cargo::cargo_bin!("fasterp"))
         .arg("-i")
         .arg(test_data_path("pe_medium_R1.fq"))
         .arg("-o")
@@ -3511,7 +3509,7 @@ fn test_low_complexity_paired_end() {
     assert!(status.success());
 
     // Run fasterp with same parameters
-    let status = Command::new(cargo_bin("fasterp"))
+    let status = Command::new(assert_cmd::cargo::cargo_bin!("fasterp"))
         .arg("-i")
         .arg(test_data_path("pe_small_R1.fq"))
         .arg("-I")
@@ -3565,7 +3563,7 @@ fn test_multithreaded_pe_basic() {
     let multi_json = "/tmp/test_mt_pe_basic_multi.json";
 
     // Run single-threaded
-    let status = Command::new(cargo_bin("fasterp"))
+    let status = Command::new(assert_cmd::cargo::cargo_bin!("fasterp"))
         .arg("-i")
         .arg(test_data_path("pe_medium_R1.fq"))
         .arg("-I")
@@ -3585,7 +3583,7 @@ fn test_multithreaded_pe_basic() {
     assert!(status.success());
 
     // Run multi-threaded
-    let status = Command::new(cargo_bin("fasterp"))
+    let status = Command::new(assert_cmd::cargo::cargo_bin!("fasterp"))
         .arg("-i")
         .arg(test_data_path("pe_medium_R1.fq"))
         .arg("-I")
@@ -3632,7 +3630,7 @@ fn test_multithreaded_pe_with_quality_filter() {
     let multi_json = "/tmp/test_mt_pe_qual_multi.json";
 
     // Run single-threaded
-    let status = Command::new(cargo_bin("fasterp"))
+    let status = Command::new(assert_cmd::cargo::cargo_bin!("fasterp"))
         .arg("-i")
         .arg(test_data_path("pe_medium_R1.fq"))
         .arg("-I")
@@ -3656,7 +3654,7 @@ fn test_multithreaded_pe_with_quality_filter() {
     assert!(status.success());
 
     // Run multi-threaded
-    let status = Command::new(cargo_bin("fasterp"))
+    let status = Command::new(assert_cmd::cargo::cargo_bin!("fasterp"))
         .arg("-i")
         .arg(test_data_path("pe_medium_R1.fq"))
         .arg("-I")
@@ -3707,7 +3705,7 @@ fn test_multithreaded_pe_with_adapters() {
     let multi_json = "/tmp/test_mt_pe_adapter_multi.json";
 
     // Run single-threaded
-    let status = Command::new(cargo_bin("fasterp"))
+    let status = Command::new(assert_cmd::cargo::cargo_bin!("fasterp"))
         .arg("-i")
         .arg(test_data_path("pe_medium_R1.fq"))
         .arg("-I")
@@ -3731,7 +3729,7 @@ fn test_multithreaded_pe_with_adapters() {
     assert!(status.success());
 
     // Run multi-threaded
-    let status = Command::new(cargo_bin("fasterp"))
+    let status = Command::new(assert_cmd::cargo::cargo_bin!("fasterp"))
         .arg("-i")
         .arg(test_data_path("pe_medium_R1.fq"))
         .arg("-I")
@@ -3782,7 +3780,7 @@ fn test_multithreaded_pe_with_trimming() {
     let multi_json = "/tmp/test_mt_pe_trim_multi.json";
 
     // Run single-threaded
-    let status = Command::new(cargo_bin("fasterp"))
+    let status = Command::new(assert_cmd::cargo::cargo_bin!("fasterp"))
         .arg("-i")
         .arg(test_data_path("pe_medium_R1.fq"))
         .arg("-I")
@@ -3810,7 +3808,7 @@ fn test_multithreaded_pe_with_trimming() {
     assert!(status.success());
 
     // Run multi-threaded
-    let status = Command::new(cargo_bin("fasterp"))
+    let status = Command::new(assert_cmd::cargo::cargo_bin!("fasterp"))
         .arg("-i")
         .arg(test_data_path("pe_medium_R1.fq"))
         .arg("-I")
@@ -3865,7 +3863,7 @@ fn test_multithreaded_pe_all_features() {
     let multi_json = "/tmp/test_mt_pe_all_multi.json";
 
     // Run single-threaded with all features
-    let status = Command::new(cargo_bin("fasterp"))
+    let status = Command::new(assert_cmd::cargo::cargo_bin!("fasterp"))
         .arg("-i")
         .arg(test_data_path("pe_medium_R1.fq"))
         .arg("-I")
@@ -3908,7 +3906,7 @@ fn test_multithreaded_pe_all_features() {
     assert!(status.success());
 
     // Run multi-threaded with all features
-    let status = Command::new(cargo_bin("fasterp"))
+    let status = Command::new(assert_cmd::cargo::cargo_bin!("fasterp"))
         .arg("-i")
         .arg(test_data_path("pe_medium_R1.fq"))
         .arg("-I")
@@ -3978,7 +3976,7 @@ fn test_multithreaded_pe_low_complexity() {
     let multi_json = "/tmp/test_mt_pe_complexity_multi.json";
 
     // Run single-threaded
-    let status = Command::new(cargo_bin("fasterp"))
+    let status = Command::new(assert_cmd::cargo::cargo_bin!("fasterp"))
         .arg("-i")
         .arg(test_data_path("pe_medium_R1.fq"))
         .arg("-I")
@@ -4001,7 +3999,7 @@ fn test_multithreaded_pe_low_complexity() {
     assert!(status.success());
 
     // Run multi-threaded
-    let status = Command::new(cargo_bin("fasterp"))
+    let status = Command::new(assert_cmd::cargo::cargo_bin!("fasterp"))
         .arg("-i")
         .arg(test_data_path("pe_medium_R1.fq"))
         .arg("-I")
@@ -4054,7 +4052,7 @@ fn test_base_correction_basic_functionality() {
     let output_json = temp_dir.path().join("corrected.json");
 
     // Run fasterp with base correction enabled
-    let status = Command::new(cargo_bin("fasterp"))
+    let status = Command::new(assert_cmd::cargo::cargo_bin!("fasterp"))
         .arg("-i")
         .arg(test_data_path("merge_test_R1.fq"))
         .arg("-I")
@@ -4120,7 +4118,7 @@ fn test_base_correction_matches_fastp() {
     assert!(status.success(), "fastp with correction failed");
 
     // Run fasterp with correction
-    let status = Command::new(cargo_bin("fasterp"))
+    let status = Command::new(assert_cmd::cargo::cargo_bin!("fasterp"))
         .arg("-i")
         .arg(test_data_path("pe_small_R1.fq"))
         .arg("-I")
@@ -4173,7 +4171,7 @@ fn test_base_correction_multithreaded() {
     let multi_json = temp_dir.path().join("multi.json");
 
     // Run single-threaded with correction
-    let status = Command::new(cargo_bin("fasterp"))
+    let status = Command::new(assert_cmd::cargo::cargo_bin!("fasterp"))
         .arg("-i")
         .arg(test_data_path("pe_medium_R1.fq"))
         .arg("-I")
@@ -4194,7 +4192,7 @@ fn test_base_correction_multithreaded() {
     assert!(status.success());
 
     // Run multi-threaded with correction
-    let status = Command::new(cargo_bin("fasterp"))
+    let status = Command::new(assert_cmd::cargo::cargo_bin!("fasterp"))
         .arg("-i")
         .arg(test_data_path("pe_medium_R1.fq"))
         .arg("-I")
@@ -4241,7 +4239,7 @@ fn test_base_correction_custom_parameters() {
     let output_json = temp_dir.path().join("custom.json");
 
     // Run with custom overlap parameters
-    let status = Command::new(cargo_bin("fasterp"))
+    let status = Command::new(assert_cmd::cargo::cargo_bin!("fasterp"))
         .arg("-i")
         .arg(test_data_path("pe_small_R1.fq"))
         .arg("-I")
@@ -4309,7 +4307,7 @@ fn test_base_correction_with_filtering() {
     assert!(status.success());
 
     // Run fasterp with correction + filtering
-    let status = Command::new(cargo_bin("fasterp"))
+    let status = Command::new(assert_cmd::cargo::cargo_bin!("fasterp"))
         .arg("-i")
         .arg(test_data_path("pe_medium_R1.fq"))
         .arg("-I")
@@ -4361,7 +4359,7 @@ fn test_base_correction_disabled_by_default() {
     let without_c_r2 = temp_dir.path().join("without_c_R2.fq");
 
     // Run WITH -c flag
-    let status = Command::new(cargo_bin("fasterp"))
+    let status = Command::new(assert_cmd::cargo::cargo_bin!("fasterp"))
         .arg("-i")
         .arg(test_data_path("merge_test_R1.fq"))
         .arg("-I")
@@ -4380,7 +4378,7 @@ fn test_base_correction_disabled_by_default() {
     assert!(status.success());
 
     // Run WITHOUT -c flag
-    let status = Command::new(cargo_bin("fasterp"))
+    let status = Command::new(assert_cmd::cargo::cargo_bin!("fasterp"))
         .arg("-i")
         .arg(test_data_path("merge_test_R1.fq"))
         .arg("-I")
@@ -4429,7 +4427,7 @@ fn test_umi_extraction_read1_paired_end() {
     fs::write(&r2_input, r2_content).unwrap();
 
     // Run fasterp with UMI extraction
-    let status = Command::new(cargo_bin("fasterp"))
+    let status = Command::new(assert_cmd::cargo::cargo_bin!("fasterp"))
         .arg("-i")
         .arg(&r1_input)
         .arg("-I")
@@ -4512,7 +4510,7 @@ fn test_umi_extraction_read2_paired_end() {
     fs::write(&r2_input, r2_content).unwrap();
 
     // Run fasterp with UMI extraction from read2
-    let status = Command::new(cargo_bin("fasterp"))
+    let status = Command::new(assert_cmd::cargo::cargo_bin!("fasterp"))
         .arg("-i")
         .arg(&r1_input)
         .arg("-I")
@@ -4584,7 +4582,7 @@ fn test_umi_multithreaded_consistency() {
     fs::write(&r2_input, r2_content).unwrap();
 
     // Run with single thread
-    let status = Command::new(cargo_bin("fasterp"))
+    let status = Command::new(assert_cmd::cargo::cargo_bin!("fasterp"))
         .arg("-i")
         .arg(&r1_input)
         .arg("-I")
@@ -4608,7 +4606,7 @@ fn test_umi_multithreaded_consistency() {
     assert!(status.success());
 
     // Run with multiple threads
-    let status = Command::new(cargo_bin("fasterp"))
+    let status = Command::new(assert_cmd::cargo::cargo_bin!("fasterp"))
         .arg("-i")
         .arg(&r1_input)
         .arg("-I")
@@ -4670,7 +4668,7 @@ fn test_umi_with_trimming_and_filtering() {
     fs::write(&r2_input, r2_content).unwrap();
 
     // Run with UMI and poly-G trimming
-    let status = Command::new(cargo_bin("fasterp"))
+    let status = Command::new(assert_cmd::cargo::cargo_bin!("fasterp"))
         .arg("-i")
         .arg(&r1_input)
         .arg("-I")
@@ -4734,7 +4732,7 @@ fn test_dedup_paired_end_exact_duplicates() {
     fs::write(&r2_input, r2_content).unwrap();
 
     // Run fasterp with deduplication enabled
-    let status = Command::new(cargo_bin("fasterp"))
+    let status = Command::new(assert_cmd::cargo::cargo_bin!("fasterp"))
         .arg("-i")
         .arg(&r1_input)
         .arg("-I")
@@ -4808,7 +4806,7 @@ fn test_dedup_multithreaded_consistency() {
     fs::write(&r2_input, r2_content).unwrap();
 
     // Run with single thread
-    let status_single = Command::new(cargo_bin("fasterp"))
+    let status_single = Command::new(assert_cmd::cargo::cargo_bin!("fasterp"))
         .arg("-i")
         .arg(&r1_input)
         .arg("-I")
@@ -4829,7 +4827,7 @@ fn test_dedup_multithreaded_consistency() {
     assert!(status_single.success());
 
     // Run with multiple threads
-    let status_multi = Command::new(cargo_bin("fasterp"))
+    let status_multi = Command::new(assert_cmd::cargo::cargo_bin!("fasterp"))
         .arg("-i")
         .arg(&r1_input)
         .arg("-I")
@@ -4890,7 +4888,7 @@ fn test_split_by_lines_basic() {
     let output_base = temp_dir.path().join("output.fq");
 
     // Split by 1000 lines (250 records per file, minimum allowed)
-    let status = Command::new(cargo_bin("fasterp"))
+    let status = Command::new(assert_cmd::cargo::cargo_bin!("fasterp"))
         .arg("-i")
         .arg(&input_fq)
         .arg("-o")
@@ -4945,7 +4943,7 @@ fn test_split_by_lines_two_reads_per_file() {
     let output_base = temp_dir.path().join("output.fq");
 
     // Split by 2000 lines (500 records per file)
-    let status = Command::new(cargo_bin("fasterp"))
+    let status = Command::new(assert_cmd::cargo::cargo_bin!("fasterp"))
         .arg("-i")
         .arg(&input_fq)
         .arg("-o")
@@ -4989,7 +4987,7 @@ fn test_split_custom_prefix_digits() {
     let output_base = temp_dir.path().join("output.fq");
 
     // Split with 2-digit padding
-    let status = Command::new(cargo_bin("fasterp"))
+    let status = Command::new(assert_cmd::cargo::cargo_bin!("fasterp"))
         .arg("-i")
         .arg(&input_fq)
         .arg("-o")
@@ -5037,7 +5035,7 @@ fn test_split_no_padding() {
     let output_base = temp_dir.path().join("output.fq");
 
     // Split with no padding (0)
-    let status = Command::new(cargo_bin("fasterp"))
+    let status = Command::new(assert_cmd::cargo::cargo_bin!("fasterp"))
         .arg("-i")
         .arg(&input_fq)
         .arg("-o")
@@ -5087,7 +5085,7 @@ fn test_split_paired_end() {
     let r2_output = temp_dir.path().join("r2_out.fq");
 
     // Split paired-end by 1000 lines
-    let status = Command::new(cargo_bin("fasterp"))
+    let status = Command::new(assert_cmd::cargo::cargo_bin!("fasterp"))
         .arg("-i")
         .arg(&r1_input)
         .arg("-I")
@@ -5141,7 +5139,7 @@ fn test_split_multithreaded() {
     let output_base = temp_dir.path().join("output.fq");
 
     // Split by 1000 lines with multiple threads
-    let status = Command::new(cargo_bin("fasterp"))
+    let status = Command::new(assert_cmd::cargo::cargo_bin!("fasterp"))
         .arg("-i")
         .arg(&input_fq)
         .arg("-o")
@@ -5215,7 +5213,7 @@ fn test_minimal_adapter_detection() {
     assert!(output.status.success(), "Fastp failed");
 
     // Run fasterp with same parameters
-    let output = Command::new(cargo_bin("fasterp"))
+    let output = Command::new(assert_cmd::cargo::cargo_bin!("fasterp"))
         .arg("-i")
         .arg(&test_input)
         .arg("-o")
@@ -5340,7 +5338,7 @@ AAGGACGGGGCCTCCGACAGGAACTCCGCGCTTAGCCACGTGATCATTGCGAACCGATATGGATTTGGATTTGACGAACG
     assert!(status.success());
 
     // Run fasterp with same parameters
-    let status = Command::new(cargo_bin("fasterp"))
+    let status = Command::new(assert_cmd::cargo::cargo_bin!("fasterp"))
         .arg("-i")
         .arg(&test_r1)
         .arg("-I")
@@ -5451,7 +5449,7 @@ TGCAGGCACGGACGAACGTCTCACCGCCTGGCCATGAAAGCGGTAAATCGGACAAGGTTATCAGCTCTCATCGGCACTCT
     assert!(status.success());
 
     // Run fasterp
-    let status = Command::new(cargo_bin("fasterp"))
+    let status = Command::new(assert_cmd::cargo::cargo_bin!("fasterp"))
         .arg("-i")
         .arg(&test_r1)
         .arg("-I")
@@ -5556,7 +5554,7 @@ fn test_adapter_auto_detection_se() {
     let json_without_detection = temp_dir.path().join("without_detection.json");
 
     // Run fasterp WITH auto-detection (default behavior)
-    let status = Command::new(cargo_bin("fasterp"))
+    let status = Command::new(assert_cmd::cargo::cargo_bin!("fasterp"))
         .arg("-i")
         .arg(&test_input)
         .arg("-o")
@@ -5572,7 +5570,7 @@ fn test_adapter_auto_detection_se() {
     assert!(status.success());
 
     // Run fasterp WITHOUT auto-detection for comparison
-    let status = Command::new(cargo_bin("fasterp"))
+    let status = Command::new(assert_cmd::cargo::cargo_bin!("fasterp"))
         .arg("-i")
         .arg(&test_input)
         .arg("-o")
@@ -5684,7 +5682,7 @@ fn test_adapter_auto_detection_matches_fastp() {
     println!("Fastp stderr:\n{fastp_stderr}");
 
     // Run fasterp with auto-detection (default behavior)
-    let fasterp_output = Command::new(cargo_bin("fasterp"))
+    let fasterp_output = Command::new(assert_cmd::cargo::cargo_bin!("fasterp"))
         .arg("-i")
         .arg(&test_input)
         .arg("-o")
@@ -5825,7 +5823,7 @@ fn test_adapter_trimming_matches_fastp_base_count() {
 
     // Run fasterp
     let fasterp_output = temp_dir.path().join("fasterp_out.fq");
-    let fasterp_status = Command::new(cargo_bin("fasterp"))
+    let fasterp_status = Command::new(assert_cmd::cargo::cargo_bin!("fasterp"))
         .arg("-i")
         .arg(test_data_path("adapter_trim_test.fastq"))
         .arg("-o")
@@ -5892,7 +5890,7 @@ fn test_adapter_trimming_matches_fastp_base_count() {
 //     let output_json = temp_dir.path().join("output.json");
 
 //     // Run fasterp with stdout (single-threaded mode required for stdout)
-//     let output = Command::new(cargo_bin("fasterp"))
+//     let output = Command::new(assert_cmd::cargo::cargo_bin!("fasterp"))
 //         .arg("-i")
 //         .arg(&input_fq)
 //         .arg("-o")
@@ -5911,7 +5909,7 @@ fn test_adapter_trimming_matches_fastp_base_count() {
 //     let expected_fq = temp_dir.path().join("expected.fq");
 //     let expected_json = temp_dir.path().join("expected.json");
 
-//     let status = Command::new(cargo_bin("fasterp"))
+//     let status = Command::new(assert_cmd::cargo::cargo_bin!("fasterp"))
 //         .arg("-i")
 //         .arg(&input_fq)
 //         .arg("-o")
@@ -5972,7 +5970,7 @@ fn test_adapter_trimming_paired_end_custom_adapters() {
     assert!(status.success());
 
     // Run fasterp with same adapters
-    let status = Command::new(cargo_bin("fasterp"))
+    let status = Command::new(assert_cmd::cargo::cargo_bin!("fasterp"))
         .arg("-i")
         .arg(test_data_path("pe_small_R1.fq"))
         .arg("-I")
@@ -6059,7 +6057,7 @@ fn test_paired_end_with_trimming_and_adapters() {
     assert!(status.success());
 
     // Run fasterp with same parameters
-    let status = Command::new(cargo_bin("fasterp"))
+    let status = Command::new(assert_cmd::cargo::cargo_bin!("fasterp"))
         .arg("-i")
         .arg(test_data_path("pe_medium_R1.fq"))
         .arg("-I")
@@ -6143,7 +6141,7 @@ fn test_paired_end_asymmetric_front_trimming() {
     assert!(status.success());
 
     // Run fasterp with same parameters
-    let status = Command::new(cargo_bin("fasterp"))
+    let status = Command::new(assert_cmd::cargo::cargo_bin!("fasterp"))
         .arg("-i")
         .arg(test_data_path("pe_small_R1.fq"))
         .arg("-I")
@@ -6243,7 +6241,7 @@ fn test_paired_end_all_features_combined() {
         .expect("Failed to run fastp");
     assert!(status.success());
 
-    let status = Command::new(cargo_bin("fasterp"))
+    let status = Command::new(assert_cmd::cargo::cargo_bin!("fasterp"))
         .arg("-i")
         .arg(test_data_path("pe_medium_R1.fq"))
         .arg("-I")
@@ -6356,7 +6354,7 @@ TGCAGGCACGGACGAACGTCTCACCGCCTGGCCATGAAAGCGGTAAATCGGACAAGGTTATCAGCTCTCATCGGCACTCT
     assert!(status.success());
 
     // Run fasterp
-    let status = Command::new(cargo_bin("fasterp"))
+    let status = Command::new(assert_cmd::cargo::cargo_bin!("fasterp"))
         .arg("-i")
         .arg(&test_r1)
         .arg("-I")
@@ -6490,7 +6488,7 @@ TGCAGGCACGGACGAACGTCTCACCGCCTGGCCATGAAAGCGGTAAATCGGACAAGGTTATCAGCTCTCATCGGCACTCT
     assert!(status.success());
 
     // Run fasterp
-    let status = Command::new(cargo_bin("fasterp"))
+    let status = Command::new(assert_cmd::cargo::cargo_bin!("fasterp"))
         .arg("-i")
         .arg(&test_r1)
         .arg("-I")
@@ -6597,7 +6595,7 @@ fn test_trim_tail_flag() {
     assert!(status.success());
 
     // Run fasterp with same parameters
-    let status = Command::new(cargo_bin("fasterp"))
+    let status = Command::new(assert_cmd::cargo::cargo_bin!("fasterp"))
         .arg("-i")
         .arg(test_data_path("pe_small_R1.fq"))
         .arg("-I")
@@ -6682,7 +6680,7 @@ fn test_max_len_flags() {
     assert!(status.success());
 
     // Run fasterp with same parameters
-    let status = Command::new(cargo_bin("fasterp"))
+    let status = Command::new(assert_cmd::cargo::cargo_bin!("fasterp"))
         .arg("-i")
         .arg(test_data_path("pe_small_R1.fq"))
         .arg("-I")
@@ -6777,7 +6775,7 @@ fn test_combined_front_tail_trimming() {
     assert!(status.success());
 
     // Run fasterp with same parameters
-    let status = Command::new(cargo_bin("fasterp"))
+    let status = Command::new(assert_cmd::cargo::cargo_bin!("fasterp"))
         .arg("-i")
         .arg(test_data_path("pe_small_R1.fq"))
         .arg("-I")
@@ -6861,7 +6859,7 @@ fn test_thread_flag_consistency() {
     let out1_r2 = temp_dir.path().join("out1_r2.fq");
     let json1 = temp_dir.path().join("json1.json");
 
-    let status = Command::new(cargo_bin("fasterp"))
+    let status = Command::new(assert_cmd::cargo::cargo_bin!("fasterp"))
         .arg("-i")
         .arg(test_data_path("pe_small_R1.fq"))
         .arg("-I")
@@ -6889,7 +6887,7 @@ fn test_thread_flag_consistency() {
     let out4_r2 = temp_dir.path().join("out4_r2.fq");
     let json4 = temp_dir.path().join("json4.json");
 
-    let status = Command::new(cargo_bin("fasterp"))
+    let status = Command::new(assert_cmd::cargo::cargo_bin!("fasterp"))
         .arg("-i")
         .arg(test_data_path("pe_small_R1.fq"))
         .arg("-I")
@@ -6967,7 +6965,7 @@ fn test_max_len_with_adapter_trimming() {
     assert!(status.success());
 
     // Run fasterp with same parameters
-    let status = Command::new(cargo_bin("fasterp"))
+    let status = Command::new(assert_cmd::cargo::cargo_bin!("fasterp"))
         .arg("-i")
         .arg(test_data_path("pe_small_R1.fq"))
         .arg("-I")
@@ -7034,7 +7032,7 @@ fn test_single_end_comprehensive_trimming() {
     assert!(status.success());
 
     // Run fasterp with same parameters
-    let status = Command::new(cargo_bin("fasterp"))
+    let status = Command::new(assert_cmd::cargo::cargo_bin!("fasterp"))
         .arg("-i")
         .arg(test_data_path("pe_small_R1.fq"))
         .arg("-o")
@@ -7116,7 +7114,7 @@ fn test_all_trimming_options_combined() {
     assert!(status.success());
 
     // Run fasterp with same parameters
-    let status = Command::new(cargo_bin("fasterp"))
+    let status = Command::new(assert_cmd::cargo::cargo_bin!("fasterp"))
         .arg("-i")
         .arg(test_data_path("pe_small_R1.fq"))
         .arg("-I")
@@ -7209,7 +7207,7 @@ fn test_quality_n_base_length_filters_combined() {
     assert!(status.success());
 
     // Run fasterp with same parameters
-    let status = Command::new(cargo_bin("fasterp"))
+    let status = Command::new(assert_cmd::cargo::cargo_bin!("fasterp"))
         .arg("-i")
         .arg(test_data_path("pe_small_R1.fq"))
         .arg("-I")
@@ -7262,7 +7260,7 @@ fn test_thread_and_tail_trim_no_conflict() {
     let fasterp_json = temp_dir.path().join("fasterp.json");
 
     // Run with both -w (threads) and -t (tail trim)
-    let status = Command::new(cargo_bin("fasterp"))
+    let status = Command::new(assert_cmd::cargo::cargo_bin!("fasterp"))
         .arg("-i")
         .arg(test_data_path("pe_small_R1.fq"))
         .arg("-I")
@@ -7330,7 +7328,7 @@ fn test_max_len_shorter_than_trimmed_read() {
         .expect("Failed to run fastp");
     assert!(status.success());
 
-    let status = Command::new(cargo_bin("fasterp"))
+    let status = Command::new(assert_cmd::cargo::cargo_bin!("fasterp"))
         .arg("-i")
         .arg(test_data_path("pe_small_R1.fq"))
         .arg("-I")
@@ -7422,7 +7420,7 @@ fn test_large_trim_values() {
         .expect("Failed to run fastp");
     assert!(status.success());
 
-    let status = Command::new(cargo_bin("fasterp"))
+    let status = Command::new(assert_cmd::cargo::cargo_bin!("fasterp"))
         .arg("-i")
         .arg(test_data_path("pe_small_R1.fq"))
         .arg("-I")
@@ -7509,7 +7507,7 @@ fn test_asymmetric_max_len_extreme() {
         .expect("Failed to run fastp");
     assert!(status.success());
 
-    let status = Command::new(cargo_bin("fasterp"))
+    let status = Command::new(assert_cmd::cargo::cargo_bin!("fasterp"))
         .arg("-i")
         .arg(test_data_path("pe_small_R1.fq"))
         .arg("-I")
@@ -7612,7 +7610,7 @@ fn run_fasterp_merge(
     let output1 = temp_dir.path().join("fasterp_merge_R1.fq");
     let output2 = temp_dir.path().join("fasterp_merge_R2.fq");
 
-    let mut cmd = Command::new(cargo_bin("fasterp"));
+    let mut cmd = Command::new(assert_cmd::cargo::cargo_bin!("fasterp"));
     cmd.arg("-i")
         .arg(test_data_path(input1))
         .arg("-I")
@@ -7671,9 +7669,9 @@ fn test_merge_basic_parity_with_fastp() {
     let temp_dir = TempDir::new().unwrap();
 
     // Run both tools with merge mode
-    let (fastp_merged, fastp_json) =
+    let (fastp_merged, _fastp_json) =
         run_fastp_merge("merge_test_R1.fq", "merge_test_R2.fq", &temp_dir, false);
-    let (fasterp_merged, fasterp_json) =
+    let (fasterp_merged, _fasterp_json) =
         run_fasterp_merge("merge_test_R1.fq", "merge_test_R2.fq", &temp_dir, false);
 
     // Check that both produced merged output
@@ -7908,7 +7906,7 @@ fn test_srr30151536_gzipped_paired_end() {
     assert!(status.success(), "fastp failed on SRR30151536 dataset");
 
     // Run fasterp with auto-detection (default behavior)
-    let status = Command::new(cargo_bin("fasterp"))
+    let status = Command::new(assert_cmd::cargo::cargo_bin!("fasterp"))
         .arg("-i")
         .arg(&input1)
         .arg("-I")
@@ -8003,7 +8001,7 @@ fn test_srr22472290_gzipped_paired_end() {
     assert!(status.success(), "fastp failed on SRR22472290 dataset");
 
     // Run fasterp with adapter trimming disabled for exact comparison
-    let status = Command::new(cargo_bin("fasterp"))
+    let status = Command::new(assert_cmd::cargo::cargo_bin!("fasterp"))
         .arg("-i")
         .arg(&input1)
         .arg("-I")
@@ -8117,7 +8115,7 @@ A/A//EEE/EA<EE/EEEEAA<EE//AEEEAAE/EE/EAEEAAA//A////AE/A<A//////////E///////
     assert!(status.success(), "fastp failed on problematic read");
 
     // Run fasterp
-    let status = Command::new(cargo_bin("fasterp"))
+    let status = Command::new(assert_cmd::cargo::cargo_bin!("fasterp"))
         .arg("-i")
         .arg(&input_r1)
         .arg("-I")
@@ -8213,7 +8211,7 @@ A/A//EEE/EA<EE/EEEEAA<EE//AEEEAAE/EE/EAEEAAA//A////AE/A<A//////////E///////
     assert!(status.success(), "fastp failed on problematic read");
 
     // Run fasterp
-    let status = Command::new(cargo_bin("fasterp"))
+    let status = Command::new(assert_cmd::cargo::cargo_bin!("fasterp"))
         .arg("-i")
         .arg(&input_r1)
         .arg("-I")
@@ -8413,7 +8411,7 @@ IIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII
     let out2 = temp_dir.path().join("out2.fq");
     let json_out = temp_dir.path().join("out.json");
 
-    let status = Command::new(cargo_bin("fasterp"))
+    let status = Command::new(assert_cmd::cargo::cargo_bin!("fasterp"))
         .args([
             "-i",
             r1_path.to_str().unwrap(),
@@ -8475,7 +8473,7 @@ IIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII
     let out2 = temp_dir.path().join("out2.fq");
     let json_out = temp_dir.path().join("out.json");
 
-    let status = Command::new(cargo_bin("fasterp"))
+    let status = Command::new(assert_cmd::cargo::cargo_bin!("fasterp"))
         .args([
             "-i",
             r1_path.to_str().unwrap(),
@@ -8534,7 +8532,7 @@ IIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII
     let out2 = temp_dir.path().join("out2.fq");
     let json_out = temp_dir.path().join("out.json");
 
-    let status = Command::new(cargo_bin("fasterp"))
+    let status = Command::new(assert_cmd::cargo::cargo_bin!("fasterp"))
         .args([
             "-i",
             r1_path.to_str().unwrap(),
@@ -8601,7 +8599,7 @@ AAAAAAAAAAAAAAACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGT
     let out2 = temp_dir.path().join("out2.fq");
     let json_out = temp_dir.path().join("out.json");
 
-    let status = Command::new(cargo_bin("fasterp"))
+    let status = Command::new(assert_cmd::cargo::cargo_bin!("fasterp"))
         .args([
             "-i",
             r1_path.to_str().unwrap(),
@@ -8674,7 +8672,7 @@ IIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII
     let out2 = temp_dir.path().join("out2.fq");
     let json_out = temp_dir.path().join("out.json");
 
-    let status = Command::new(cargo_bin("fasterp"))
+    let status = Command::new(assert_cmd::cargo::cargo_bin!("fasterp"))
         .args([
             "-i",
             r1_path.to_str().unwrap(),
@@ -8736,7 +8734,7 @@ IIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII
     let out2 = temp_dir.path().join("out2.fq");
     let json_out = temp_dir.path().join("out.json");
 
-    let status = Command::new(cargo_bin("fasterp"))
+    let status = Command::new(assert_cmd::cargo::cargo_bin!("fasterp"))
         .args([
             "-i",
             r1_path.to_str().unwrap(),
@@ -8799,7 +8797,7 @@ fn test_multithreaded_overlap_consistency() {
     let out2_st = temp_dir.path().join("out2_st.fq");
     let json_st = temp_dir.path().join("st.json");
 
-    let status = Command::new(cargo_bin("fasterp"))
+    let status = Command::new(assert_cmd::cargo::cargo_bin!("fasterp"))
         .args([
             "-i",
             r1_path.to_str().unwrap(),
@@ -8826,7 +8824,7 @@ fn test_multithreaded_overlap_consistency() {
     let out2_mt = temp_dir.path().join("out2_mt.fq");
     let json_mt = temp_dir.path().join("mt.json");
 
-    let status = Command::new(cargo_bin("fasterp"))
+    let status = Command::new(assert_cmd::cargo::cargo_bin!("fasterp"))
         .args([
             "-i",
             r1_path.to_str().unwrap(),
@@ -8898,7 +8896,7 @@ IIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII
     let out2 = temp_dir.path().join("out2.fq");
     let json_out = temp_dir.path().join("out.json");
 
-    let status = Command::new(cargo_bin("fasterp"))
+    let status = Command::new(assert_cmd::cargo::cargo_bin!("fasterp"))
         .args([
             "-i",
             r1_path.to_str().unwrap(),
@@ -8959,7 +8957,7 @@ IIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII
     let out2 = temp_dir.path().join("out2.fq");
     let json_out = temp_dir.path().join("out.json");
 
-    let status = Command::new(cargo_bin("fasterp"))
+    let status = Command::new(assert_cmd::cargo::cargo_bin!("fasterp"))
         .args([
             "-i",
             r1_path.to_str().unwrap(),
@@ -9023,7 +9021,7 @@ IIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII
     let out2 = temp_dir.path().join("out2.fq");
     let json_out = temp_dir.path().join("out.json");
 
-    let status = Command::new(cargo_bin("fasterp"))
+    let status = Command::new(assert_cmd::cargo::cargo_bin!("fasterp"))
         .args([
             "-i",
             r1_path.to_str().unwrap(),
@@ -9087,7 +9085,7 @@ IIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII
     let out2 = temp_dir.path().join("out2.fq");
     let json_out = temp_dir.path().join("out.json");
 
-    let status = Command::new(cargo_bin("fasterp"))
+    let status = Command::new(assert_cmd::cargo::cargo_bin!("fasterp"))
         .args([
             "-i",
             r1_path.to_str().unwrap(),
@@ -9151,7 +9149,7 @@ IIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII
     let out2 = temp_dir.path().join("out2.fq");
     let json_out = temp_dir.path().join("out.json");
 
-    let status = Command::new(cargo_bin("fasterp"))
+    let status = Command::new(assert_cmd::cargo::cargo_bin!("fasterp"))
         .args([
             "-i",
             r1_path.to_str().unwrap(),
@@ -9233,7 +9231,7 @@ fn test_mixed_overlapping_and_non_overlapping() {
     let out2 = temp_dir.path().join("out2.fq");
     let json_out = temp_dir.path().join("out.json");
 
-    let status = Command::new(cargo_bin("fasterp"))
+    let status = Command::new(assert_cmd::cargo::cargo_bin!("fasterp"))
         .args([
             "-i",
             r1_path.to_str().unwrap(),
@@ -9293,7 +9291,7 @@ IIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII
     let json_out = temp_dir.path().join("out.json");
 
     // Enable polyG trimming with --trim-poly-g flag
-    let status = Command::new(cargo_bin("fasterp"))
+    let status = Command::new(assert_cmd::cargo::cargo_bin!("fasterp"))
         .args([
             "-i",
             r1_path.to_str().unwrap(),
@@ -9357,7 +9355,7 @@ IIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII
     let json_out = temp_dir.path().join("out.json");
 
     // Set minimum length filter to 20bp
-    let status = Command::new(cargo_bin("fasterp"))
+    let status = Command::new(assert_cmd::cargo::cargo_bin!("fasterp"))
         .args([
             "-i",
             r1_path.to_str().unwrap(),
@@ -9427,10 +9425,9 @@ DDDDDIIHIIIIIIHHIIIIIIIIIIIIIIIIIIEHIGHEEHIIIIHI?GH
 
     let out1 = temp_dir.path().join("out1.fq");
     let out2 = temp_dir.path().join("out2.fq");
-    let json_out = temp_dir.path().join("out.json");
 
     // Set minimum length filter to 20bp
-    let status = Command::new(cargo_bin("fasterp"))
+    let status = Command::new(assert_cmd::cargo::cargo_bin!("fasterp"))
         .args([
             "-i",
             r1_path.to_str().unwrap(),
@@ -9532,7 +9529,7 @@ D@@D@FHHHHH?HEHIE11FHHEHHII?HHHIIFEDCEHCHHC1FHFHCGE
     let fasterp_out2 = temp_dir.path().join("fasterp_out2.fq");
     let fasterp_json = temp_dir.path().join("fasterp.json");
 
-    let status = Command::new(cargo_bin("fasterp"))
+    let status = Command::new(assert_cmd::cargo::cargo_bin!("fasterp"))
         .args([
             "-i",
             r1_path.to_str().unwrap(),

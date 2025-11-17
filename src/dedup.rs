@@ -52,19 +52,6 @@ impl DedupTracker {
         }
     }
 
-    /// Check if single-end read is a duplicate
-    /// Returns true if this is a duplicate (already seen)
-    pub fn is_duplicate_se(&mut self, seq: &[u8]) -> bool {
-        let hash = self.hash_sequence(seq);
-        if self.seen_hashes.contains(&hash) {
-            self.duplicates += 1;
-            true
-        } else {
-            self.seen_hashes.insert(hash);
-            false
-        }
-    }
-
     /// Check if paired-end read pair is a duplicate
     /// Returns true if this pair is a duplicate (already seen)
     pub fn is_duplicate_pe(&mut self, seq1: &[u8], seq2: &[u8]) -> bool {
@@ -76,23 +63,6 @@ impl DedupTracker {
             self.seen_hashes.insert(hash);
             false
         }
-    }
-
-    /// Hash a single sequence
-    fn hash_sequence(&self, seq: &[u8]) -> u64 {
-        let mut hasher = DefaultHasher::new();
-
-        // Use only part of sequence based on accuracy level to reduce memory
-        // Higher accuracy = use more of the sequence
-        let sample_size = self.calculate_sample_size(seq.len());
-        let sample_seq = if seq.len() <= sample_size {
-            seq
-        } else {
-            &seq[..sample_size]
-        };
-
-        sample_seq.hash(&mut hasher);
-        hasher.finish()
     }
 
     /// Hash a pair of sequences (for paired-end)
@@ -129,8 +99,7 @@ impl DedupTracker {
             2 => 8,  // 1/8 of sequence
             3 => 4,  // 1/4 of sequence
             4 => 2,  // 1/2 of sequence
-            5 => 1,  // full sequence (fastp default)
-            _ => 1,  // full sequence for accuracy >= 6
+            _ => 1,  // full sequence (fastp default and for accuracy >= 5)
         };
 
         if fraction == 1 {
@@ -139,52 +108,11 @@ impl DedupTracker {
             std::cmp::max(seq_len / fraction, 32) // minimum 32 bases
         }
     }
-
-    /// Get number of unique reads seen
-    pub fn unique_count(&self) -> usize {
-        self.seen_hashes.len()
-    }
-
-    /// Clear the tracker (for memory management in streaming)
-    pub fn clear(&mut self) {
-        self.seen_hashes.clear();
-        // Keep duplicates count
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_dedup_single_end_exact_duplicate() {
-        let mut tracker = DedupTracker::new(5);
-
-        let seq = b"ACGTACGTACGTACGT";
-
-        // First occurrence - not a duplicate
-        assert!(!tracker.is_duplicate_se(seq));
-
-        // Second occurrence - is a duplicate
-        assert!(tracker.is_duplicate_se(seq));
-
-        assert_eq!(tracker.duplicates, 1);
-        assert_eq!(tracker.unique_count(), 1);
-    }
-
-    #[test]
-    fn test_dedup_single_end_different_sequences() {
-        let mut tracker = DedupTracker::new(5);
-
-        let seq1 = b"ACGTACGTACGTACGT";
-        let seq2 = b"GGGGCCCCAAAATTTT";
-
-        assert!(!tracker.is_duplicate_se(seq1));
-        assert!(!tracker.is_duplicate_se(seq2));
-
-        assert_eq!(tracker.duplicates, 0);
-        assert_eq!(tracker.unique_count(), 2);
-    }
 
     #[test]
     fn test_dedup_paired_end_exact_duplicate() {
@@ -200,7 +128,6 @@ mod tests {
         assert!(tracker.is_duplicate_pe(seq1, seq2));
 
         assert_eq!(tracker.duplicates, 1);
-        assert_eq!(tracker.unique_count(), 1);
     }
 
     #[test]
@@ -215,7 +142,6 @@ mod tests {
         assert!(!tracker.is_duplicate_pe(seq1b, seq2)); // Different pair
 
         assert_eq!(tracker.duplicates, 0);
-        assert_eq!(tracker.unique_count(), 2);
     }
 
     #[test]
@@ -230,7 +156,6 @@ mod tests {
         assert!(!tracker.is_duplicate_pe(seq1, seq2b)); // Different pair
 
         assert_eq!(tracker.duplicates, 0);
-        assert_eq!(tracker.unique_count(), 2);
     }
 
     #[test]
@@ -238,10 +163,11 @@ mod tests {
         // Test that different accuracy levels work
         for accuracy in 1..=6 {
             let mut tracker = DedupTracker::new(accuracy);
-            let seq = b"ACGTACGTACGTACGTACGTACGTACGTACGT";
+            let seq1 = b"ACGTACGTACGTACGTACGTACGTACGTACGT";
+            let seq2 = b"TTTTAAAACCCCGGGGACGTACGTACGTACGT";
 
-            assert!(!tracker.is_duplicate_se(seq));
-            assert!(tracker.is_duplicate_se(seq));
+            assert!(!tracker.is_duplicate_pe(seq1, seq2));
+            assert!(tracker.is_duplicate_pe(seq1, seq2));
             assert_eq!(tracker.duplicates, 1);
         }
     }

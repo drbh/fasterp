@@ -158,6 +158,7 @@ pub(crate) struct PairedWorkerResult {
 /// and emits Batch structures with NO string allocations - just byte slices.
 ///
 /// Handles partial records at block boundaries by carrying them over to next batch.
+#[allow(clippy::needless_pass_by_value)]
 pub(crate) fn producer_thread(
     input_path: String,
     batch_bytes: usize,
@@ -282,6 +283,9 @@ pub(crate) fn producer_thread(
 }
 
 /// Worker thread: process batches with thread-local accumulators
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_lines)]
+#[allow(clippy::needless_pass_by_value)]
 pub(crate) fn worker_thread(
     receiver: Receiver<Option<Batch>>,
     sender: Sender<Option<WorkerResult>>,
@@ -345,18 +349,18 @@ pub(crate) fn worker_thread(
 
                 pos.ensure_capacity(seq.len());
                 for (i, (&b, &q)) in seq.iter().zip(qual).enumerate() {
-                    let qval = u64::from(q - 33);
-                    pos.total_sum[i] += qval;
+                    let quality_score = u64::from(q - 33);
+                    pos.total_sum[i] += quality_score;
                     pos.total_cnt[i] += 1;
 
                     if let Some(bi) = base_idx(b) {
-                        pos.base_sum[bi][i] += qval;
+                        pos.base_sum[bi][i] += quality_score;
                         pos.base_cnt[bi][i] += 1;
                     }
 
                     // Track quality histogram
-                    if qval < 94 {
-                        pos.qual_hist[qval as usize] += 1;
+                    if quality_score < 94 {
+                        pos.qual_hist[quality_score as usize] += 1;
                     }
                 }
 
@@ -374,8 +378,8 @@ pub(crate) fn worker_thread(
 
                 pos.ensure_capacity(seq.len());
                 for (i, (&b, &q)) in seq.iter().zip(qual).enumerate() {
-                    let qval = u32::from(q - 33);
-                    qsum += qval;
+                    let quality_u32 = u32::from(q - 33);
+                    qsum += quality_u32;
                     if q >= 53 {
                         q20 += 1;
                     }
@@ -392,17 +396,17 @@ pub(crate) fn worker_thread(
                         gc += 1;
                     }
 
-                    pos.total_sum[i] += u64::from(qval);
+                    pos.total_sum[i] += u64::from(quality_u32);
                     pos.total_cnt[i] += 1;
 
                     if let Some(bi) = base_idx(b) {
-                        pos.base_sum[bi][i] += u64::from(qval);
+                        pos.base_sum[bi][i] += u64::from(quality_u32);
                         pos.base_cnt[bi][i] += 1;
                     }
 
                     // Track quality histogram
-                    if (qval as usize) < 94 {
-                        pos.qual_hist[qval as usize] += 1;
+                    if (quality_u32 as usize) < 94 {
+                        pos.qual_hist[quality_u32 as usize] += 1;
                     }
                 }
 
@@ -520,18 +524,18 @@ pub(crate) fn worker_thread(
             // Track position stats for after-filtering data (including histogram)
             pos_after.ensure_capacity(trimmed_len);
             for (i, (&b, &q)) in trimmed_seq.iter().zip(trimmed_qual).enumerate() {
-                let qval = u64::from(q - 33);
-                pos_after.total_sum[i] += qval;
+                let quality_score = u64::from(q - 33);
+                pos_after.total_sum[i] += quality_score;
                 pos_after.total_cnt[i] += 1;
 
                 if let Some(bi) = base_idx(b) {
-                    pos_after.base_sum[bi][i] += qval;
+                    pos_after.base_sum[bi][i] += quality_score;
                     pos_after.base_cnt[bi][i] += 1;
                 }
 
                 // Track quality histogram for after-filtering
-                if qval < 94 {
-                    pos_after.qual_hist[qval as usize] += 1;
+                if quality_score < 94 {
+                    pos_after.qual_hist[quality_score as usize] += 1;
                 }
             }
 
@@ -569,6 +573,8 @@ pub(crate) fn worker_thread(
 }
 
 /// Merger thread: write output in order and reduce stats (zero-copy vectored I/O)
+#[allow(clippy::too_many_lines)]
+#[allow(clippy::needless_pass_by_value)]
 pub(crate) fn merger_thread(
     receiver: Receiver<Option<WorkerResult>>,
     output_path: String,
@@ -747,25 +753,27 @@ pub(crate) fn merger_thread(
 /// Opens files IN THIS THREAD to isolate `GzDecoders` from each other (workaround for flate2 bug).
 /// Reads blocks from both input files, parses FASTQ records, and emits
 /// `PairedBatch` structures with synchronized record counts.
+#[allow(clippy::too_many_lines)]
+#[allow(clippy::needless_pass_by_value)]
 pub(crate) fn paired_producer_thread_with_paths(
     input1: String,
     input2: String,
     batch_bytes: usize,
     sender: Sender<Option<PairedBatch>>,
-    num_workers: usize,
+    _num_workers: usize,
 ) -> Result<()> {
     use crossbeam_channel::bounded;
     use std::io::Read;
 
     // Use bounded channels with larger capacity to prevent deadlock
     // Capacity of 16 provides enough buffering to handle speed differences between R1 and R2
-    let (decomp_tx1, decomp_rx1) = bounded::<(Vec<u8>, usize)>(16); // R1 decompressed chunks
-    let (decomp_tx2, decomp_rx2) = bounded::<(Vec<u8>, usize)>(16); // R2 decompressed chunks
+    let (r1_sender, r1_receiver) = bounded::<(Vec<u8>, usize)>(16); // R1 decompressed chunks
+    let (r2_sender, r2_receiver) = bounded::<(Vec<u8>, usize)>(16); // R2 decompressed chunks
 
     // Spawn dedicated decompressor thread for R1
     let input1_clone = input1.clone();
     let decomp_chunk_size = batch_bytes; // Use same size as batch_bytes
-    let decomp_thread1 = std::thread::spawn(move || -> Result<()> {
+    let _decomp_thread1 = std::thread::spawn(move || -> Result<()> {
         let mut reader = crate::io::open_input(&input1_clone)?;
         // Reuse buffer to reduce allocations
         let mut buffer = vec![0u8; decomp_chunk_size];
@@ -785,7 +793,7 @@ pub(crate) fn paired_producer_thread_with_paths(
             }
             // Send a copy of the data (receiver owns it)
             let data = buffer[..total_read].to_vec();
-            if decomp_tx1.send((data, total_read)).is_err() {
+            if r1_sender.send((data, total_read)).is_err() {
                 break; // Receiver dropped
             }
         }
@@ -794,7 +802,7 @@ pub(crate) fn paired_producer_thread_with_paths(
 
     // Spawn dedicated decompressor thread for R2
     let input2_clone = input2.clone();
-    let decomp_thread2 = std::thread::spawn(move || -> Result<()> {
+    let _decomp_thread2 = std::thread::spawn(move || -> Result<()> {
         let mut reader = crate::io::open_input(&input2_clone)?;
         // Reuse buffer to reduce allocations
         let mut buffer = vec![0u8; decomp_chunk_size];
@@ -814,7 +822,7 @@ pub(crate) fn paired_producer_thread_with_paths(
             }
             // Send a copy of the data (receiver owns it)
             let data = buffer[..total_read].to_vec();
-            if decomp_tx2.send((data, total_read)).is_err() {
+            if r2_sender.send((data, total_read)).is_err() {
                 break; // Receiver dropped
             }
         }
@@ -828,14 +836,8 @@ pub(crate) fn paired_producer_thread_with_paths(
     loop {
         // With larger bounded channels (capacity 16), deadlock is unlikely
         // Simple sequential receives work fine
-        let (buffer1, bytes_read1) = match decomp_rx1.recv() {
-            Ok(data) => data,
-            Err(_) => (Vec::new(), 0),
-        };
-        let (buffer2, bytes_read2) = match decomp_rx2.recv() {
-            Ok(data) => data,
-            Err(_) => (Vec::new(), 0),
-        };
+        let (buffer1, bytes_read1) = r1_receiver.recv().unwrap_or_default();
+        let (buffer2, bytes_read2) = r2_receiver.recv().unwrap_or_default();
 
         // Prepend carryover for R1
         let carryover_len1 = carryover1.len();
@@ -879,10 +881,10 @@ pub(crate) fn paired_producer_thread_with_paths(
         let is_eof2 = bytes_read2 == 0;
 
         // Parse R1
-        let (complete_len1, mut recs1) = parse_fastq_buffer(&data1, actual_len1, is_eof1)?;
+        let (complete_len1, mut recs1) = parse_fastq_buffer(&data1, actual_len1, is_eof1);
 
         // Parse R2
-        let (complete_len2, mut recs2) = parse_fastq_buffer(&data2, actual_len2, is_eof2)?;
+        let (complete_len2, mut recs2) = parse_fastq_buffer(&data2, actual_len2, is_eof2);
 
         // Handle record count mismatch due to gzip decompression boundaries
         // Take the minimum number of complete records from both files
@@ -967,13 +969,9 @@ pub(crate) fn paired_producer_thread_with_paths(
 
 /// Helper function to parse FASTQ records from a buffer
 /// Returns (`complete_len`, records)
-fn parse_fastq_buffer(
-    buffer: &[u8],
-    actual_len: usize,
-    is_eof: bool,
-) -> Result<(usize, Vec<[usize; 4]>)> {
+fn parse_fastq_buffer(buffer: &[u8], actual_len: usize, is_eof: bool) -> (usize, Vec<[usize; 4]>) {
     if actual_len == 0 {
-        return Ok((0, Vec::new()));
+        return (0, Vec::new());
     }
 
     // SIMD-accelerated newline search using memchr (10-50x faster than naive loop)
@@ -1031,13 +1029,16 @@ fn parse_fastq_buffer(
         }
     }
 
-    Ok((complete_len, recs))
+    (complete_len, recs)
 }
 
 /// Paired-end worker thread: process read pairs with synchronization
 ///
 /// Processes both R1 and R2 together. Read pairs pass/fail together -
 /// if either read fails ANY filter, BOTH reads are discarded.
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_lines)]
+#[allow(clippy::needless_pass_by_value)]
 pub(crate) fn paired_worker_thread(
     receiver: Receiver<Option<PairedBatch>>,
     sender: Sender<Option<PairedWorkerResult>>,
@@ -1097,11 +1098,11 @@ pub(crate) fn paired_worker_thread(
         // Process each pair
         for (idx, (&rec1, &rec2)) in batch.recs_r1.iter().zip(batch.recs_r2.iter()).enumerate() {
             // Parse R1
-            let (seq1, qual1, seq1_end, qual1_end) =
+            let (seq1, qual1, _seq1_end, _qual1_end) =
                 parse_record(&batch.buf_r1, rec1, idx, &batch.recs_r1);
 
             // Parse R2
-            let (seq2, qual2, seq2_end, qual2_end) =
+            let (seq2, qual2, _seq2_end, _qual2_end) =
                 parse_record(&batch.buf_r2, rec2, idx, &batch.recs_r2);
 
             // Validate both records
@@ -1643,8 +1644,8 @@ pub(crate) fn paired_worker_thread(
             );
 
             // Track position stats for reads that passed filters
-            crate::processor::track_position_stats(final_seq1, final_qual1, &mut pos_r1_after).ok();
-            crate::processor::track_position_stats(final_seq2, final_qual2, &mut pos_r2_after).ok();
+            crate::processor::track_position_stats(final_seq1, final_qual1, &mut pos_r1_after);
+            crate::processor::track_position_stats(final_seq2, final_qual2, &mut pos_r2_after);
 
             // Track kmers for reads that passed filters
             count_k5_2bit(final_seq1, &mut k5_r1_after);
@@ -1697,7 +1698,6 @@ fn parse_record<'a>(
 ) -> (&'a [u8], &'a [u8], usize, usize) {
     let [_h_start, s_start, p_start, q_start] = rec;
     let s_end = p_start - 1;
-    let p_end = q_start - 1;
     let q_end = if idx + 1 < recs.len() {
         recs[idx + 1][0] - 1
     } else {
@@ -1723,25 +1723,27 @@ fn update_position_stats(pos: &mut PositionStats, seq: &[u8], qual: &[u8]) {
 
     for i in 0..seq.len() {
         let q = qual[i];
-        let qval = u64::from(q - 33);
+        let quality_score = u64::from(q - 33);
         let b = seq[i];
 
-        pos.total_sum[i] += qval;
+        pos.total_sum[i] += quality_score;
         pos.total_cnt[i] += 1;
 
         if let Some(bi) = base_idx(b) {
-            pos.base_sum[bi][i] += qval;
+            pos.base_sum[bi][i] += quality_score;
             pos.base_cnt[bi][i] += 1;
         }
 
         // Track quality histogram
-        if qval < 94 {
-            pos.qual_hist[qval as usize] += 1;
+        if quality_score < 94 {
+            pos.qual_hist[quality_score as usize] += 1;
         }
     }
 }
 
 /// Paired-end merger thread: write both outputs in order
+#[allow(clippy::too_many_lines)]
+#[allow(clippy::needless_pass_by_value)]
 pub(crate) fn paired_merger_thread(
     receiver: Receiver<Option<PairedWorkerResult>>,
     output1_path: String,

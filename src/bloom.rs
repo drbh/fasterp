@@ -15,8 +15,6 @@ pub struct DuplicateDetector {
     bit_arrays: Vec<Vec<AtomicU8>>,
     /// Buffer size in bits (for modulo operations)
     buf_len_in_bits: u64,
-    /// Buffer size in bytes
-    buf_len_in_bytes: usize,
     /// Number of hash buffers (determines number of hash functions)
     buf_num: usize,
     /// Prime numbers for hashing (`buf_num` * `PRIME_ARRAY_LEN`)
@@ -39,7 +37,6 @@ impl DuplicateDetector {
 
         // Scale memory based on accuracy level (matching fastp)
         match accuracy_level {
-            1 => {} // 512MB × 2 = 1GB
             2 => {
                 buf_len_in_bytes *= 2;
             } // 1GB × 2 = 2GB
@@ -59,7 +56,7 @@ impl DuplicateDetector {
                 buf_len_in_bytes *= 8;
                 buf_num = 3;
             } // 4GB × 6 = 24GB
-            _ => {} // Default to level 1
+            _ => {} // Level 1 and default: 512MB × 2 = 1GB
         }
 
         let buf_len_in_bits = (buf_len_in_bytes as u64) << 3; // Convert bytes to bits
@@ -81,7 +78,6 @@ impl DuplicateDetector {
         Self {
             bit_arrays,
             buf_len_in_bits,
-            buf_len_in_bytes,
             buf_num,
             prime_arrays,
             offset_mask,
@@ -133,9 +129,9 @@ impl DuplicateDetector {
                 _ => 13, // N or any other character
             };
 
-            for i in 0..self.buf_num {
+            for (i, output_item) in output.iter_mut().take(self.buf_num).enumerate() {
                 let offset = ((p + pos_offset) * self.buf_num + i) & self.offset_mask;
-                output[i] += self.prime_arrays[offset] * (base + (p + pos_offset) as u64);
+                *output_item += self.prime_arrays[offset] * (base + (p + pos_offset) as u64);
             }
         }
     }
@@ -145,8 +141,8 @@ impl DuplicateDetector {
     fn apply_bloom_filter(&self, positions: &[u64]) -> bool {
         let mut is_dup = true;
 
-        for i in 0..self.buf_num {
-            let pos = positions[i] % self.buf_len_in_bits;
+        for (i, &position) in positions.iter().enumerate().take(self.buf_num) {
+            let pos = position % self.buf_len_in_bits;
             let byte_pos = (pos >> 3) as usize; // Divide by 8 to get byte position
             let bit_offset = (pos & 0x07) as u8; // Remainder is bit position within byte
             let bit_mask = 1u8 << bit_offset;
@@ -156,20 +152,6 @@ impl DuplicateDetector {
 
             // Check if bit was already set
             is_dup = is_dup && (old_value & bit_mask) != 0;
-        }
-
-        is_dup
-    }
-
-    /// Check if a single-end read is duplicate
-    pub fn check_read(&self, seq: &[u8]) -> bool {
-        let mut positions = vec![0u64; self.buf_num];
-        self.seq2intvector(seq, 0, &mut positions);
-        let is_dup = self.apply_bloom_filter(&positions);
-
-        self.total_reads.fetch_add(1, Ordering::Relaxed);
-        if is_dup {
-            self.duplicate_reads.fetch_add(1, Ordering::Relaxed);
         }
 
         is_dup
@@ -204,43 +186,11 @@ impl DuplicateDetector {
         let dups = self.duplicate_reads.load(Ordering::Relaxed);
         dups as f64 / total as f64
     }
-
-    /// Get total reads processed
-    pub fn get_total_reads(&self) -> usize {
-        self.total_reads.load(Ordering::Relaxed)
-    }
-
-    /// Get duplicate reads found
-    pub fn get_duplicate_reads(&self) -> usize {
-        self.duplicate_reads.load(Ordering::Relaxed)
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_basic_duplicate_detection() {
-        let detector = DuplicateDetector::new(1);
-
-        let seq1 = b"ATCGATCGATCGATCGATCG";
-        let seq2 = b"GCTAGCTAGCTAGCTAGCTA";
-
-        // First time should not be duplicate
-        assert!(!detector.check_read(seq1));
-
-        // Second time should be duplicate
-        assert!(detector.check_read(seq1));
-
-        // Different sequence should not be duplicate
-        assert!(!detector.check_read(seq2));
-
-        // Check stats
-        assert_eq!(detector.get_total_reads(), 3);
-        assert_eq!(detector.get_duplicate_reads(), 1);
-        assert!((detector.get_dup_rate() - 1.0 / 3.0).abs() < 0.001);
-    }
 
     #[test]
     fn test_paired_duplicate_detection() {

@@ -9,6 +9,7 @@
 /// - `seq` and `qual` must point to valid memory of at least `len` bytes
 /// - `len` must be accurate
 /// - Caller must ensure seq and qual are aligned and valid for the entire length
+#[allow(clippy::inline_always)]
 #[inline(always)]
 pub(crate) unsafe fn loop_seq_qual_indexed<F: FnMut(usize, u8, u8)>(
     seq: *const u8,

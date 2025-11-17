@@ -82,6 +82,7 @@ const LUT_BASE_IDX: [u8; 256] = {
 
 /// Convert base to 2-bit encoding: A=0, C=1, G=2, T=3
 /// Uses lookup table for O(1) performance
+#[allow(clippy::inline_always)]
 #[inline(always)]
 pub(crate) fn base_to_2bit(b: u8) -> Option<u32> {
     let code = LUT_BASE_TO_2BIT[b as usize];
@@ -94,6 +95,7 @@ pub(crate) fn base_to_2bit(b: u8) -> Option<u32> {
 
 /// Get base index for `quality_curves`: A=0, T=1, C=2, G=3
 /// Uses lookup table for O(1) performance
+#[allow(clippy::inline_always)]
 #[inline(always)]
 pub(crate) fn base_idx(b: u8) -> Option<usize> {
     let idx = LUT_BASE_IDX[b as usize];
@@ -137,6 +139,7 @@ static KMER_CACHE: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new()
 
 /// Convert 2-bit encoded kmer to &str for JSON output
 /// Uses static cache - initialized once, then zero allocations
+#[allow(clippy::inline_always)]
 #[inline(always)]
 pub(crate) fn kmer_to_str(code: usize) -> &'static str {
     let cache = KMER_CACHE.get_or_init(|| {

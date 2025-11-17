@@ -25,11 +25,13 @@ pub(crate) enum CompressionFormat {
 
 impl CompressionFormat {
     /// Detect from file path
+    #[allow(clippy::case_sensitive_file_extension_comparisons)]
     pub(crate) fn from_path(path: &str) -> Self {
         if path == "-" {
             return CompressionFormat::None; // stdin/stdout defaults to uncompressed
         }
 
+        // path_lower is already lowercased, so comparison is case-insensitive
         let path_lower = path.to_lowercase();
         if path_lower.ends_with(".gz") || path_lower.ends_with(".gzip") {
             CompressionFormat::Gzip
@@ -157,7 +159,7 @@ pub(crate) fn open_output(
 
                 if parallel {
                     // Use parallel compression (4-8 threads)
-                    let num_threads = (num_cpus::get() / 2).max(4).min(8);
+                    let num_threads = (num_cpus::get() / 2).clamp(4, 8);
                     let compressor = ParCompressBuilder::<Gzip>::new()
                         .compression_level(gzp::Compression::new(level))
                         .num_threads(num_threads)

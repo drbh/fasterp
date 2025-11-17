@@ -5,6 +5,12 @@
 //! - Quality filtering (mean quality score)
 //! - N-base filtering (maximum ambiguous bases)
 
+// Allow cast warnings for numeric computing - these are intentional and necessary for statistics
+#![allow(clippy::cast_precision_loss)]
+#![allow(clippy::cast_possible_truncation)]
+#![allow(clippy::cast_sign_loss)]
+#![allow(clippy::cast_possible_wrap)]
+
 use anyhow::{Context, Result};
 use clap::Parser;
 use crossbeam_channel::bounded;
@@ -37,6 +43,7 @@ use stats::{
 };
 use trimming::TrimmingConfig;
 
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Parser, Debug)]
 #[command(author, version, about = "A fast FASTQ preprocessor", long_about = None)]
 struct Args {
@@ -456,16 +463,16 @@ fn create_umi_config(args: &Args) -> Result<umi::UmiConfig> {
 }
 
 // Helper function to create DedupConfig from CLI args
-fn create_dedup_config(args: &Args) -> Result<dedup::DedupConfig> {
+fn create_dedup_config(args: &Args) -> dedup::DedupConfig {
     if !args.dedup {
-        return Ok(dedup::DedupConfig::default());
+        return dedup::DedupConfig::default();
     }
 
     // Dedup uses HashSet-based approach with default accuracy
-    Ok(dedup::DedupConfig {
+    dedup::DedupConfig {
         enabled: true,
         accuracy: 5, // Default accuracy for HashSet-based dedup
-    })
+    }
 }
 
 // Helper function to create SplitConfig from CLI args
@@ -503,11 +510,12 @@ fn create_split_config(args: &Args) -> Result<split::SplitConfig> {
 }
 
 // Helper function to build and write paired-end report
+#[allow(clippy::too_many_lines)]
 fn build_and_write_paired_end_report(
     args: &Args,
-    pe_acc: PairedEndAccumulator,
+    pe_acc: &PairedEndAccumulator,
     start_time: std::time::Instant,
-    dup_detector: &Option<std::sync::Arc<bloom::DuplicateDetector>>,
+    dup_detector: Option<&std::sync::Arc<bloom::DuplicateDetector>>,
 ) -> Result<()> {
     let before_stats_r1 = pe_acc.before_r1.to_read_stats();
     let after_stats_r1 = pe_acc.after_r1.to_read_stats();
@@ -1070,6 +1078,7 @@ fn auto_detect_adapter_se(
 ///    - Merger: writes output in order, reduces stats
 ///
 /// Result: 2-4x faster on large datasets with multi-threading
+#[allow(clippy::too_many_lines)]
 fn main() -> Result<()> {
     let args = Args::parse();
 
@@ -1133,7 +1142,7 @@ fn main() -> Result<()> {
 
     // Create deduplication configuration from CLI args
     let dedup_config = if args.dedup {
-        Some(create_dedup_config(&args)?)
+        Some(create_dedup_config(&args))
     } else {
         None
     };
@@ -1383,7 +1392,7 @@ fn main() -> Result<()> {
         };
 
         // Build paired-end report
-        build_and_write_paired_end_report(&args, pe_acc, start_time, &dup_detector)?;
+        build_and_write_paired_end_report(&args, &pe_acc, start_time, dup_detector.as_ref())?;
         return Ok(());
     }
 
