@@ -1,0 +1,9 @@
+# Cargo configuration for optimal performance
+
+[build]
+# Use native CPU features for maximum SIMD performance
+rustflags = ["-C", "target-cpu=native"]
+
+[profile.release]
+# These can also be set here as an alternative to Cargo.toml
+# Kept in Cargo.toml for visibility

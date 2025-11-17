@@ -9,6 +9,7 @@
 
 use anyhow::Result;
 use crossbeam_channel::{Receiver, Sender};
+use memchr;
 use std::collections::BTreeMap;
 use std::io::{IoSlice, Read, Write};
 use std::ops::Range;
@@ -341,7 +342,7 @@ pub(crate) fn worker_thread(
             }
 
             // Compute stats - use SIMD when available, otherwise single-pass
-            let (_qsum, q20, q30, _ncnt, gc) = if simd::is_simd_available() {
+            let (_qsum, q20, q30, q40, _ncnt, gc) = if simd::is_simd_available() {
                 // SIMD path: compute basic stats fast, then position-specific
                 let stats = simd::compute_stats(seq, qual, 0); // 0 = don't count unqualified for before stats
 
@@ -362,12 +363,15 @@ pub(crate) fn worker_thread(
                     }
                 }
 
-                (stats.qsum, stats.q20, stats.q30, stats.ncnt, stats.gc)
+                (
+                    stats.qsum, stats.q20, stats.q30, stats.q40, stats.ncnt, stats.gc,
+                )
             } else {
                 // Non-SIMD path: single pass for both basic and position stats
                 let mut qsum = 0u32;
                 let mut q20 = 0usize;
                 let mut q30 = 0usize;
+                let mut q40 = 0usize;
                 let mut ncnt = 0usize;
                 let mut gc = 0usize;
 
@@ -380,6 +384,9 @@ pub(crate) fn worker_thread(
                     }
                     if q >= 63 {
                         q30 += 1;
+                    }
+                    if q >= 73 {
+                        q40 += 1;
                     }
                     if b == b'N' || b == b'n' {
                         ncnt += 1;
@@ -402,7 +409,7 @@ pub(crate) fn worker_thread(
                     }
                 }
 
-                (qsum, q20, q30, ncnt, gc)
+                (qsum, q20, q30, q40, ncnt, gc)
             };
 
             // K-mer counting
@@ -411,7 +418,7 @@ pub(crate) fn worker_thread(
             }
 
             // Update before stats
-            before.add(seq.len(), q20, q30, gc);
+            before.add(seq.len(), q20, q30, q40, gc);
 
             // Apply trimming if enabled
             let trimming_result = if trimming_config.is_enabled() {
@@ -505,7 +512,13 @@ pub(crate) fn worker_thread(
             });
 
             // Update after stats with trimmed read
-            after.add(trimmed_len, trimmed_q20, trimmed_q30, trimmed_gc);
+            after.add(
+                trimmed_len,
+                trimmed_q20,
+                trimmed_q30,
+                trimmed_stats.q40,
+                trimmed_gc,
+            );
 
             // Track position stats for after-filtering data (including histogram)
             pos_after.ensure_capacity(trimmed_len);
@@ -565,10 +578,16 @@ pub(crate) fn merger_thread(
     num_workers: usize,
     compression_level: Option<u32>,
     split_config: crate::split::SplitConfig,
+    parallel_compression: bool,
 ) -> Result<StreamAccumulator> {
     // Create split writer (OutputWriter already has buffering, so no need for additional BufWriter)
     let compression = compression_level.unwrap_or(6);
-    let mut writer = crate::split::SplitWriter::new(&output_path, split_config, compression)?;
+    let mut writer = crate::split::SplitWriter::new(
+        &output_path,
+        split_config,
+        compression,
+        parallel_compression,
+    )?;
 
     let mut acc = StreamAccumulator::new();
     let mut next_id = 0u64;
@@ -638,12 +657,14 @@ pub(crate) fn merger_thread(
                     acc.before.total_bases += result.before.total_bases;
                     acc.before.q20_bases += result.before.q20_bases;
                     acc.before.q30_bases += result.before.q30_bases;
+                    acc.before.q40_bases += result.before.q40_bases;
                     acc.before.gc_bases += result.before.gc_bases;
 
                     acc.after.total_reads += result.after.total_reads;
                     acc.after.total_bases += result.after.total_bases;
                     acc.after.q20_bases += result.after.q20_bases;
                     acc.after.q30_bases += result.after.q30_bases;
+                    acc.after.q40_bases += result.after.q40_bases;
                     acc.after.gc_bases += result.after.gc_bases;
 
                     // Merge position stats
@@ -724,29 +745,86 @@ pub(crate) fn merger_thread(
 // PAIRED-END MULTI-THREADING PIPELINE
 // ============================================================================
 
-/// Paired-end producer thread: read both R1 and R2 simultaneously
+/// Paired-end producer thread: opens and reads both R1 and R2 files
 ///
+/// Opens files IN THIS THREAD to isolate GzDecoders from each other (workaround for flate2 bug).
 /// Reads blocks from both input files, parses FASTQ records, and emits
 /// PairedBatch structures with synchronized record counts.
-pub(crate) fn paired_producer_thread(
-    input1_path: String,
-    input2_path: String,
+pub(crate) fn paired_producer_thread_with_paths(
+    input1: String,
+    input2: String,
     batch_bytes: usize,
     sender: Sender<Option<PairedBatch>>,
+    num_workers: usize,
 ) -> Result<()> {
-    let mut reader1 = crate::io::open_input(&input1_path)?;
-    let mut reader2 = crate::io::open_input(&input2_path)?;
+    use std::io::Read;
+    use crossbeam_channel::bounded;
+
+    // Create channels for decompressed data from dedicated decompressor threads
+    let (decomp_tx1, decomp_rx1) = bounded::<(Vec<u8>, usize)>(2); // R1 decompressed chunks
+    let (decomp_tx2, decomp_rx2) = bounded::<(Vec<u8>, usize)>(2); // R2 decompressed chunks
+
+    // Spawn dedicated decompressor thread for R1
+    let input1_clone = input1.clone();
+    let decomp_chunk_size = batch_bytes; // Use same size as batch_bytes
+    let decomp_thread1 = std::thread::spawn(move || -> Result<()> {
+        let mut reader = crate::io::open_input(&input1_clone)?;
+        loop {
+            let mut buffer = vec![0u8; decomp_chunk_size];
+            let bytes_read = reader.read(&mut buffer)?;
+            if bytes_read == 0 {
+                break;
+            }
+            if decomp_tx1.send((buffer, bytes_read)).is_err() {
+                break; // Receiver dropped
+            }
+        }
+        Ok(())
+    });
+
+    // Spawn dedicated decompressor thread for R2
+    let input2_clone = input2.clone();
+    let decomp_thread2 = std::thread::spawn(move || -> Result<()> {
+        let mut reader = crate::io::open_input(&input2_clone)?;
+        loop {
+            let mut buffer = vec![0u8; decomp_chunk_size];
+            let bytes_read = reader.read(&mut buffer)?;
+            if bytes_read == 0 {
+                break;
+            }
+            if decomp_tx2.send((buffer, bytes_read)).is_err() {
+                break; // Receiver dropped
+            }
+        }
+        Ok(())
+    });
 
     let mut batch_id = 0u64;
     let mut carryover1 = Vec::new();
     let mut carryover2 = Vec::new();
-    let mut buffer1 = vec![0u8; batch_bytes];
-    let mut buffer2 = vec![0u8; batch_bytes];
+    let mut buffer1 = vec![0u8; decomp_chunk_size];
+    let mut buffer2 = vec![0u8; decomp_chunk_size];
 
     loop {
-        // Read chunks from both files
-        let bytes_read1 = reader1.read(&mut buffer1)?;
-        let bytes_read2 = reader2.read(&mut buffer2)?;
+        // Receive pre-decompressed chunks from parallel decompressor threads
+        let (chunk1, bytes_read1) = match decomp_rx1.recv() {
+            Ok(data) => data,
+            Err(_) => (Vec::new(), 0), // Channel closed = EOF
+        };
+        let (chunk2, bytes_read2) = match decomp_rx2.recv() {
+            Ok(data) => data,
+            Err(_) => (Vec::new(), 0), // Channel closed = EOF
+        };
+
+        // Copy received data into our reusable buffers
+        if bytes_read1 > buffer1.len() {
+            buffer1.resize(bytes_read1, 0);
+        }
+        if bytes_read2 > buffer2.len() {
+            buffer2.resize(bytes_read2, 0);
+        }
+        buffer1[..bytes_read1].copy_from_slice(&chunk1[..bytes_read1]);
+        buffer2[..bytes_read2].copy_from_slice(&chunk2[..bytes_read2]);
 
         // Prepend carryover for R1
         let carryover_len1 = carryover1.len();
@@ -821,17 +899,12 @@ pub(crate) fn paired_producer_thread(
                 } else {
                     adjusted_complete_len1 = 0;
                 }
+                adjusted_complete_len2 = complete_len2;
             } else {
-                adjusted_complete_len1 = complete_len1;
-            }
-
-            if recs2.len() > num_pairs {
                 // R2 has more records - truncate and save excess to carryover
                 recs2.truncate(num_pairs);
-                // Find the byte position after the last record we're keeping
                 if num_pairs > 0 {
                     let last_rec = recs2[num_pairs - 1];
-                    // Find end of last record (after 4th line's newline)
                     adjusted_complete_len2 = buffer2[last_rec[3]..complete_len2]
                         .iter()
                         .position(|&b| b == b'\n')
@@ -840,23 +913,30 @@ pub(crate) fn paired_producer_thread(
                 } else {
                     adjusted_complete_len2 = 0;
                 }
-            } else {
-                adjusted_complete_len2 = complete_len2;
+                adjusted_complete_len1 = complete_len1;
+            }
+
+            // Save excess data to carryover
+            if adjusted_complete_len1 < actual_len1 {
+                carryover1.extend_from_slice(&buffer1[adjusted_complete_len1..actual_len1]);
+            }
+            if adjusted_complete_len2 < actual_len2 {
+                carryover2.extend_from_slice(&buffer2[adjusted_complete_len2..actual_len2]);
             }
         } else {
+            // Same number of records - use all complete data
             adjusted_complete_len1 = complete_len1;
             adjusted_complete_len2 = complete_len2;
+
+            // Save incomplete data to carryover
+            if complete_len1 < actual_len1 {
+                carryover1.extend_from_slice(&buffer1[complete_len1..actual_len1]);
+            }
+            if complete_len2 < actual_len2 {
+                carryover2.extend_from_slice(&buffer2[complete_len2..actual_len2]);
+            }
         }
 
-        // Save incomplete parts for next iteration
-        if !is_eof1 && adjusted_complete_len1 < actual_len1 {
-            carryover1 = buffer1[adjusted_complete_len1..actual_len1].to_vec();
-        }
-        if !is_eof2 && adjusted_complete_len2 < actual_len2 {
-            carryover2 = buffer2[adjusted_complete_len2..actual_len2].to_vec();
-        }
-
-        // Send batch if we have records
         if !recs1.is_empty() {
             let batch = PairedBatch {
                 id: batch_id,
@@ -865,17 +945,11 @@ pub(crate) fn paired_producer_thread(
                 recs_r1: recs1,
                 recs_r2: recs2,
             };
+            batch_id += 1;
 
             if sender.send(Some(batch)).is_err() {
                 break; // Receiver disconnected
             }
-
-            batch_id += 1;
-        }
-
-        // Break if both files reached EOF
-        if is_eof1 && is_eof2 {
-            break;
         }
     }
 
@@ -895,22 +969,22 @@ fn parse_fastq_buffer(
         return Ok((0, Vec::new()));
     }
 
-    // Single-pass scan: find complete records AND line starts
+    // SIMD-accelerated newline search using memchr (10-50x faster than naive loop)
     let mut complete_end = 0;
     let mut line_count = 0;
-    let mut line_starts = vec![0];
+    let mut line_starts = Vec::with_capacity(actual_len / 100); // Pre-allocate for ~100 byte lines
+    line_starts.push(0);
 
-    for i in 0..actual_len {
-        if buffer[i] == b'\n' {
-            line_count += 1;
-            // After every 4 lines, we have a complete record
-            if line_count % 4 == 0 {
-                complete_end = i + 1;
-            }
-            // Track line starts for parsing
-            if i + 1 < actual_len {
-                line_starts.push(i + 1);
-            }
+    // Use memchr to find all newlines with SIMD
+    for newline_pos in memchr::memchr_iter(b'\n', &buffer[..actual_len]) {
+        line_count += 1;
+        // After every 4 lines, we have a complete record
+        if line_count % 4 == 0 {
+            complete_end = newline_pos + 1;
+        }
+        // Track line starts for parsing
+        if newline_pos + 1 < actual_len {
+            line_starts.push(newline_pos + 1);
         }
     }
 
@@ -973,6 +1047,7 @@ pub(crate) fn paired_worker_thread(
     overlap_config: Option<crate::overlap::OverlapConfig>,
     umi_config: Option<crate::umi::UmiConfig>,
     dedup_config: Option<crate::dedup::DedupConfig>,
+    dup_detector: Option<std::sync::Arc<crate::bloom::DuplicateDetector>>,
 ) {
     // Initialize dedup tracker if deduplication is enabled
     let mut dedup_tracker = if let Some(ref cfg) = dedup_config {
@@ -1026,6 +1101,12 @@ pub(crate) fn paired_worker_thread(
             if seq1.len() != qual1.len() || seq2.len() != qual2.len() {
                 invalid += 1;
                 continue;
+            }
+
+            // Track duplicates using Bloom filter (before any processing)
+            // This is for statistics only, not filtering
+            if let Some(ref detector) = dup_detector {
+                detector.check_pair(seq1, seq2);
             }
 
             // Extract UMI if enabled (happens BEFORE any other processing)
@@ -1109,7 +1190,13 @@ pub(crate) fn paired_worker_thread(
 
             // Compute stats for R1 (after UMI removal)
             let stats1 = simd::compute_stats(final_umi_seq1, final_umi_qual1, 0);
-            before_r1.add(final_umi_seq1.len(), stats1.q20, stats1.q30, stats1.gc);
+            before_r1.add(
+                final_umi_seq1.len(),
+                stats1.q20,
+                stats1.q30,
+                stats1.q40,
+                stats1.gc,
+            );
             update_position_stats(&mut pos_r1, final_umi_seq1, final_umi_qual1);
             if !no_kmer {
                 count_k5_2bit(final_umi_seq1, &mut k5_r1);
@@ -1117,39 +1204,133 @@ pub(crate) fn paired_worker_thread(
 
             // Compute stats for R2 (after UMI removal)
             let stats2 = simd::compute_stats(final_umi_seq2, final_umi_qual2, 0);
-            before_r2.add(final_umi_seq2.len(), stats2.q20, stats2.q30, stats2.gc);
+            before_r2.add(
+                final_umi_seq2.len(),
+                stats2.q20,
+                stats2.q30,
+                stats2.q40,
+                stats2.gc,
+            );
             update_position_stats(&mut pos_r2, final_umi_seq2, final_umi_qual2);
             if !no_kmer {
                 count_k5_2bit(final_umi_seq2, &mut k5_r2);
             }
 
-            // Apply trimming to R1 (after UMI removal)
-            let trim_result1 = if trimming_config_r1.is_enabled() {
-                trim_read(final_umi_seq1, final_umi_qual1, &trimming_config_r1)
-            } else {
-                TrimmingResult {
-                    start_pos: 0,
-                    end_pos: final_umi_seq1.len(),
-                    poly_g_trimmed: 0,
-                    poly_x_trimmed: 0,
-                    adapter_trimmed: false,
-                    adapter_bases_trimmed: 0,
-                }
+            // Always detect overlap for paired-end adapter trimming (fastp does this)
+            // Overlap-based trimming works even when adapters aren't detected via k-mer analysis
+            let overlap_result = {
+                let overlap_detect_config = crate::overlap::OverlapConfig {
+                    min_overlap_len: 30, // fastp default (options.cpp:overlapRequire = 30)
+                    max_diff: 5,
+                    max_diff_percent: 20,
+                };
+                crate::overlap::detect_overlap(
+                    final_umi_seq1,
+                    final_umi_seq2,
+                    &overlap_detect_config,
+                )
             };
 
-            // Apply trimming to R2 (after UMI removal)
-            let trim_result2 = if trimming_config_r2.is_enabled() {
-                trim_read(final_umi_seq2, final_umi_qual2, &trimming_config_r2)
+            // Try overlap-based adapter trimming first
+            // Always use overlap-based trimming when overlap is detected (fastp does this)
+            let overlap_trimmed = if let Some(ref overlap) = overlap_result {
+                let trim_result = crate::overlap::trim_by_overlap_analysis(
+                    final_umi_seq1.len(),
+                    final_umi_seq2.len(),
+                    overlap,
+                );
+                trim_result
             } else {
-                TrimmingResult {
-                    start_pos: 0,
-                    end_pos: final_umi_seq2.len(),
-                    poly_g_trimmed: 0,
-                    poly_x_trimmed: 0,
-                    adapter_trimmed: false,
-                    adapter_bases_trimmed: 0,
-                }
+                None
             };
+
+            // Apply trimming to R1 and R2 (after UMI removal)
+            let mut trim_result1;
+            let mut trim_result2;
+
+            if let Some((overlap_trim_len1, overlap_trim_len2)) = overlap_trimmed {
+                // Overlap-based adapter trimming succeeded
+                // Still need to apply other trimming (poly-G, quality, etc.)
+                // but skip adapter trimming since we already did it with overlap
+
+                // Temporarily disable adapter trimming for other trims
+                let mut temp_config1 = trimming_config_r1.clone();
+                let mut temp_config2 = trimming_config_r2.clone();
+                temp_config1.adapter_config.adapter_seq = None;
+                temp_config2.adapter_config.adapter_seq = None;
+                temp_config2.adapter_config.adapter_seq_r2 = None;
+
+                trim_result1 = if trimming_config_r1.is_enabled() {
+                    trim_read(final_umi_seq1, final_umi_qual1, &temp_config1)
+                } else {
+                    TrimmingResult {
+                        start_pos: 0,
+                        end_pos: final_umi_seq1.len(),
+                        poly_g_trimmed: 0,
+                        poly_x_trimmed: 0,
+                        adapter_trimmed: false,
+                        adapter_bases_trimmed: 0,
+                    }
+                };
+
+                trim_result2 = if trimming_config_r2.is_enabled() {
+                    trim_read(final_umi_seq2, final_umi_qual2, &temp_config2)
+                } else {
+                    TrimmingResult {
+                        start_pos: 0,
+                        end_pos: final_umi_seq2.len(),
+                        poly_g_trimmed: 0,
+                        poly_x_trimmed: 0,
+                        adapter_trimmed: false,
+                        adapter_bases_trimmed: 0,
+                    }
+                };
+
+                // Apply overlap-based adapter trim lengths
+                // Track the end position before overlap trim to calculate adapter bases correctly
+                let end_before_overlap1 = trim_result1.end_pos;
+                let end_before_overlap2 = trim_result2.end_pos;
+
+                trim_result1.end_pos = std::cmp::min(trim_result1.end_pos, overlap_trim_len1);
+                trim_result2.end_pos = std::cmp::min(trim_result2.end_pos, overlap_trim_len2);
+
+                // Mark as adapter trimmed (only count bases trimmed beyond other trims)
+                if trim_result1.end_pos < end_before_overlap1 {
+                    trim_result1.adapter_trimmed = true;
+                    trim_result1.adapter_bases_trimmed = end_before_overlap1 - trim_result1.end_pos;
+                }
+                if trim_result2.end_pos < end_before_overlap2 {
+                    trim_result2.adapter_trimmed = true;
+                    trim_result2.adapter_bases_trimmed = end_before_overlap2 - trim_result2.end_pos;
+                }
+            } else {
+                // No overlap-based trimming - use normal adapter trimming
+                trim_result1 = if trimming_config_r1.is_enabled() {
+                    trim_read(final_umi_seq1, final_umi_qual1, &trimming_config_r1)
+                } else {
+                    TrimmingResult {
+                        start_pos: 0,
+                        end_pos: final_umi_seq1.len(),
+                        poly_g_trimmed: 0,
+                        poly_x_trimmed: 0,
+                        adapter_trimmed: false,
+                        adapter_bases_trimmed: 0,
+                    }
+                };
+
+                trim_result2 = if trimming_config_r2.is_enabled() {
+                    trim_read(final_umi_seq2, final_umi_qual2, &trimming_config_r2)
+                } else {
+                    TrimmingResult {
+                        start_pos: 0,
+                        end_pos: final_umi_seq2.len(),
+                        poly_g_trimmed: 0,
+                        poly_x_trimmed: 0,
+                        adapter_trimmed: false,
+                        adapter_bases_trimmed: 0,
+                    }
+                };
+            }
 
             // Track adapter trimming stats (count each read individually)
             if trim_result1.adapter_trimmed {
@@ -1238,13 +1419,7 @@ pub(crate) fn paired_worker_thread(
             let trimmed_stats2 =
                 simd::compute_stats(final_seq2, final_qual2, qualified_quality_phred);
 
-            // Check N limit (EITHER read too many N = BOTH fail)
-            if trimmed_stats1.ncnt > n_limit || trimmed_stats2.ncnt > n_limit {
-                too_many_n += 1;
-                continue;
-            }
-
-            // Check unqualified percent (EITHER read fails = BOTH fail)
+            // Check unqualified percent FIRST to match fastp order (EITHER read fails = BOTH fail)
             let mut fail_quality = false;
             if qualified_quality_phred > 0 {
                 if !final_seq1.is_empty()
@@ -1259,6 +1434,17 @@ pub(crate) fn paired_worker_thread(
                 {
                     fail_quality = true;
                 }
+            }
+
+            if fail_quality {
+                low_quality += 1;
+                continue;
+            }
+
+            // Check N limit SECOND (EITHER read too many N = BOTH fail)
+            if trimmed_stats1.ncnt > n_limit || trimmed_stats2.ncnt > n_limit {
+                too_many_n += 1;
+                continue;
             }
 
             // Check average quality (EITHER read fails = BOTH fail)
@@ -1439,12 +1625,14 @@ pub(crate) fn paired_worker_thread(
                 final_seq1.len(),
                 trimmed_stats1.q20,
                 trimmed_stats1.q30,
+                trimmed_stats1.q40,
                 trimmed_stats1.gc,
             );
             after_r2.add(
                 final_seq2.len(),
                 trimmed_stats2.q20,
                 trimmed_stats2.q30,
+                trimmed_stats2.q40,
                 trimmed_stats2.gc,
             );
 
@@ -1555,14 +1743,24 @@ pub(crate) fn paired_merger_thread(
     num_workers: usize,
     compression_level: Option<u32>,
     split_config: crate::split::SplitConfig,
+    parallel_compression: bool,
 ) -> Result<crate::processor::PairedEndAccumulator> {
     use std::io::Write;
 
     // Create split writers
     let compression = compression_level.unwrap_or(6);
-    let mut writer1 =
-        crate::split::SplitWriter::new(&output1_path, split_config.clone(), compression)?;
-    let mut writer2 = crate::split::SplitWriter::new(&output2_path, split_config, compression)?;
+    let mut writer1 = crate::split::SplitWriter::new(
+        &output1_path,
+        split_config.clone(),
+        compression,
+        parallel_compression,
+    )?;
+    let mut writer2 = crate::split::SplitWriter::new(
+        &output2_path,
+        split_config,
+        compression,
+        parallel_compression,
+    )?;
 
     let mut acc = crate::processor::PairedEndAccumulator::new();
     let mut next_id = 0u64;
@@ -1676,12 +1874,14 @@ pub(crate) fn paired_merger_thread(
                     acc.before_r1.total_bases += result.before_r1.total_bases;
                     acc.before_r1.q20_bases += result.before_r1.q20_bases;
                     acc.before_r1.q30_bases += result.before_r1.q30_bases;
+                    acc.before_r1.q40_bases += result.before_r1.q40_bases;
                     acc.before_r1.gc_bases += result.before_r1.gc_bases;
 
                     acc.after_r1.total_reads += result.after_r1.total_reads;
                     acc.after_r1.total_bases += result.after_r1.total_bases;
                     acc.after_r1.q20_bases += result.after_r1.q20_bases;
                     acc.after_r1.q30_bases += result.after_r1.q30_bases;
+                    acc.after_r1.q40_bases += result.after_r1.q40_bases;
                     acc.after_r1.gc_bases += result.after_r1.gc_bases;
 
                     // Merge stats - R2
@@ -1689,12 +1889,14 @@ pub(crate) fn paired_merger_thread(
                     acc.before_r2.total_bases += result.before_r2.total_bases;
                     acc.before_r2.q20_bases += result.before_r2.q20_bases;
                     acc.before_r2.q30_bases += result.before_r2.q30_bases;
+                    acc.before_r2.q40_bases += result.before_r2.q40_bases;
                     acc.before_r2.gc_bases += result.before_r2.gc_bases;
 
                     acc.after_r2.total_reads += result.after_r2.total_reads;
                     acc.after_r2.total_bases += result.after_r2.total_bases;
                     acc.after_r2.q20_bases += result.after_r2.q20_bases;
                     acc.after_r2.q30_bases += result.after_r2.q30_bases;
+                    acc.after_r2.q40_bases += result.after_r2.q40_bases;
                     acc.after_r2.gc_bases += result.after_r2.gc_bases;
 
                     // Merge position stats - R1

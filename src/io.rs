@@ -10,6 +10,9 @@ use anyhow::{Context, Result};
 use flate2::Compression;
 use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
+use gzp::ZWriter;
+use gzp::deflate::Gzip;
+use gzp::par::compress::{ParCompress, ParCompressBuilder};
 use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Write};
 
@@ -61,6 +64,7 @@ pub(crate) fn open_input(path: &str) -> Result<Box<dyn BufRead + Send>> {
         match format {
             CompressionFormat::Gzip => {
                 let decoder = GzDecoder::new(file);
+                // Use same 16MB buffer as uncompressed - decompression is fast enough
                 let reader = BufReader::with_capacity(16 * 1024 * 1024, decoder);
                 Ok(Box::new(reader))
             }
@@ -76,6 +80,7 @@ pub(crate) fn open_input(path: &str) -> Result<Box<dyn BufRead + Send>> {
 pub enum OutputWriter {
     Plain(BufWriter<File>),
     Gzip(BufWriter<GzEncoder<File>>),
+    ParGzip(ParCompress<Gzip>),
     Stdout(BufWriter<std::io::Stdout>),
 }
 
@@ -84,6 +89,7 @@ impl Write for OutputWriter {
         match self {
             OutputWriter::Plain(w) => w.write(buf),
             OutputWriter::Gzip(w) => w.write(buf),
+            OutputWriter::ParGzip(w) => w.write(buf),
             OutputWriter::Stdout(w) => w.write(buf),
         }
     }
@@ -92,6 +98,7 @@ impl Write for OutputWriter {
         match self {
             OutputWriter::Plain(w) => w.flush(),
             OutputWriter::Gzip(w) => w.flush(),
+            OutputWriter::ParGzip(w) => w.flush(),
             OutputWriter::Stdout(w) => w.flush(),
         }
     }
@@ -111,6 +118,13 @@ impl OutputWriter {
                 encoder.finish().context("Failed to finish gzip encoding")?;
                 Ok(())
             }
+            OutputWriter::ParGzip(mut w) => {
+                // MUST call finish() before ParCompress goes out of scope
+                w.flush().context("Failed to flush parallel gzip writer")?;
+                w.finish()
+                    .context("Failed to finish parallel gzip compression")?;
+                Ok(())
+            }
             OutputWriter::Stdout(mut w) => {
                 w.flush()?;
                 Ok(())
@@ -120,7 +134,11 @@ impl OutputWriter {
 }
 
 /// Open output file or stdout with optional compression
-pub(crate) fn open_output(path: &str, compression_level: Option<u32>) -> Result<OutputWriter> {
+pub(crate) fn open_output(
+    path: &str,
+    compression_level: Option<u32>,
+    parallel: bool,
+) -> Result<OutputWriter> {
     if path == "-" {
         // Write to stdout
         let stdout = std::io::stdout();
@@ -134,10 +152,23 @@ pub(crate) fn open_output(path: &str, compression_level: Option<u32>) -> Result<
         match format {
             CompressionFormat::Gzip => {
                 let level = compression_level.unwrap_or(6); // Default to level 6
-                let compression = Compression::new(level);
-                let encoder = GzEncoder::new(file, compression);
-                let writer = BufWriter::with_capacity(16 * 1024 * 1024, encoder);
-                Ok(OutputWriter::Gzip(writer))
+
+                if parallel {
+                    // Use parallel compression (4-8 threads)
+                    let num_threads = (num_cpus::get() / 2).max(4).min(8);
+                    let compressor = ParCompressBuilder::<Gzip>::new()
+                        .compression_level(gzp::Compression::new(level))
+                        .num_threads(num_threads)
+                        .context("Failed to set number of threads for parallel compression")?
+                        .from_writer(file);
+                    Ok(OutputWriter::ParGzip(compressor))
+                } else {
+                    // Use standard single-threaded
+                    let compression = Compression::new(level);
+                    let encoder = GzEncoder::new(file, compression);
+                    let writer = BufWriter::with_capacity(16 * 1024 * 1024, encoder);
+                    Ok(OutputWriter::Gzip(writer))
+                }
             }
             CompressionFormat::None => {
                 let writer = BufWriter::with_capacity(16 * 1024 * 1024, file);

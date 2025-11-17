@@ -770,7 +770,9 @@ fn write_insert_size_chart(html: &mut String, insert_size: &InsertSizeStats) {
 
     html.push_str("var data = [trace];\n");
     html.push_str("var layout = {\n");
-    html.push_str("  xaxis: {title: 'Insert size (bp)', color: '#c0c0c0', gridcolor: '#3a3a3a'},\n");
+    html.push_str(
+        "  xaxis: {title: 'Insert size (bp)', color: '#c0c0c0', gridcolor: '#3a3a3a'},\n",
+    );
     html.push_str("  yaxis: {title: 'Read pairs', color: '#c0c0c0', gridcolor: '#3a3a3a'},\n");
     html.push_str("  margin: {l: 60, r: 30, t: 30, b: 50},\n");
     html.push_str("  showlegend: false,\n");

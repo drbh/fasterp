@@ -14,6 +14,7 @@ use std::io::{BufWriter, Write};
 use std::thread;
 
 mod adapter;
+mod bloom;
 mod dedup;
 mod html;
 mod io;
@@ -121,12 +122,16 @@ struct Args {
     #[arg(short = 'z', long)]
     compression_level: Option<u32>,
 
+    /// Use parallel compression for gzip output (default: true, disable with --no-parallel-compression)
+    #[arg(long, default_value = "true", action = clap::ArgAction::Set)]
+    parallel_compression: bool,
+
     /// Number of worker threads (default: auto-detect CPU count)
     #[arg(short = 'w', long)]
     threads: Option<usize>,
 
-    /// Batch size in bytes (default: 16 MiB)
-    #[arg(long, default_value = "16777216")]
+    /// Batch size in bytes (default: 32 MiB)
+    #[arg(long, default_value = "33554432")]
     batch_bytes: usize,
 
     /// Maximum backlog of batches (default: threads+1)
@@ -266,9 +271,13 @@ struct Args {
     #[arg(short = 'D', long)]
     dedup: bool,
 
-    /// Deduplication accuracy (1-6). Higher = more memory but fewer false positives (default: 5)
-    #[arg(long, default_value = "5")]
-    dedup_accuracy: u8,
+    /// Deduplication accuracy (1-6). Higher = more memory but fewer false positives (default: 3 for dedup, 1 otherwise)
+    #[arg(long, default_value = "0")]
+    dup_calc_accuracy: u8,
+
+    /// Don't evaluate duplication rate (saves time and memory)
+    #[arg(long)]
+    dont_eval_duplication: bool,
 
     /// Split output by limiting total number of files (2-999). Cannot be used with --split-by-lines
     #[arg(short = 's', long, conflicts_with = "split_by_lines")]
@@ -452,14 +461,10 @@ fn create_dedup_config(args: &Args) -> Result<dedup::DedupConfig> {
         return Ok(dedup::DedupConfig::default());
     }
 
-    // Validate accuracy level
-    if args.dedup_accuracy < 1 || args.dedup_accuracy > 6 {
-        anyhow::bail!("Deduplication accuracy must be between 1 and 6 (default: 5)");
-    }
-
+    // Dedup uses HashSet-based approach with default accuracy
     Ok(dedup::DedupConfig {
         enabled: true,
-        accuracy: args.dedup_accuracy,
+        accuracy: 5, // Default accuracy for HashSet-based dedup
     })
 }
 
@@ -502,6 +507,7 @@ fn build_and_write_paired_end_report(
     args: &Args,
     pe_acc: PairedEndAccumulator,
     start_time: std::time::Instant,
+    dup_detector: &Option<std::sync::Arc<bloom::DuplicateDetector>>,
 ) -> Result<()> {
     let before_stats_r1 = pe_acc.before_r1.to_read_stats();
     let after_stats_r1 = pe_acc.after_r1.to_read_stats();
@@ -525,10 +531,15 @@ fn build_and_write_paired_end_report(
     let kmer_map_r1_after = pe_acc.kmer_table_to_map_r1_after();
     let kmer_map_r2_after = pe_acc.kmer_table_to_map_r2_after();
 
-    // Calculate duplication rate from combined kmer counts
-    let dup_rate_r1 = stats::calculate_duplication_rate(&kmer_map_r1);
-    let dup_rate_r2 = stats::calculate_duplication_rate(&kmer_map_r2);
-    let combined_dup_rate = (dup_rate_r1 + dup_rate_r2) / 2.0;
+    // Calculate duplication rate
+    // Use Bloom filter if available (matches fastp), otherwise fall back to kmer-based estimation
+    let combined_dup_rate = if let Some(detector) = &dup_detector {
+        detector.get_dup_rate()
+    } else {
+        let dup_rate_r1 = stats::calculate_duplication_rate(&kmer_map_r1);
+        let dup_rate_r2 = stats::calculate_duplication_rate(&kmer_map_r2);
+        (dup_rate_r1 + dup_rate_r2) / 2.0
+    };
 
     // Calculate combined before/after stats for summary
     let combined_before = ReadStats {
@@ -537,6 +548,7 @@ fn build_and_write_paired_end_report(
         total_bases: before_stats_r1.total_bases + before_stats_r2.total_bases,
         q20_bases: before_stats_r1.q20_bases + before_stats_r2.q20_bases,
         q30_bases: before_stats_r1.q30_bases + before_stats_r2.q30_bases,
+        q40_bases: before_stats_r1.q40_bases + before_stats_r2.q40_bases,
         q20_rate: if before_stats_r1.total_bases + before_stats_r2.total_bases > 0 {
             (before_stats_r1.q20_bases + before_stats_r2.q20_bases) as f64
                 / (before_stats_r1.total_bases + before_stats_r2.total_bases) as f64
@@ -545,6 +557,12 @@ fn build_and_write_paired_end_report(
         },
         q30_rate: if before_stats_r1.total_bases + before_stats_r2.total_bases > 0 {
             (before_stats_r1.q30_bases + before_stats_r2.q30_bases) as f64
+                / (before_stats_r1.total_bases + before_stats_r2.total_bases) as f64
+        } else {
+            0.0
+        },
+        q40_rate: if before_stats_r1.total_bases + before_stats_r2.total_bases > 0 {
+            (before_stats_r1.q40_bases + before_stats_r2.q40_bases) as f64
                 / (before_stats_r1.total_bases + before_stats_r2.total_bases) as f64
         } else {
             0.0
@@ -570,6 +588,7 @@ fn build_and_write_paired_end_report(
         total_bases: after_stats_r1.total_bases + after_stats_r2.total_bases,
         q20_bases: after_stats_r1.q20_bases + after_stats_r2.q20_bases,
         q30_bases: after_stats_r1.q30_bases + after_stats_r2.q30_bases,
+        q40_bases: after_stats_r1.q40_bases + after_stats_r2.q40_bases,
         q20_rate: if after_stats_r1.total_bases + after_stats_r2.total_bases > 0 {
             (after_stats_r1.q20_bases + after_stats_r2.q20_bases) as f64
                 / (after_stats_r1.total_bases + after_stats_r2.total_bases) as f64
@@ -578,6 +597,12 @@ fn build_and_write_paired_end_report(
         },
         q30_rate: if after_stats_r1.total_bases + after_stats_r2.total_bases > 0 {
             (after_stats_r1.q30_bases + after_stats_r2.q30_bases) as f64
+                / (after_stats_r1.total_bases + after_stats_r2.total_bases) as f64
+        } else {
+            0.0
+        },
+        q40_rate: if after_stats_r1.total_bases + after_stats_r2.total_bases > 0 {
+            (after_stats_r1.q40_bases + after_stats_r2.q40_bases) as f64
                 / (after_stats_r1.total_bases + after_stats_r2.total_bases) as f64
         } else {
             0.0
@@ -606,6 +631,10 @@ fn build_and_write_paired_end_report(
             ),
             before_filtering: combined_before,
             after_filtering: combined_after,
+            read1_before_filtering: Some(before_stats_r1.clone()),
+            read2_before_filtering: Some(before_stats_r2.clone()),
+            read1_after_filtering: Some(after_stats_r1.clone()),
+            read2_after_filtering: Some(after_stats_r2.clone()),
         },
         filtering_result: FilteringResult {
             // Count both R1 and R2 reads to match fastp's behavior
@@ -736,7 +765,11 @@ fn print_read_stats(title: &str, stats: &ReadStats) {
         stats.q30_bases,
         stats.q30_rate * 100.0
     );
-    eprintln!("Q40 bases: 0(0%)");
+    eprintln!(
+        "Q40 bases: {}({:.4}%)",
+        stats.q40_bases,
+        stats.q40_rate * 100.0
+    );
 }
 
 /// Print filtering results
@@ -808,17 +841,31 @@ fn print_report_to_stdout(
     }
     eprintln!();
 
-    // Before/after stats for read1
-    print_read_stats("Read1 before filtering", &report.summary.before_filtering);
-    eprintln!();
-    print_read_stats("Read1 after filtering", &report.summary.after_filtering);
-    eprintln!();
-
-    // If paired-end, print read2 stats
+    // Before/after stats
     if is_paired_end {
-        // Note: For PE, we'd need separate read2 stats which aren't currently
-        // separated in the summary. For now, just print read1 stats.
-        // TODO: Add separate read2 before/after stats to Summary
+        // For paired-end, print separate Read1 and Read2 stats
+        if let Some(ref r1_before) = report.summary.read1_before_filtering {
+            print_read_stats("Read1 before filtering", r1_before);
+            eprintln!();
+        }
+        if let Some(ref r2_before) = report.summary.read2_before_filtering {
+            print_read_stats("Read2 before filtering", r2_before);
+            eprintln!();
+        }
+        if let Some(ref r1_after) = report.summary.read1_after_filtering {
+            print_read_stats("Read1 after filtering", r1_after);
+            eprintln!();
+        }
+        if let Some(ref r2_after) = report.summary.read2_after_filtering {
+            print_read_stats("Read2 after filtering", r2_after);
+            eprintln!();
+        }
+    } else {
+        // For single-end, print combined stats
+        print_read_stats("Read1 before filtering", &report.summary.before_filtering);
+        eprintln!();
+        print_read_stats("Read1 after filtering", &report.summary.after_filtering);
+        eprintln!();
     }
 
     // Filtering results
@@ -1046,7 +1093,9 @@ fn main() -> Result<()> {
     }
 
     // Determine number of threads
-    let num_threads = args.threads.unwrap_or_else(num_cpus::get);
+    let mut num_threads = args.threads.unwrap_or_else(num_cpus::get);
+
+    println!("Using {} thread(s) for processing", num_threads);
 
     // Validate merge arguments
     if args.merge {
@@ -1085,6 +1134,21 @@ fn main() -> Result<()> {
     // Create deduplication configuration from CLI args
     let dedup_config = if args.dedup {
         Some(create_dedup_config(&args)?)
+    } else {
+        None
+    };
+
+    // Create duplicate detector for calculating duplication rate (separate from dedup)
+    // Uses Bloom filter matching fastp's implementation
+    let dup_detector = if !args.dont_eval_duplication {
+        let accuracy = if args.dup_calc_accuracy > 0 {
+            args.dup_calc_accuracy
+        } else if args.dedup {
+            3 // Default to 3 when dedup is enabled
+        } else {
+            1 // Default to 1 otherwise (lower memory usage)
+        };
+        Some(std::sync::Arc::new(bloom::DuplicateDetector::new(accuracy)))
     } else {
         None
     };
@@ -1160,12 +1224,17 @@ fn main() -> Result<()> {
 
             // Create split writers
             let compression = args.compression_level.unwrap_or(6);
-            let mut writer1 =
-                split::SplitWriter::new(&args.output, split_config.clone(), compression)?;
+            let mut writer1 = split::SplitWriter::new(
+                &args.output,
+                split_config.clone(),
+                compression,
+                args.parallel_compression,
+            )?;
             let mut writer2 = split::SplitWriter::new(
                 args.output2.as_ref().unwrap(),
                 split_config.clone(),
                 compression,
+                args.parallel_compression,
             )?;
 
             // Open merged output if merge mode enabled
@@ -1174,6 +1243,7 @@ fn main() -> Result<()> {
                     args.merged_out.as_ref().unwrap(),
                     split_config.clone(),
                     compression,
+                    args.parallel_compression,
                 )?)
             } else {
                 None
@@ -1199,6 +1269,7 @@ fn main() -> Result<()> {
                 overlap_config.as_ref(),
                 umi_config.as_ref(),
                 dedup_config.as_ref(),
+                dup_detector.as_ref(),
             )?;
 
             // Finish writers
@@ -1211,8 +1282,8 @@ fn main() -> Result<()> {
         } else {
             // MULTI-THREADED PAIRED-END MODE
             use crate::pipeline::{
-                PairedBatch, PairedWorkerResult, paired_merger_thread, paired_producer_thread,
-                paired_worker_thread,
+                PairedBatch, PairedWorkerResult, paired_merger_thread,
+                paired_producer_thread_with_paths, paired_worker_thread,
             };
             use crossbeam_channel::bounded;
 
@@ -1222,12 +1293,19 @@ fn main() -> Result<()> {
             let (batch_tx, batch_rx) = bounded::<Option<PairedBatch>>(backlog);
             let (result_tx, result_rx) = bounded::<Option<PairedWorkerResult>>(backlog);
 
-            // Spawn producer thread
-            let input_path1 = args.input.clone();
-            let input_path2 = args.input2.as_ref().unwrap().clone();
+            // Spawn producer thread with file paths (opens readers in thread to isolate GzDecoders)
             let batch_bytes = args.batch_bytes;
+            let num_workers = num_threads;
+            let input1_clone = args.input.clone();
+            let input2_clone = args.input2.as_ref().unwrap().clone();
             let producer = thread::spawn(move || {
-                paired_producer_thread(input_path1, input_path2, batch_bytes, batch_tx)
+                paired_producer_thread_with_paths(
+                    input1_clone,
+                    input2_clone,
+                    batch_bytes,
+                    batch_tx,
+                    num_workers,
+                )
             });
 
             // Spawn worker threads
@@ -1248,6 +1326,7 @@ fn main() -> Result<()> {
                 let overlap_config_clone = overlap_config.clone();
                 let umi_config_clone = umi_config.clone();
                 let dedup_config_clone = dedup_config.clone();
+                let dup_detector_clone = dup_detector.clone();
 
                 let worker = thread::spawn(move || {
                     paired_worker_thread(
@@ -1266,6 +1345,7 @@ fn main() -> Result<()> {
                         overlap_config_clone,
                         umi_config_clone,
                         dedup_config_clone,
+                        dup_detector_clone,
                     )
                 });
                 workers.push(worker);
@@ -1279,6 +1359,7 @@ fn main() -> Result<()> {
             let output_path1 = args.output.clone();
             let output_path2 = args.output2.as_ref().unwrap().clone();
             let compression_level = args.compression_level;
+            let parallel_compression = args.parallel_compression;
             let split_config_clone = split_config.clone();
             let merger = thread::spawn(move || {
                 paired_merger_thread(
@@ -1288,19 +1369,21 @@ fn main() -> Result<()> {
                     num_threads,
                     compression_level,
                     split_config_clone,
+                    parallel_compression,
                 )
             });
 
             // Wait for all threads
             producer.join().unwrap()?;
-            for worker in workers {
+            for (index, worker) in workers.into_iter().enumerate() {
+                println!("Waiting for worker thread {} to finish...", index);
                 worker.join().unwrap();
             }
             merger.join().unwrap()?
         };
 
         // Build paired-end report
-        build_and_write_paired_end_report(&args, pe_acc, start_time)?;
+        build_and_write_paired_end_report(&args, pe_acc, start_time, &dup_detector)?;
         return Ok(());
     }
 
@@ -1309,6 +1392,13 @@ fn main() -> Result<()> {
     // Perform adapter auto-detection if requested and no adapter specified
     // Skip auto-detection if input is stdin (can't rewind)
     let mut se_trimming_config = trimming_config;
+
+    // Enable auto-detection for SE mode by default (fastp does this for SE)
+    // Unlike PE mode which uses overlap-based detection
+    if !args.disable_adapter_detection && se_trimming_config.adapter_config.adapter_seq.is_none() {
+        se_trimming_config.adapter_config.detect_adapter_for_pe = true;
+    }
+
     if se_trimming_config.adapter_config.detect_adapter_for_pe
         && se_trimming_config.adapter_config.adapter_seq.is_none()
         && args.input != "-"
@@ -1351,7 +1441,12 @@ fn main() -> Result<()> {
 
         // Create split writer
         let compression = args.compression_level.unwrap_or(6);
-        let mut writer = split::SplitWriter::new(&args.output, split_config.clone(), compression)?;
+        let mut writer = split::SplitWriter::new(
+            &args.output,
+            split_config.clone(),
+            compression,
+            args.parallel_compression,
+        )?;
 
         let acc = process_fastq_stream(
             reader,
@@ -1421,6 +1516,7 @@ fn main() -> Result<()> {
         // Spawn merger thread
         let output_path = args.output.clone();
         let compression_level = args.compression_level;
+        let parallel_compression = args.parallel_compression;
         let split_config_clone = split_config.clone();
         let merger = thread::spawn(move || {
             merger_thread(
@@ -1429,6 +1525,7 @@ fn main() -> Result<()> {
                 num_threads,
                 compression_level,
                 split_config_clone,
+                parallel_compression,
             )
         });
 
@@ -1461,6 +1558,10 @@ fn main() -> Result<()> {
             sequencing: format!("single end ({} cycles)", acc.max_cycle),
             before_filtering: before_stats.clone(),
             after_filtering: after_stats.clone(),
+            read1_before_filtering: None,
+            read2_before_filtering: None,
+            read1_after_filtering: None,
+            read2_after_filtering: None,
         },
         filtering_result: FilteringResult {
             passed_filter_reads: acc.after.total_reads,

@@ -12,7 +12,7 @@ use rayon::prelude::*;
 use rustc_hash::FxHashMap;
 use std::cell::RefCell;
 use std::cmp::min;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 // Thread-local scratch buffers for adapter matching to avoid per-call heap allocations
 thread_local! {
@@ -39,8 +39,8 @@ impl AdapterConfig {
         Self {
             adapter_seq: None,
             adapter_seq_r2: None,
-            detect_adapter_for_pe: true, // fastp enables auto-detection by default
-            min_overlap: 5,              // fastp's default for adapter trimming
+            detect_adapter_for_pe: false, // fastp does NOT auto-detect for PE reads, only uses overlap-based trimming
+            min_overlap: 5,               // fastp's default for adapter trimming
             max_mismatches: 2,
         }
     }
@@ -91,8 +91,9 @@ pub fn detect_adapters_from_pe_reads<'a>(
         max_diff_percent: 20,
     };
 
-    let mut adapter_r1_counts: HashMap<Vec<u8>, usize> = HashMap::new();
-    let mut adapter_r2_counts: HashMap<Vec<u8>, usize> = HashMap::new();
+    // Use BTreeMap instead of HashMap for deterministic iteration order
+    let mut adapter_r1_counts: BTreeMap<Vec<u8>, usize> = BTreeMap::new();
+    let mut adapter_r2_counts: BTreeMap<Vec<u8>, usize> = BTreeMap::new();
     let mut total_reads = 0;
     let mut reads_with_adapters = 0;
 
@@ -163,7 +164,7 @@ pub fn detect_adapters_from_pe_reads<'a>(
 
 /// Find consensus adapter from frequency counts
 fn find_consensus_adapter(
-    adapter_counts: &HashMap<Vec<u8>, usize>,
+    adapter_counts: &BTreeMap<Vec<u8>, usize>,
     threshold: usize,
 ) -> Option<Vec<u8>> {
     if adapter_counts.is_empty() {
@@ -1428,7 +1429,7 @@ mod tests {
 
     #[test]
     fn test_consensus_adapter_selection() {
-        let mut adapter_counts = HashMap::new();
+        let mut adapter_counts = BTreeMap::new();
         adapter_counts.insert(b"AGATCGG".to_vec(), 5);
         adapter_counts.insert(b"AGATCGGAAGAGC".to_vec(), 100); // Most frequent
         adapter_counts.insert(b"TTTTTTT".to_vec(), 3);
@@ -1443,7 +1444,7 @@ mod tests {
 
     #[test]
     fn test_consensus_adapter_threshold() {
-        let mut adapter_counts = HashMap::new();
+        let mut adapter_counts = BTreeMap::new();
         adapter_counts.insert(b"AGATCGG".to_vec(), 5); // Below threshold of 10
 
         let result = find_consensus_adapter(&adapter_counts, 10);

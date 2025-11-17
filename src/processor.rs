@@ -299,7 +299,7 @@ impl StreamAccumulator {
 
         // Compute stats - use SIMD when available, otherwise single-pass
         let simd_available = simd::is_simd_available();
-        let (_qsum, q20, q30, _ncnt, gc) = if simd_available {
+        let (_qsum, q20, q30, q40, _ncnt, gc) = if simd_available {
             // SIMD path: compute basic stats fast, then position-specific
             let stats = simd::compute_stats(seq, qual, 0); // 0 = don't count unqualified for before stats
 
@@ -347,12 +347,15 @@ impl StreamAccumulator {
                 });
             }
 
-            (stats.qsum, stats.q20, stats.q30, stats.ncnt, stats.gc)
+            (
+                stats.qsum, stats.q20, stats.q30, stats.q40, stats.ncnt, stats.gc,
+            )
         } else {
             // Non-SIMD path: single pass for both basic and position stats
             let mut qsum = 0u32;
             let mut q20 = 0usize;
             let mut q30 = 0usize;
+            let mut q40 = 0usize;
             let mut ncnt = 0usize;
             let mut gc = 0usize;
 
@@ -391,6 +394,9 @@ impl StreamAccumulator {
                     if q >= 63 {
                         q30 += 1;
                     }
+                    if q >= 73 {
+                        q40 += 1;
+                    }
                     if b == b'N' || b == b'n' {
                         ncnt += 1;
                     }
@@ -414,14 +420,14 @@ impl StreamAccumulator {
                 });
             }
 
-            (qsum, q20, q30, ncnt, gc)
+            (qsum, q20, q30, q40, ncnt, gc)
         };
 
         // K-mer counting (also in the same pass conceptually, but separate loop for clarity)
         count_k5_2bit(seq, &mut self.kmer_table);
 
         // Update "before" stats
-        self.before.add(seq.len(), q20, q30, gc);
+        self.before.add(seq.len(), q20, q30, q40, gc);
 
         // Apply trimming if enabled
         let trimming_result = if trimming_config.is_enabled() {
@@ -459,6 +465,7 @@ impl StreamAccumulator {
         let trimmed_qsum = trimmed_stats.qsum;
         let trimmed_q20 = trimmed_stats.q20;
         let trimmed_q30 = trimmed_stats.q30;
+        let trimmed_q40 = trimmed_stats.q40;
         let trimmed_ncnt = trimmed_stats.ncnt;
         let trimmed_gc = trimmed_stats.gc;
         let unqualified_count = trimmed_stats.unqualified;
@@ -506,8 +513,13 @@ impl StreamAccumulator {
         writeln!(writer, "{}", std::str::from_utf8(trimmed_qual)?)?;
 
         // Update "after" stats with trimmed read stats
-        self.after
-            .add(trimmed_len, trimmed_q20, trimmed_q30, trimmed_gc);
+        self.after.add(
+            trimmed_len,
+            trimmed_q20,
+            trimmed_q30,
+            trimmed_q40,
+            trimmed_gc,
+        );
 
         // Track position stats for reads that passed filters (after filtering)
         track_position_stats(trimmed_seq, trimmed_qual, &mut self.pos_after)?;
@@ -523,12 +535,13 @@ impl StreamAccumulator {
     pub(crate) fn kmer_table_to_map(&self) -> IndexMap<String, usize> {
         let mut map = IndexMap::new();
         for code in 0..1024 {
-            // kmer_to_str returns &'static str from cache, we convert to String for the map
-            // This still allocates, but only once per unique kmer string (cached in kmer_to_str)
-            map.insert(
-                crate::kmer::kmer_to_str(code).to_string(),
-                self.kmer_table[code],
-            );
+            // Only include kmers that were actually seen (count > 0)
+            if self.kmer_table[code] > 0 {
+                map.insert(
+                    crate::kmer::kmer_to_str(code).to_string(),
+                    self.kmer_table[code],
+                );
+            }
         }
         map
     }
@@ -537,10 +550,13 @@ impl StreamAccumulator {
     pub(crate) fn kmer_table_after_to_map(&self) -> IndexMap<String, usize> {
         let mut map = IndexMap::new();
         for code in 0..1024 {
-            map.insert(
-                crate::kmer::kmer_to_str(code).to_string(),
-                self.kmer_table_after[code],
-            );
+            // Only include kmers that were actually seen (count > 0)
+            if self.kmer_table_after[code] > 0 {
+                map.insert(
+                    crate::kmer::kmer_to_str(code).to_string(),
+                    self.kmer_table_after[code],
+                );
+            }
         }
         map
     }
@@ -571,7 +587,7 @@ impl PairedEndAccumulator {
             max_cycle_r2: 0,
             adapter_trimmed_reads: 0,
             adapter_trimmed_bases: 0,
-            insert_size_histogram: vec![0; 512],  // Track insert sizes up to 512bp
+            insert_size_histogram: vec![0; 512], // Track insert sizes up to 512bp
             insert_size_unknown: 0,
         }
     }
@@ -580,10 +596,13 @@ impl PairedEndAccumulator {
     pub(crate) fn kmer_table_to_map_r1(&self) -> IndexMap<String, usize> {
         let mut map = IndexMap::new();
         for code in 0..1024 {
-            map.insert(
-                crate::kmer::kmer_to_str(code).to_string(),
-                self.kmer_table_r1[code],
-            );
+            // Only include kmers that were actually seen (count > 0)
+            if self.kmer_table_r1[code] > 0 {
+                map.insert(
+                    crate::kmer::kmer_to_str(code).to_string(),
+                    self.kmer_table_r1[code],
+                );
+            }
         }
         map
     }
@@ -591,10 +610,13 @@ impl PairedEndAccumulator {
     pub(crate) fn kmer_table_to_map_r2(&self) -> IndexMap<String, usize> {
         let mut map = IndexMap::new();
         for code in 0..1024 {
-            map.insert(
-                crate::kmer::kmer_to_str(code).to_string(),
-                self.kmer_table_r2[code],
-            );
+            // Only include kmers that were actually seen (count > 0)
+            if self.kmer_table_r2[code] > 0 {
+                map.insert(
+                    crate::kmer::kmer_to_str(code).to_string(),
+                    self.kmer_table_r2[code],
+                );
+            }
         }
         map
     }
@@ -602,10 +624,13 @@ impl PairedEndAccumulator {
     pub(crate) fn kmer_table_to_map_r1_after(&self) -> IndexMap<String, usize> {
         let mut map = IndexMap::new();
         for code in 0..1024 {
-            map.insert(
-                crate::kmer::kmer_to_str(code).to_string(),
-                self.kmer_table_r1_after[code],
-            );
+            // Only include kmers that were actually seen (count > 0)
+            if self.kmer_table_r1_after[code] > 0 {
+                map.insert(
+                    crate::kmer::kmer_to_str(code).to_string(),
+                    self.kmer_table_r1_after[code],
+                );
+            }
         }
         map
     }
@@ -613,10 +638,13 @@ impl PairedEndAccumulator {
     pub(crate) fn kmer_table_to_map_r2_after(&self) -> IndexMap<String, usize> {
         let mut map = IndexMap::new();
         for code in 0..1024 {
-            map.insert(
-                crate::kmer::kmer_to_str(code).to_string(),
-                self.kmer_table_r2_after[code],
-            );
+            // Only include kmers that were actually seen (count > 0)
+            if self.kmer_table_r2_after[code] > 0 {
+                map.insert(
+                    crate::kmer::kmer_to_str(code).to_string(),
+                    self.kmer_table_r2_after[code],
+                );
+            }
         }
         map
     }
@@ -711,6 +739,7 @@ pub(crate) fn process_paired_fastq_stream<
     overlap_config: Option<&crate::overlap::OverlapConfig>,
     umi_config: Option<&crate::umi::UmiConfig>,
     dedup_config: Option<&crate::dedup::DedupConfig>,
+    dup_detector: Option<&std::sync::Arc<crate::bloom::DuplicateDetector>>,
 ) -> Result<PairedEndAccumulator> {
     let mut acc = PairedEndAccumulator::new();
     let mut parser1 = FastqParser::new(reader1);
@@ -742,6 +771,12 @@ pub(crate) fn process_paired_fastq_stream<
                 if seq1.len() != qual1.len() || seq2.len() != qual2.len() {
                     acc.invalid += 1;
                     continue;
+                }
+
+                // Track duplicates using Bloom filter (before any processing)
+                // This is for statistics only, not filtering
+                if let Some(detector) = dup_detector {
+                    detector.check_pair(&seq1, &seq2);
                 }
 
                 // Extract UMI if enabled (happens BEFORE any other processing)
@@ -899,8 +934,13 @@ pub(crate) fn process_paired_fastq_stream<
                     &mut acc.pos_r1,
                     &mut acc.kmer_table_r1,
                 )?;
-                acc.before_r1
-                    .add(final_seq1.len(), stats1.q20, stats1.q30, stats1.gc);
+                acc.before_r1.add(
+                    final_seq1.len(),
+                    stats1.q20,
+                    stats1.q30,
+                    stats1.q40,
+                    stats1.gc,
+                );
 
                 // Process read2 statistics (before filtering, after UMI removal)
                 let stats2 = process_read_stats(
@@ -909,26 +949,36 @@ pub(crate) fn process_paired_fastq_stream<
                     &mut acc.pos_r2,
                     &mut acc.kmer_table_r2,
                 )?;
-                acc.before_r2
-                    .add(final_seq2.len(), stats2.q20, stats2.q30, stats2.gc);
+                acc.before_r2.add(
+                    final_seq2.len(),
+                    stats2.q20,
+                    stats2.q30,
+                    stats2.q40,
+                    stats2.gc,
+                );
 
-                // Detect overlap for adapter trimming (if adapters are enabled)
-                let overlap_result = if trimming_config_r1.adapter_config.is_enabled()
-                    || trimming_config_r2.adapter_config.is_enabled()
-                    || overlap_config.is_some()
-                {
-                    // Use default overlap config for adapter detection
-                    let overlap_detect_config = crate::overlap::OverlapConfig::default();
+                // Always detect overlap for paired-end adapter trimming (fastp does this)
+                // Overlap-based trimming works even when adapters aren't detected via k-mer analysis
+                let overlap_result = {
+                    let overlap_detect_config = crate::overlap::OverlapConfig {
+                        min_overlap_len: 30, // fastp default (options.cpp:overlapRequire = 30)
+                        max_diff: 5,
+                        max_diff_percent: 20,
+                    };
                     crate::overlap::detect_overlap(final_seq1, final_seq2, &overlap_detect_config)
-                } else {
-                    None
                 };
 
                 // Track insert size from overlap detection
                 if let Some(ref overlap) = overlap_result {
                     if overlap.overlapped {
-                        // Insert size = R1_length + R2_length - overlap_length
-                        let insert_size = final_seq1.len() + final_seq2.len() - overlap.overlap_len;
+                        // Insert size calculation depends on offset (fastp logic):
+                        // - offset > 0: reads don't fully overlap, use traditional formula
+                        // - offset <= 0: reads fully overlap with adapters, insert size = overlap_len
+                        let insert_size = if overlap.offset > 0 {
+                            final_seq1.len() + final_seq2.len() - overlap.overlap_len
+                        } else {
+                            overlap.overlap_len
+                        };
                         if insert_size < acc.insert_size_histogram.len() {
                             acc.insert_size_histogram[insert_size] += 1;
                         }
@@ -940,18 +990,13 @@ pub(crate) fn process_paired_fastq_stream<
                 }
 
                 // Try overlap-based adapter trimming first
+                // Always use overlap-based trimming when overlap is detected (fastp does this)
                 let overlap_trimmed = if let Some(ref overlap) = overlap_result {
-                    if (trimming_config_r1.adapter_config.is_enabled()
-                        || trimming_config_r2.adapter_config.is_enabled())
-                    {
-                        crate::overlap::trim_by_overlap_analysis(
-                            final_seq1.len(),
-                            final_seq2.len(),
-                            overlap,
-                        )
-                    } else {
-                        None
-                    }
+                    crate::overlap::trim_by_overlap_analysis(
+                        final_seq1.len(),
+                        final_seq2.len(),
+                        overlap,
+                    )
                 } else {
                     None
                 };
@@ -1250,6 +1295,7 @@ pub(crate) fn process_paired_fastq_stream<
                                     merged_seq.len(),
                                     merged_stats.q20,
                                     merged_stats.q30,
+                                    merged_stats.q40,
                                     merged_stats.gc,
                                 );
 
@@ -1284,12 +1330,14 @@ pub(crate) fn process_paired_fastq_stream<
                                 corrected_seq1.len(),
                                 trimmed_stats1.q20,
                                 trimmed_stats1.q30,
+                                trimmed_stats1.q40,
                                 trimmed_stats1.gc,
                             );
                             acc.after_r2.add(
                                 corrected_seq2.len(),
                                 trimmed_stats2.q20,
                                 trimmed_stats2.q30,
+                                trimmed_stats2.q40,
                                 trimmed_stats2.gc,
                             );
 
@@ -1330,12 +1378,14 @@ pub(crate) fn process_paired_fastq_stream<
                     corrected_seq1.len(),
                     trimmed_stats1.q20,
                     trimmed_stats1.q30,
+                    trimmed_stats1.q40,
                     trimmed_stats1.gc,
                 );
                 acc.after_r2.add(
                     corrected_seq2.len(),
                     trimmed_stats2.q20,
                     trimmed_stats2.q30,
+                    trimmed_stats2.q40,
                     trimmed_stats2.gc,
                 );
 
@@ -1403,6 +1453,7 @@ pub(crate) fn track_position_stats(seq: &[u8], qual: &[u8], pos: &mut PositionSt
 struct ReadStats {
     q20: usize,
     q30: usize,
+    q40: usize,
     gc: usize,
 }
 
@@ -1460,12 +1511,14 @@ fn process_read_stats(
         ReadStats {
             q20: s.q20,
             q30: s.q30,
+            q40: s.q40,
             gc: s.gc,
         }
     } else {
         // Non-SIMD path
         let mut q20 = 0usize;
         let mut q30 = 0usize;
+        let mut q40 = 0usize;
         let mut gc = 0usize;
 
         pos.ensure_capacity(seq.len());
@@ -1499,6 +1552,9 @@ fn process_read_stats(
                 if q >= 63 {
                     q30 += 1;
                 }
+                if q >= 73 {
+                    q40 += 1;
+                }
                 if b == b'G' || b == b'g' || b == b'C' || b == b'c' {
                     gc += 1;
                 }
@@ -1518,7 +1574,7 @@ fn process_read_stats(
             });
         }
 
-        ReadStats { q20, q30, gc }
+        ReadStats { q20, q30, q40, gc }
     };
 
     // K-mer counting

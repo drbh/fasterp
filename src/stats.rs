@@ -21,8 +21,10 @@ pub(crate) struct ReadStats {
     pub total_bases: usize,
     pub q20_bases: usize,
     pub q30_bases: usize,
+    pub q40_bases: usize,
     pub q20_rate: f64,
     pub q30_rate: f64,
+    pub q40_rate: f64,
     pub read1_mean_length: usize,
     pub gc_content: f64,
 }
@@ -78,6 +80,14 @@ pub(crate) struct Summary {
     pub sequencing: String,
     pub before_filtering: ReadStats,
     pub after_filtering: ReadStats,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub read1_before_filtering: Option<ReadStats>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub read2_before_filtering: Option<ReadStats>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub read1_after_filtering: Option<ReadStats>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub read2_after_filtering: Option<ReadStats>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -282,15 +292,17 @@ pub(crate) struct SimpleStats {
     pub total_bases: usize,
     pub q20_bases: usize,
     pub q30_bases: usize,
+    pub q40_bases: usize,
     pub gc_bases: usize,
 }
 
 impl SimpleStats {
-    pub(crate) fn add(&mut self, bases: usize, q20: usize, q30: usize, gc: usize) {
+    pub(crate) fn add(&mut self, bases: usize, q20: usize, q30: usize, q40: usize, gc: usize) {
         self.total_reads += 1;
         self.total_bases += bases;
         self.q20_bases += q20;
         self.q30_bases += q30;
+        self.q40_bases += q40;
         self.gc_bases += gc;
     }
 
@@ -300,6 +312,7 @@ impl SimpleStats {
             total_bases: self.total_bases,
             q20_bases: self.q20_bases,
             q30_bases: self.q30_bases,
+            q40_bases: self.q40_bases,
             q20_rate: if self.total_bases > 0 {
                 self.q20_bases as f64 / self.total_bases as f64
             } else {
@@ -307,6 +320,11 @@ impl SimpleStats {
             },
             q30_rate: if self.total_bases > 0 {
                 self.q30_bases as f64 / self.total_bases as f64
+            } else {
+                0.0
+            },
+            q40_rate: if self.total_bases > 0 {
+                self.q40_bases as f64 / self.total_bases as f64
             } else {
                 0.0
             },
@@ -335,6 +353,5 @@ pub(crate) fn calculate_duplication_rate(kmer_counts: &indexmap::IndexMap<String
     }
 
     // Duplication rate = 1 - (unique / total)
-
     1.0 - (unique_kmers as f64 / total_kmers as f64)
 }

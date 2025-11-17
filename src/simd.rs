@@ -23,6 +23,7 @@ pub struct Stats {
     pub qsum: u32,
     pub q20: usize,
     pub q30: usize,
+    pub q40: usize,
     pub ncnt: usize,
     pub gc: usize,
     pub unqualified: usize, // Count of bases below qual_threshold
@@ -82,6 +83,7 @@ fn compute_stats_scalar(seq: &[u8], qual: &[u8], qual_threshold: u8) -> Stats {
     let mut qsum = 0u32;
     let mut q20 = 0usize;
     let mut q30 = 0usize;
+    let mut q40 = 0usize;
     let mut ncnt = 0usize;
     let mut gc = 0usize;
     let mut unqualified = 0usize;
@@ -92,13 +94,16 @@ fn compute_stats_scalar(seq: &[u8], qual: &[u8], qual_threshold: u8) -> Stats {
         let qval = (q - 33) as u32;
         qsum += qval;
 
-        // Q20/Q30: quality thresholds
+        // Q20/Q30/Q40: quality thresholds
         if q >= 53 {
             q20 += 1;
         } // Phred 20 = ASCII 53
         if q >= 63 {
             q30 += 1;
         } // Phred 30 = ASCII 63
+        if q >= 73 {
+            q40 += 1;
+        } // Phred 40 = ASCII 73
 
         // Unqualified: below qual_threshold
         if qual_threshold > 0 && q < qual_threshold_ascii {
@@ -120,6 +125,7 @@ fn compute_stats_scalar(seq: &[u8], qual: &[u8], qual_threshold: u8) -> Stats {
         qsum,
         q20,
         q30,
+        q40,
         ncnt,
         gc,
         unqualified,
@@ -133,6 +139,7 @@ unsafe fn compute_stats_avx2(seq: &[u8], qual: &[u8], qual_threshold: u8) -> Sta
     let mut qsum = 0u32;
     let mut q20 = 0usize;
     let mut q30 = 0usize;
+    let mut q40 = 0usize;
     let mut ncnt = 0usize;
     let mut gc = 0usize;
     let mut unqualified = 0usize;
@@ -140,6 +147,7 @@ unsafe fn compute_stats_avx2(seq: &[u8], qual: &[u8], qual_threshold: u8) -> Sta
     let offset = _mm256_set1_epi8(33);
     let q20_thresh = _mm256_set1_epi8(53);
     let q30_thresh = _mm256_set1_epi8(63);
+    let q40_thresh = _mm256_set1_epi8(73);
     let qual_threshold_ascii = qual_threshold + 33;
     let qual_thresh_vec = _mm256_set1_epi8(qual_threshold_ascii as i8);
 
@@ -167,6 +175,11 @@ unsafe fn compute_stats_avx2(seq: &[u8], qual: &[u8], qual_threshold: u8) -> Sta
         let q30_mask =
             _mm256_cmpgt_epi8(qual_vec, _mm256_sub_epi8(q30_thresh, _mm256_set1_epi8(1)));
         q30 += count_set_bits_avx2(q30_mask);
+
+        // Q40 counting: compare qual >= 73
+        let q40_mask =
+            _mm256_cmpgt_epi8(qual_vec, _mm256_sub_epi8(q40_thresh, _mm256_set1_epi8(1)));
+        q40 += count_set_bits_avx2(q40_mask);
 
         // Unqualified counting: compare qual < qual_threshold_ascii
         if qual_threshold > 0 {
@@ -214,6 +227,9 @@ unsafe fn compute_stats_avx2(seq: &[u8], qual: &[u8], qual_threshold: u8) -> Sta
         if q >= 63 {
             q30 += 1;
         }
+        if q >= 73 {
+            q40 += 1;
+        }
         if qual_threshold > 0 && q < qual_threshold_ascii {
             unqualified += 1;
         }
@@ -230,6 +246,7 @@ unsafe fn compute_stats_avx2(seq: &[u8], qual: &[u8], qual_threshold: u8) -> Sta
         qsum,
         q20,
         q30,
+        q40,
         ncnt,
         gc,
         unqualified,
@@ -277,6 +294,7 @@ unsafe fn compute_stats_neon(seq: &[u8], qual: &[u8], qual_threshold: u8) -> Sta
     let mut qsum = 0u32;
     let mut q20 = 0usize;
     let mut q30 = 0usize;
+    let mut q40 = 0usize;
     let mut ncnt = 0usize;
     let mut gc = 0usize;
     let mut unqualified = 0usize;
@@ -289,6 +307,7 @@ unsafe fn compute_stats_neon(seq: &[u8], qual: &[u8], qual_threshold: u8) -> Sta
         let offset = vdupq_n_u8(33);
         let q20_thresh = vdupq_n_u8(53);
         let q30_thresh = vdupq_n_u8(63);
+        let q40_thresh = vdupq_n_u8(73);
         let qual_thresh_vec = vdupq_n_u8(qual_threshold_ascii);
 
         let n_upper = vdupq_n_u8(b'N');
@@ -310,6 +329,10 @@ unsafe fn compute_stats_neon(seq: &[u8], qual: &[u8], qual_threshold: u8) -> Sta
             // Q30 counting: compare qual >= 63
             let q30_mask = vcgeq_u8(qual_vec, q30_thresh);
             q30 += count_set_bits_neon(q30_mask);
+
+            // Q40 counting: compare qual >= 73
+            let q40_mask = vcgeq_u8(qual_vec, q40_thresh);
+            q40 += count_set_bits_neon(q40_mask);
 
             // Unqualified counting: compare qual < qual_threshold_ascii
             if qual_threshold > 0 {
@@ -355,6 +378,9 @@ unsafe fn compute_stats_neon(seq: &[u8], qual: &[u8], qual_threshold: u8) -> Sta
         if q >= 63 {
             q30 += 1;
         }
+        if q >= 73 {
+            q40 += 1;
+        }
         if qual_threshold > 0 && q < qual_threshold_ascii {
             unqualified += 1;
         }
@@ -371,6 +397,7 @@ unsafe fn compute_stats_neon(seq: &[u8], qual: &[u8], qual_threshold: u8) -> Sta
         qsum,
         q20,
         q30,
+        q40,
         ncnt,
         gc,
         unqualified,
@@ -461,6 +488,39 @@ mod tests {
     }
 
     #[test]
+    fn test_neon_vs_scalar_simple() {
+        // Simple test first with the exact quality chars from problematic read
+        let r1_qual = b"AAAA/EA/E6EA/AE/E6E/EEA/EAE/EAE/EE//EE/EE";
+        let r1_seq = b"GACTGGGGAGACGCCGAGTGAGGGCGAGCGCTGCTGTGGCG";
+
+        let scalar = compute_stats_scalar(r1_seq, r1_qual, 15);
+
+        #[cfg(target_arch = "aarch64")]
+        {
+            let neon = unsafe { compute_stats_neon(r1_seq, r1_qual, 15) };
+            println!("\nSimple NEON vs Scalar test:");
+            println!(
+                "  Scalar: unqualified={}, qsum={}",
+                scalar.unqualified, scalar.qsum
+            );
+            println!(
+                "  NEON:   unqualified={}, qsum={}",
+                neon.unqualified, neon.qsum
+            );
+            assert_eq!(
+                neon.unqualified, scalar.unqualified,
+                "NEON/scalar unqualified mismatch!"
+            );
+            assert_eq!(neon.qsum, scalar.qsum, "NEON/scalar qsum mismatch!");
+        }
+
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            println!("Skipping NEON test (not on ARM)");
+        }
+    }
+
+    #[test]
     fn test_compare_scalar_vs_simd() {
         let seq = b"ATCGATCGATCGATNNATCGATCGATCGATCGATCG";
         let qual = b"IIII555555????????IIII555555????????II";
@@ -489,6 +549,178 @@ mod tests {
             assert_eq!(scalar.ncnt, simd.ncnt, "ncnt mismatch");
             assert_eq!(scalar.gc, simd.gc, "gc mismatch");
             assert_eq!(scalar.unqualified, simd.unqualified, "unqualified mismatch");
+        }
+    }
+
+    /// Test the problematic read from SRR22472290.464
+    /// This read is filtered by fasterp but passed by fastp
+    #[test]
+    fn test_problematic_read_srr22472290_464() {
+        // The exact quality strings from the problematic read pair
+        let r1_seq = b"GACTGGGGAGACGCCGAGTGAGGGCGAGCGCTGCTGTGGCG";
+        let r1_qual = b"AAAA/EA/E6EA/AE/E6E/EEA/EAE/EAE/EE//EE/EE";
+
+        let r2_seq = b"CGCCACAGCCGCGCTCGCCCTCACTCGGCGTCTACCCAGTCCTGTCTATTATACACAAAAGACGATGCCGACGAA";
+        let r2_qual =
+            b"A/A//EEE/EA<EE/EEEEAA<EE//AEEEAAE/EE/EAEEAAA//A////AE/A<A//////////E///////";
+
+        let qual_threshold = 15; // Default qualified_quality_phred
+
+        // Compute stats using the scalar fallback
+        let r1_stats_scalar = compute_stats_scalar(r1_seq, r1_qual, qual_threshold);
+        let r2_stats_scalar = compute_stats_scalar(r2_seq, r2_qual, qual_threshold);
+
+        println!("\n=== Problematic Read SRR22472290.464 Analysis ===");
+        println!("\nR1 (42 bases) Scalar Results:");
+        println!(
+            "  unqualified={}, qsum={}, q20={}, q30={}, ncnt={}, gc={}",
+            r1_stats_scalar.unqualified,
+            r1_stats_scalar.qsum,
+            r1_stats_scalar.q20,
+            r1_stats_scalar.q30,
+            r1_stats_scalar.ncnt,
+            r1_stats_scalar.gc
+        );
+
+        println!("\nR2 (76 bases) Scalar Results:");
+        println!(
+            "  unqualified={}, qsum={}, q20={}, q30={}, ncnt={}, gc={}",
+            r2_stats_scalar.unqualified,
+            r2_stats_scalar.qsum,
+            r2_stats_scalar.q20,
+            r2_stats_scalar.q30,
+            r2_stats_scalar.ncnt,
+            r2_stats_scalar.gc
+        );
+
+        // Test SIMD implementations if available
+        #[cfg(target_arch = "x86_64")]
+        {
+            if is_x86_feature_detected!("avx2") {
+                let r1_stats_avx2 = unsafe { compute_stats_avx2(r1_seq, r1_qual, qual_threshold) };
+                let r2_stats_avx2 = unsafe { compute_stats_avx2(r2_seq, r2_qual, qual_threshold) };
+
+                println!("\nR1 (42 bases) AVX2 Results:");
+                println!(
+                    "  unqualified={}, qsum={}, q20={}, q30={}, ncnt={}, gc={}",
+                    r1_stats_avx2.unqualified,
+                    r1_stats_avx2.qsum,
+                    r1_stats_avx2.q20,
+                    r1_stats_avx2.q30,
+                    r1_stats_avx2.ncnt,
+                    r1_stats_avx2.gc
+                );
+
+                println!("\nR2 (76 bases) AVX2 Results:");
+                println!(
+                    "  unqualified={}, qsum={}, q20={}, q30={}, ncnt={}, gc={}",
+                    r2_stats_avx2.unqualified,
+                    r2_stats_avx2.qsum,
+                    r2_stats_avx2.q20,
+                    r2_stats_avx2.q30,
+                    r2_stats_avx2.ncnt,
+                    r2_stats_avx2.gc
+                );
+
+                // Check filtering decisions
+                let unqualified_percent_limit = 40;
+                let r1_threshold = (unqualified_percent_limit * r1_seq.len()) as f64 / 100.0;
+                let r2_threshold = (unqualified_percent_limit * r2_seq.len()) as f64 / 100.0;
+
+                let r1_fail_scalar = (r1_stats_scalar.unqualified as f64) > r1_threshold;
+                let r1_fail_avx2 = (r1_stats_avx2.unqualified as f64) > r1_threshold;
+                let r2_fail_scalar = (r2_stats_scalar.unqualified as f64) > r2_threshold;
+                let r2_fail_avx2 = (r2_stats_avx2.unqualified as f64) > r2_threshold;
+
+                println!("\nFiltering Decision (40% unqualified threshold):");
+                println!(
+                    "  R1: threshold={:.2}, Scalar fail={}, AVX2 fail={}",
+                    r1_threshold, r1_fail_scalar, r1_fail_avx2
+                );
+                println!(
+                    "  R2: threshold={:.2}, Scalar fail={}, AVX2 fail={}",
+                    r2_threshold, r2_fail_scalar, r2_fail_avx2
+                );
+
+                // THE KEY ASSERTIONS: SIMD and scalar must match
+                assert_eq!(
+                    r1_stats_avx2.unqualified, r1_stats_scalar.unqualified,
+                    "R1: AVX2 and scalar produce different unqualified counts!"
+                );
+                assert_eq!(
+                    r1_stats_avx2.qsum, r1_stats_scalar.qsum,
+                    "R1: AVX2 and scalar produce different quality sums!"
+                );
+                assert_eq!(
+                    r1_stats_avx2.q20, r1_stats_scalar.q20,
+                    "R1: AVX2 and scalar produce different Q20 counts!"
+                );
+                assert_eq!(
+                    r1_stats_avx2.q30, r1_stats_scalar.q30,
+                    "R1: AVX2 and scalar produce different Q30 counts!"
+                );
+
+                assert_eq!(
+                    r2_stats_avx2.unqualified, r2_stats_scalar.unqualified,
+                    "R2: AVX2 and scalar produce different unqualified counts!"
+                );
+                assert_eq!(
+                    r2_stats_avx2.qsum, r2_stats_scalar.qsum,
+                    "R2: AVX2 and scalar produce different quality sums!"
+                );
+                assert_eq!(
+                    r2_stats_avx2.q20, r2_stats_scalar.q20,
+                    "R2: AVX2 and scalar produce different Q20 counts!"
+                );
+                assert_eq!(
+                    r2_stats_avx2.q30, r2_stats_scalar.q30,
+                    "R2: AVX2 and scalar produce different Q30 counts!"
+                );
+
+                println!("\n✓ AVX2 and scalar implementations produce identical results");
+            } else {
+                println!("\nAVX2 not available, skipping SIMD comparison");
+            }
+        }
+
+        #[cfg(target_arch = "aarch64")]
+        {
+            let r1_stats_neon = unsafe { compute_stats_neon(r1_seq, r1_qual, qual_threshold) };
+            let r2_stats_neon = unsafe { compute_stats_neon(r2_seq, r2_qual, qual_threshold) };
+
+            println!("\nR1 (42 bases) NEON Results:");
+            println!(
+                "  unqualified={}, qsum={}, q20={}, q30={}, ncnt={}, gc={}",
+                r1_stats_neon.unqualified,
+                r1_stats_neon.qsum,
+                r1_stats_neon.q20,
+                r1_stats_neon.q30,
+                r1_stats_neon.ncnt,
+                r1_stats_neon.gc
+            );
+
+            println!("\nR2 (76 bases) NEON Results:");
+            println!(
+                "  unqualified={}, qsum={}, q20={}, q30={}, ncnt={}, gc={}",
+                r2_stats_neon.unqualified,
+                r2_stats_neon.qsum,
+                r2_stats_neon.q20,
+                r2_stats_neon.q30,
+                r2_stats_neon.ncnt,
+                r2_stats_neon.gc
+            );
+
+            // THE KEY ASSERTIONS: SIMD and scalar must match
+            assert_eq!(
+                r1_stats_neon.unqualified, r1_stats_scalar.unqualified,
+                "R1: NEON and scalar produce different unqualified counts!"
+            );
+            assert_eq!(
+                r2_stats_neon.unqualified, r2_stats_scalar.unqualified,
+                "R2: NEON and scalar produce different unqualified counts!"
+            );
+
+            println!("\n✓ NEON and scalar implementations produce identical results");
         }
     }
 }

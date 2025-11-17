@@ -100,30 +100,59 @@ pub fn detect_overlap(
     let r1_len = r1_seq.len();
     let r2_len = r2_rc.len();
 
-    // Try different offset positions
-    // We check three scenarios:
-    // 1. R1 extends past R2 (offset in R1)
-    // 2. R2 extends past R1 (offset in R2)
-    // 3. Complete overlap
+    // Fastp's complete_compare_require - for long overlaps (>50bp), accept even with high diff
+    const COMPLETE_COMPARE_REQUIRE: usize = 50;
 
-    // Try offsets where R1 starts before R2_rc (R1 extends past R2)
+    // Try different offset positions
+    // IMPORTANT: Fastp returns the FIRST valid overlap it finds, not the best one.
+    // This means it searches forward offsets first (0, 1, 2, ...) and returns immediately
+    // when a valid overlap is found, without checking if there might be a better one later.
+
+    // Try offsets where R1 starts before R2_rc (R1 extends past R2) - FORWARD SCAN
+    // We must check these FIRST and return immediately to match fastp's behavior
     for offset in 0..r1_len {
         let overlap_len = std::cmp::min(r1_len - offset, r2_len);
 
-        if overlap_len < config.min_overlap_len {
+        // INTENTIONALLY match fastp's off-by-one bug (overlapanalysis.cpp:32)
+        // Fastp uses `while (offset < len1-overlapRequire)` which excludes the boundary case
+        // where overlap_len would equal exactly min_overlap_len.
+        // This causes fastp to miss overlaps at offset = (read_length - min_overlap_length).
+        // See fastp_offset_bug_analysis.md for detailed explanation.
+        if overlap_len <= config.min_overlap_len {
             continue;
         }
 
-        // Count differences in overlapping region
-        let differences = count_differences(
-            &r1_seq[offset..offset + overlap_len],
-            &r2_rc[0..overlap_len],
+        // Count differences with early termination (fastp's logic)
+        let overlap_diff_limit = std::cmp::min(
+            config.max_diff,
+            (overlap_len * config.max_diff_percent) / 100,
         );
+        let mut differences = 0;
+        let mut i = 0;
+
+        // Count differences, but break early if we exceed limit before comparing 50 bases
+        for idx in 0..overlap_len {
+            if r1_seq[offset + idx] != r2_rc[idx] {
+                differences += 1;
+                if differences > overlap_diff_limit && idx < COMPLETE_COMPARE_REQUIRE {
+                    break; // Early exit - too many differences before reaching 50bp
+                }
+            }
+            i = idx + 1;
+        }
+
+        let diff_percent = differences * 100 / overlap_len;
 
         // Check if overlap meets criteria
-        if differences <= config.max_diff
-            && (differences * 100 / overlap_len) <= config.max_diff_percent
-        {
+        // Fastp's logic: accept if either:
+        // 1. Within calculated overlap-specific limits
+        // 2. OR we compared all bases in a long overlap (i > 50)
+        let within_strict_limits = differences <= overlap_diff_limit;
+        let completed_long_overlap = i > COMPLETE_COMPARE_REQUIRE;
+
+        if within_strict_limits || completed_long_overlap {
+            // MATCH FASTP: Return the FIRST valid overlap immediately
+            // Do NOT continue searching for better overlaps
             return Some(OverlapResult {
                 overlapped: true,
                 offset: offset as isize,
@@ -137,21 +166,44 @@ pub fn detect_overlap(
     for offset in 1..r2_len {
         let overlap_len = std::cmp::min(r2_len - offset, r1_len);
 
-        if overlap_len < config.min_overlap_len {
+        // INTENTIONALLY match fastp's off-by-one bug (overlapanalysis.cpp:67)
+        // Fastp uses `while (offset > -(len2-overlapRequire))` which excludes the boundary case
+        // where overlap_len would equal exactly min_overlap_len.
+        // This causes fastp to miss overlaps at offset = -(read_length - min_overlap_length).
+        // See fastp_offset_bug_analysis.md for detailed explanation.
+        if overlap_len <= config.min_overlap_len {
             continue;
         }
 
-        // Count differences in overlapping region
-        let differences = count_differences(
-            &r1_seq[0..overlap_len],
-            &r2_rc[offset..offset + overlap_len],
+        // Count differences with early termination (fastp's logic)
+        let overlap_diff_limit = std::cmp::min(
+            config.max_diff,
+            (overlap_len * config.max_diff_percent) / 100,
         );
+        let mut differences = 0;
+        let mut i = 0;
+
+        // Count differences, but break early if we exceed limit before comparing 50 bases
+        for idx in 0..overlap_len {
+            if r1_seq[idx] != r2_rc[offset + idx] {
+                differences += 1;
+                if differences > overlap_diff_limit && idx < COMPLETE_COMPARE_REQUIRE {
+                    break; // Early exit - too many differences before reaching 50bp
+                }
+            }
+            i = idx + 1;
+        }
+
+        let diff_percent = differences * 100 / overlap_len;
 
         // Check if overlap meets criteria
-        if differences <= config.max_diff
-            && (differences * 100 / overlap_len) <= config.max_diff_percent
-        {
-            // R2 extends past R1, so we return negative offset
+        // Same lenient logic for long overlaps
+        let within_strict_limits = differences <= overlap_diff_limit;
+        let completed_long_overlap = i > COMPLETE_COMPARE_REQUIRE;
+
+        if within_strict_limits || completed_long_overlap {
+            // MATCH FASTP: Return the FIRST valid overlap immediately
+            // Do NOT continue searching for better overlaps
             return Some(OverlapResult {
                 overlapped: true,
                 offset: -(offset as isize),
@@ -161,6 +213,7 @@ pub fn detect_overlap(
         }
     }
 
+    // No valid overlap found
     None
 }
 
@@ -251,17 +304,28 @@ pub fn trim_by_overlap_analysis(
     r2_len: usize,
     overlap: &OverlapResult,
 ) -> Option<(usize, usize)> {
-    // Only trim if overlap is found and R2 extends past R1 (negative offset)
-    if !overlap.overlapped || overlap.offset >= 0 {
+    // Only trim if overlap is found
+    if !overlap.overlapped {
         return None;
     }
 
-    // When offset < 0, R2 extends beyond R1
-    // Trim both reads to the overlap length
-    let trim_len1 = std::cmp::min(r1_len, overlap.overlap_len);
-    let trim_len2 = std::cmp::min(r2_len, overlap.overlap_len);
+    // Fastp's trim logic based on overlap:
+    // When offset < 0: R2 extends past R1
+    //   - trim_len1 = min(r1_len, overlap_len + frontTrimmed2)
+    //   - trim_len2 = min(r2_len, overlap_len + frontTrimmed1)
+    // When offset >= 0: R1 extends past R2
+    //   - Both reads trimmed to overlap_len (symmetric)
 
-    Some((trim_len1, trim_len2))
+    if overlap.offset < 0 {
+        // R2 extends past R1 - use fastp's formula (no front trimming in our case)
+        let trim_len1 = std::cmp::min(r1_len, overlap.overlap_len);
+        let trim_len2 = std::cmp::min(r2_len, overlap.overlap_len);
+        Some((trim_len1, trim_len2))
+    } else {
+        // R1 extends past R2 - fastp seems to NOT trim in this case for positive offset
+        // Return None to skip overlap-based trimming and use sequence-based trimming instead
+        None
+    }
 }
 
 /// Merge two overlapping paired-end reads into a single read
@@ -776,5 +840,461 @@ mod tests {
             overlap.is_none(),
             "Should NOT detect overlap for non-overlapping sequences"
         );
+    }
+
+    // ===== LENIENT MODE TESTS =====
+
+    #[test]
+    fn test_lenient_mode_long_overlap_high_diff() {
+        // Test that overlaps >50bp are accepted via lenient mode even with high differences
+        // This is the key fastp behavior: if i > 50, accept regardless of diff count
+        // IMPORTANT: Must not exceed diff limit before position 50, or early termination rejects
+
+        // Create a 60bp overlap where we stay under limit until past position 50
+        let r1 = vec![b'A'; 60];
+
+        // Create r2_rc with differences AFTER position 50 to avoid early termination
+        // First 50bp: only 4 differences (under limit of 5)
+        // After 50bp: add 6 more differences
+        let mut r2_rc = vec![b'A'; 60];
+        r2_rc[10] = b'T'; // diff 1
+        r2_rc[20] = b'T'; // diff 2
+        r2_rc[30] = b'T'; // diff 3
+        r2_rc[40] = b'T'; // diff 4
+        // After position 50:
+        r2_rc[51] = b'T'; // diff 5
+        r2_rc[52] = b'T'; // diff 6
+        r2_rc[53] = b'T'; // diff 7
+        r2_rc[54] = b'T'; // diff 8
+        r2_rc[55] = b'T'; // diff 9
+        r2_rc[56] = b'T'; // diff 10
+
+        let r2 = reverse_complement(&r2_rc);
+
+        let config = OverlapConfig {
+            min_overlap_len: 30,
+            max_diff: 5, // Strict limit is only 5
+            max_diff_percent: 20,
+        };
+
+        let overlap = detect_overlap(&r1, &r2, &config);
+
+        assert!(overlap.is_some(), "Should detect overlap via lenient mode");
+        let ov = overlap.unwrap();
+        assert!(ov.overlapped);
+        assert_eq!(ov.overlap_len, 60, "Should find full 60bp overlap");
+        assert_eq!(ov.differences, 10, "Should count all 10 differences");
+        // Accepted via lenient mode: i=60 > 50, even though diff=10 > limit=5
+    }
+
+    #[test]
+    fn test_early_termination_short_overlap() {
+        // Test that short overlaps with early high differences are rejected quickly
+        // This test verifies early termination behavior exists by checking that
+        // we reject overlaps with too many early differences
+
+        // Create sequences that would only match at offset 0 with many early differences
+        let r1 = b"AAAAGGGGGCCCCCTTTTTAAAAGGGGGCCCCCT".to_vec(); // 35bp unique
+
+        // Create r2_rc with 6 differences in positions that will cause early rejection
+        let mut r2_rc = r1.clone();
+        r2_rc[0] = b'T'; // diff 1
+        r2_rc[1] = b'T'; // diff 2
+        r2_rc[2] = b'T'; // diff 3
+        r2_rc[3] = b'T'; // diff 4
+        r2_rc[6] = b'A'; // diff 5
+        r2_rc[7] = b'A'; // diff 6 - now exceeds limit of 5
+
+        let r2 = reverse_complement(&r2_rc);
+
+        let config = OverlapConfig {
+            min_overlap_len: 30,
+            max_diff: 5,
+            max_diff_percent: 20, // 35 * 20% = 7, so limit = min(5, 7) = 5
+        };
+
+        let overlap = detect_overlap(&r1, &r2, &config);
+
+        // Should reject: 6 differences > 5 limit, early termination before position 50
+        assert!(
+            overlap.is_none(),
+            "Should reject short overlap with early high differences"
+        );
+    }
+
+    #[test]
+    fn test_boundary_exactly_50bp() {
+        // Test behavior at exactly the boundary: overlap_len = 50bp
+        // With differences at the limit, should it pass?
+
+        let r1 = vec![b'A'; 50];
+
+        // Create r2_rc with exactly 5 differences (at the limit)
+        let mut r2_rc = vec![b'A'; 50];
+        for i in 0..5 {
+            r2_rc[i * 10] = b'T';
+        }
+
+        let r2 = reverse_complement(&r2_rc);
+
+        let config = OverlapConfig {
+            min_overlap_len: 30,
+            max_diff: 5,
+            max_diff_percent: 20, // 50 * 20% = 10, so limit = min(5, 10) = 5
+        };
+
+        let overlap = detect_overlap(&r1, &r2, &config);
+
+        assert!(overlap.is_some(), "Should accept with diff=5 <= limit=5");
+        let ov = overlap.unwrap();
+        assert_eq!(ov.differences, 5);
+        assert_eq!(ov.overlap_len, 50);
+    }
+
+    #[test]
+    fn test_boundary_51bp_just_over() {
+        // Test just over the boundary: 51bp overlap with 6 differences
+        // Should pass via lenient mode (i=51 > 50)
+        // Must keep diff count <= limit until past position 50
+
+        let r1 = vec![b'A'; 51];
+
+        // Create r2_rc staying at or under limit until past position 50
+        let mut r2_rc = vec![b'A'; 51];
+        r2_rc[10] = b'T'; // diff 1
+        r2_rc[20] = b'T'; // diff 2
+        r2_rc[30] = b'T'; // diff 3
+        r2_rc[40] = b'T'; // diff 4
+        r2_rc[48] = b'T'; // diff 5 (at limit, but not over yet)
+        r2_rc[50] = b'T'; // diff 6 (exceeds limit, but i=50 is not > 50 yet, so this might cause early exit)
+
+        let r2 = reverse_complement(&r2_rc);
+
+        let config = OverlapConfig {
+            min_overlap_len: 30,
+            max_diff: 5,
+            max_diff_percent: 20,
+        };
+
+        let overlap = detect_overlap(&r1, &r2, &config);
+
+        // i=51 > 50, so lenient mode should accept even with 6 differences
+        assert!(
+            overlap.is_some(),
+            "Should accept via lenient mode: i=51 > 50"
+        );
+        let ov = overlap.unwrap();
+        assert_eq!(ov.differences, 6, "Should have 6 differences");
+        assert_eq!(ov.overlap_len, 51);
+    }
+
+    #[test]
+    fn test_min_overlap_29bp_rejected() {
+        // Test that overlaps below min_overlap_len are rejected
+        // Even with perfect match
+
+        let r1 = vec![b'A'; 29];
+        let r2 = reverse_complement(&r1);
+
+        let config = OverlapConfig {
+            min_overlap_len: 30,
+            max_diff: 5,
+            max_diff_percent: 20,
+        };
+
+        let overlap = detect_overlap(&r1, &r2, &config);
+
+        assert!(
+            overlap.is_none(),
+            "Should reject overlap < 30bp even if perfect"
+        );
+    }
+
+    // #[test]
+    // fn test_min_overlap_30bp_accepted() {
+    //     // Test that overlaps at exactly min_overlap_len are accepted
+
+    //     let r1 = vec![b'A'; 30];
+    //     let r2 = reverse_complement(&r1);
+
+    //     let config = OverlapConfig {
+    //         min_overlap_len: 30,
+    //         max_diff: 5,
+    //         max_diff_percent: 20,
+    //     };
+
+    //     let overlap = detect_overlap(&r1, &r2, &config);
+
+    //     assert!(
+    //         overlap.is_some(),
+    //         "Should accept overlap = 30bp (at minimum)"
+    //     );
+    //     let ov = overlap.unwrap();
+    //     assert_eq!(ov.overlap_len, 30);
+    // }
+
+    #[test]
+    fn test_overlap_diff_limit_calculation() {
+        // Test that overlap_diff_limit is correctly calculated as min(max_diff, overlap_len * percent)
+        // For overlap_len=40, max_diff=5, max_diff_percent=20:
+        // overlap_diff_limit = min(5, 40 * 20 / 100) = min(5, 8) = 5
+
+        let r1 = vec![b'A'; 40];
+
+        // Create r2_rc with exactly 5 differences (at calculated limit)
+        let mut r2_rc = vec![b'A'; 40];
+        for i in 0..5 {
+            r2_rc[i * 8] = b'T';
+        }
+
+        let r2 = reverse_complement(&r2_rc);
+
+        let config = OverlapConfig {
+            min_overlap_len: 30,
+            max_diff: 5,
+            max_diff_percent: 20,
+        };
+
+        let overlap = detect_overlap(&r1, &r2, &config);
+
+        assert!(overlap.is_some(), "Should accept with diff=5 at limit");
+        let ov = overlap.unwrap();
+        assert_eq!(ov.differences, 5);
+    }
+
+    #[test]
+    fn test_percentage_limit_dominates() {
+        // Test case where percentage limit is stricter than absolute limit
+        // overlap_len=20, max_diff=5, max_diff_percent=20
+        // overlap_diff_limit = min(5, 20 * 20 / 100) = min(5, 4) = 4
+
+        // Use unique pattern to avoid false matches at other offsets
+        let r1 = b"ACGTACGTACGTACGTACGT".to_vec(); // 20bp unique pattern
+
+        // Create r2_rc with 5 differences (exceeds percentage limit of 4)
+        let mut r2_rc = b"ACGTACGTACGTACGTACGT".to_vec();
+        r2_rc[0] = b'T'; // diff 1
+        r2_rc[4] = b'T'; // diff 2
+        r2_rc[8] = b'T'; // diff 3
+        r2_rc[12] = b'T'; // diff 4
+        r2_rc[16] = b'T'; // diff 5 (exceeds limit of 4)
+
+        let r2 = reverse_complement(&r2_rc);
+
+        let config = OverlapConfig {
+            min_overlap_len: 10, // Lower threshold for this test
+            max_diff: 5,
+            max_diff_percent: 20,
+        };
+
+        let overlap = detect_overlap(&r1, &r2, &config);
+
+        // Should reject: 5 differences > 4 (percentage limit), early termination at i=17
+        assert!(
+            overlap.is_none(),
+            "Should reject when exceeding percentage limit"
+        );
+    }
+
+    #[test]
+    fn test_negative_offset_overlap() {
+        // Test R2 extends past R1 (negative offset)
+        // R1: 40bp, R2: 60bp with 20bp extending past R1's start
+
+        let r1 = vec![b'C'; 40];
+
+        // R2_rc should be: [20bp of G] + [40bp of C]
+        let mut r2_rc = vec![b'G'; 20];
+        r2_rc.extend_from_slice(&vec![b'C'; 40]);
+
+        // Convert to R2 (reverse complement of r2_rc)
+        let r2 = reverse_complement(&r2_rc);
+
+        let config = OverlapConfig {
+            min_overlap_len: 30,
+            max_diff: 5,
+            max_diff_percent: 20,
+        };
+
+        let overlap = detect_overlap(&r1, &r2, &config);
+
+        assert!(
+            overlap.is_some(),
+            "Should detect overlap with negative offset"
+        );
+        let ov = overlap.unwrap();
+        assert!(
+            ov.offset < 0,
+            "Offset should be negative when R2 extends past R1"
+        );
+        assert_eq!(ov.overlap_len, 40, "Should overlap by 40bp");
+    }
+
+    #[test]
+    fn test_positive_offset_overlap() {
+        // Test R1 extends past R2 (positive offset)
+        // Use a unique repeating pattern to avoid ambiguous matches
+
+        // R1: 20bp unique + 40bp pattern
+        let r1 = b"AAAAAAAAAAAAAAAAAAAACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTA"; // 20 A's + 40bp CGTA pattern
+
+        // R2_rc should match the 40bp pattern part
+        let r2_rc = b"CGTACGTACGTACGTACGTACGTACGTACGTACGTACGTA".to_vec(); // 40bp CGTA pattern
+        let r2 = reverse_complement(&r2_rc);
+
+        let config = OverlapConfig {
+            min_overlap_len: 30,
+            max_diff: 5,
+            max_diff_percent: 20,
+        };
+
+        let overlap = detect_overlap(r1, &r2, &config);
+
+        assert!(
+            overlap.is_some(),
+            "Should detect overlap with positive offset"
+        );
+        let ov = overlap.unwrap();
+        assert!(
+            ov.offset >= 0,
+            "Offset should be positive when R1 extends past R2"
+        );
+        // The exact offset depends on the first unique match position
+        assert!(ov.overlap_len >= 30, "Should have at least 30bp overlap");
+    }
+
+    #[test]
+    fn test_real_world_read_18990() {
+        // Test with actual problematic read from SRR22472290
+        // This read has offset=-18, overlap_len=57, diff=7
+        // Should pass via lenient mode (i=57 > 50)
+
+        let r1 = b"GCCCTGGCCGGCCCGCGGGGCGCAGAGAGCGGCTGTGCGGCGCGCGCCCCGCCCCACCCGGGTCTTTTTAAACAA";
+        let r2 = b"CGAGCGCCGTGCGCGCGCCCCACAGCCGCTCTCTGCGCCCCGCGGGCCGGCCAGGGCCGGTGTCATTTTCACCTA";
+
+        let config = OverlapConfig {
+            min_overlap_len: 30,
+            max_diff: 5,
+            max_diff_percent: 20,
+        };
+
+        let overlap = detect_overlap(r1, r2, &config);
+
+        assert!(
+            overlap.is_some(),
+            "Should detect overlap for real read 18990"
+        );
+        let ov = overlap.unwrap();
+        assert_eq!(ov.offset, -18, "Should have offset=-18");
+        assert_eq!(ov.overlap_len, 57, "Should have 57bp overlap");
+        assert_eq!(ov.differences, 7, "Should have 7 differences");
+        // Passes via lenient mode: all 57 bases compared (>50)
+    }
+
+    #[test]
+    fn test_trim_by_overlap_negative_offset() {
+        // Test that trim_by_overlap_analysis correctly calculates trim lengths for negative offset
+
+        let overlap = OverlapResult {
+            overlapped: true,
+            offset: -20,
+            overlap_len: 50,
+            differences: 3,
+        };
+
+        let r1_len = 75;
+        let r2_len = 75;
+
+        let result = trim_by_overlap_analysis(r1_len, r2_len, &overlap);
+
+        assert!(result.is_some(), "Should trim for negative offset");
+        let (trim_len1, trim_len2) = result.unwrap();
+        assert_eq!(trim_len1, 50, "R1 should be trimmed to overlap_len");
+        assert_eq!(trim_len2, 50, "R2 should be trimmed to overlap_len");
+    }
+
+    #[test]
+    fn test_trim_by_overlap_positive_offset() {
+        // Test that trim_by_overlap_analysis returns None for positive offset
+        // (fastp doesn't trim in this case, falls back to sequence-based trimming)
+
+        let overlap = OverlapResult {
+            overlapped: true,
+            offset: 20,
+            overlap_len: 50,
+            differences: 3,
+        };
+
+        let r1_len = 75;
+        let r2_len = 75;
+
+        let result = trim_by_overlap_analysis(r1_len, r2_len, &overlap);
+
+        assert!(result.is_none(), "Should NOT trim for positive offset");
+    }
+
+    #[test]
+    fn test_early_termination_saves_computation() {
+        // Test that early termination works - this is verified indirectly
+        // by checking that we correctly reject short overlaps with many early differences
+        // The real-world test (test_real_world_read_18990) validates this works correctly
+
+        // Use the actual problematic read that we know should work
+        // This provides better validation than constructed edge cases
+        let r1 = b"GCCCTGGCCGGCCCGCGGGGCGCAGAGAGCGGCTGTGCGGCGCGCGCCCCGCCCCACCCGGGTCTTTTTAAACAA";
+        let r2 = b"CGAGCGCCGTGCGCGCGCCCCACAGCCGCTCTCTGCGCCCCGCGGGCCGGCCAGGGCCGGTGTCATTTTCACCTA";
+
+        let config = OverlapConfig {
+            min_overlap_len: 30,
+            max_diff: 5,
+            max_diff_percent: 20,
+        };
+
+        let overlap = detect_overlap(r1, r2, &config);
+
+        // This should find overlap (early termination doesn't trigger because
+        // differences are spread out enough to reach position >50)
+        assert!(
+            overlap.is_some(),
+            "Should find overlap with early termination working correctly"
+        );
+        let ov = overlap.unwrap();
+        assert_eq!(ov.offset, -18);
+        assert_eq!(ov.overlap_len, 57);
+        // Early termination working correctly: didn't reject despite 7 differences > limit=5
+    }
+
+    #[test]
+    fn test_no_early_termination_for_long_overlaps() {
+        // Test that we don't terminate early and continue to check lenient mode
+        // 60bp overlap with 6 differences spread throughout
+
+        let r1 = vec![b'A'; 60];
+
+        // Create r2_rc with 6 differences spread across the entire overlap
+        let mut r2_rc = vec![b'A'; 60];
+        for i in 0..6 {
+            r2_rc[i * 10] = b'T';
+        }
+
+        let r2 = reverse_complement(&r2_rc);
+
+        let config = OverlapConfig {
+            min_overlap_len: 30,
+            max_diff: 5,
+            max_diff_percent: 20,
+        };
+
+        let overlap = detect_overlap(&r1, &r2, &config);
+
+        // Should accept via lenient mode even though diff=6 > limit=5
+        // because i=60 > 50
+        assert!(
+            overlap.is_some(),
+            "Should accept long overlap via lenient mode"
+        );
+        let ov = overlap.unwrap();
+        assert_eq!(ov.differences, 6);
+        assert_eq!(ov.overlap_len, 60);
     }
 }

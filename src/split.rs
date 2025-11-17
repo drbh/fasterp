@@ -50,6 +50,8 @@ pub struct SplitWriter {
     config: SplitConfig,
     /// Compression level
     compression_level: u32,
+    /// Use parallel compression
+    parallel_compression: bool,
 }
 
 impl SplitWriter {
@@ -58,6 +60,7 @@ impl SplitWriter {
         output_path: impl AsRef<Path>,
         config: SplitConfig,
         compression_level: u32,
+        parallel_compression: bool,
     ) -> Result<Self> {
         let mut writer = Self {
             base_path: output_path.as_ref().to_path_buf(),
@@ -66,6 +69,7 @@ impl SplitWriter {
             lines_in_current_file: 0,
             config,
             compression_level,
+            parallel_compression,
         };
 
         // For non-split mode or split-by-lines, open the first file immediately
@@ -120,7 +124,11 @@ impl SplitWriter {
         let filename_str = filename
             .to_str()
             .ok_or_else(|| anyhow::anyhow!("Invalid filename path"))?;
-        let writer = crate::io::open_output(filename_str, Some(self.compression_level))?;
+        let writer = crate::io::open_output(
+            filename_str,
+            Some(self.compression_level),
+            self.parallel_compression,
+        )?;
         self.current_writer = Some(writer);
 
         Ok(())
@@ -198,7 +206,7 @@ mod tests {
             prefix_digits: 4,
         };
 
-        let mut writer = SplitWriter::new(&output_path, config, 6).unwrap();
+        let mut writer = SplitWriter::new(&output_path, config, 6, false).unwrap();
         writer.write(b"@read1\nACGT\n+\nIIII\n").unwrap();
         writer.finish().unwrap();
 
@@ -216,7 +224,7 @@ mod tests {
             prefix_digits: 4,
         };
 
-        let mut writer = SplitWriter::new(&output_path, config, 6).unwrap();
+        let mut writer = SplitWriter::new(&output_path, config, 6, false).unwrap();
 
         // Write 2 records (8 lines total)
         writer.write(b"@read1\nACGT\n+\nIIII\n").unwrap();
@@ -238,7 +246,7 @@ mod tests {
             prefix_digits: 4,
         };
 
-        let writer = SplitWriter::new(&output_path, config, 6).unwrap();
+        let writer = SplitWriter::new(&output_path, config, 6, false).unwrap();
 
         let filename1 = writer.generate_filename(1);
         assert!(filename1.to_string_lossy().contains("0001.output.fq"));
@@ -257,7 +265,7 @@ mod tests {
             prefix_digits: 0, // No padding
         };
 
-        let writer = SplitWriter::new(&output_path, config, 6).unwrap();
+        let writer = SplitWriter::new(&output_path, config, 6, false).unwrap();
 
         let filename1 = writer.generate_filename(1);
         assert!(filename1.to_string_lossy().contains("1.output.fq"));
