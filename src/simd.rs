@@ -50,7 +50,13 @@ pub fn is_simd_available() -> bool {
     }
 }
 
-/// Count mismatches between two equal-length byte slices using SIMD
+/// Count mismatches with early termination - uses scalar for correctness
+///
+/// The early termination logic requires byte-by-byte position tracking to match
+/// fastp's exact behavior. SIMD chunking loses this granularity and causes
+/// incorrect acceptance of overlaps. Since this function is not performance-critical
+/// (called ~200k times on small sequences vs millions of calls for stats),
+/// scalar is the right choice.
 ///
 /// Returns (`total_differences`, `positions_compared`)
 /// Stops early if differences exceeds `max_diff` and `positions_compared` < `min_complete`
@@ -63,30 +69,12 @@ pub fn count_mismatches(
 ) -> (usize, usize) {
     debug_assert_eq!(seq1.len(), seq2.len());
 
-    #[cfg(target_arch = "x86_64")]
-    {
-        if is_x86_feature_detected!("avx2") {
-            return unsafe { count_mismatches_avx2(seq1, seq2, max_diff, min_complete) };
-        }
-        return count_mismatches_scalar(seq1, seq2, max_diff, min_complete);
-    }
-
-    #[cfg(target_arch = "aarch64")]
-    {
-        unsafe { count_mismatches_neon(seq1, seq2, max_diff, min_complete) }
-    }
-
-    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-    {
-        count_mismatches_scalar(seq1, seq2, max_diff, min_complete)
-    }
+    // Always use scalar - the early termination semantics require exact position tracking
+    // SIMD chunking breaks this and causes incorrect overlap acceptance
+    count_mismatches_scalar(seq1, seq2, max_diff, min_complete)
 }
 
 /// Scalar mismatch counting with early termination
-#[cfg(any(
-    target_arch = "x86_64",
-    not(any(target_arch = "x86_64", target_arch = "aarch64"))
-))]
 #[inline]
 fn count_mismatches_scalar(
     seq1: &[u8],

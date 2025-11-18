@@ -35,6 +35,3 @@ panic = "abort"            # Smaller/faster code by not unwinding
 strip = false              # Keep debug symbols for profiling (change to true for production)
 overflow-checks = false    # Disable integer overflow checks for performance
 
-[[bench]]
-name = "comparison"
-harness = false

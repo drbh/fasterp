@@ -21,6 +21,8 @@ pub struct OverlapResult {
     pub offset: isize,
     /// Length of overlapping region
     pub overlap_len: usize,
+    /// Number of differences/mismatches in overlap
+    pub diff: usize,
 }
 
 /// Configuration for overlap detection
@@ -141,6 +143,7 @@ pub fn detect_overlap(
                 overlapped: true,
                 offset: offset as isize,
                 overlap_len,
+                diff: differences,
             });
         }
     }
@@ -184,6 +187,7 @@ pub fn detect_overlap(
                 overlapped: true,
                 offset: -(offset as isize),
                 overlap_len,
+                diff: differences,
             });
         }
     }
@@ -464,6 +468,7 @@ mod tests {
             overlapped: true,
             offset: 0,
             overlap_len: 4,
+            diff: 1,
         };
 
         let stats = correct_by_overlap(
@@ -491,6 +496,7 @@ mod tests {
             overlapped: true,
             offset: 0,
             overlap_len: 4,
+            diff: 1,
         };
 
         let stats = correct_by_overlap(
@@ -642,6 +648,7 @@ mod tests {
             overlapped: true,
             offset: 10,      // R1 extends by 10bp
             overlap_len: 50, // 50bp overlap
+            diff: 0,
         };
 
         let (merged_header, merged_seq, merged_qual) =
@@ -1119,6 +1126,7 @@ mod tests {
             overlapped: true,
             offset: -20,
             overlap_len: 50,
+            diff: 0,
         };
 
         let r1_len = 75;
@@ -1141,6 +1149,7 @@ mod tests {
             overlapped: true,
             offset: 20,
             overlap_len: 50,
+            diff: 0,
         };
 
         let r1_len = 75;

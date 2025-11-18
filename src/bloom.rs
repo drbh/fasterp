@@ -136,8 +136,11 @@ impl DuplicateDetector {
         }
     }
 
-    /// Apply Bloom filter: check if all bits are set, and set them if not
-    /// Returns true if this is a duplicate (all bits were already set)
+    /// Apply Bloom filter: check if bits are set, and set them if not
+    /// Returns true if this is a duplicate
+    ///
+    /// Note: fastp's implementation only checks the LAST buffer's bit (due to overwriting
+    /// isDup each iteration instead of ANDing). We replicate this for exact parity.
     fn apply_bloom_filter(&self, positions: &[u64]) -> bool {
         let mut is_dup = true;
 
@@ -150,8 +153,8 @@ impl DuplicateDetector {
             // Atomically fetch old value and set the bit
             let old_value = self.bit_arrays[i][byte_pos].fetch_or(bit_mask, Ordering::Relaxed);
 
-            // Check if bit was already set
-            is_dup = is_dup && (old_value & bit_mask) != 0;
+            // Match fastp: overwrite (not AND) - only last buffer's result matters
+            is_dup = (old_value & bit_mask) != 0;
         }
 
         is_dup
