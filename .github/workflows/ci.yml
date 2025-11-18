@@ -95,7 +95,7 @@ jobs:
           -o /tmp/filtered_1.fq \
           -O /tmp/filtered_2.fq \
           -j /tmp/report.json \
-          -h _site/index.html
+          --html _site/index.html
 
     - name: Setup Pages
       if: github.ref == 'refs/heads/main' && github.event_name == 'push'
