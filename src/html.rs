@@ -52,7 +52,7 @@ fn write_css(html: &mut String) {
         "body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif; ",
     );
     html.push_str("background: #1a1a1a; padding: 20px; line-height: 1.6; color: #e0e0e0; }\n");
-    html.push_str("#container { max-width: 1000px; margin: 0 auto; background: #242424; ");
+    html.push_str("#container { width: 100%; background: #242424; ");
     html.push_str("border: 1px solid #3a3a3a; padding: 40px; }\n");
     html.push_str("h1 { color: #f0f0f0; font-size: 28px; font-weight: 600; ");
     html.push_str(
@@ -78,7 +78,7 @@ fn write_css(html: &mut String) {
     html.push_str("border-left: 3px solid #4a4a4a; margin: 10px 0; ");
     html.push_str("font-family: 'JetBrains Mono', 'Courier New', monospace; font-size: 12px; ");
     html.push_str("color: #b0b0b0; word-break: break-all; }\n");
-    html.push_str(".chart { width: 100%; height: 400px; margin: 20px 0; ");
+    html.push_str(".chart { width: 100%; height: 350px; margin: 10px 0; ");
     html.push_str("border: 1px solid #3a3a3a; }\n");
     html.push_str(".kmer_table { border-collapse: collapse; margin: 20px 0; ");
     html.push_str("font-family: 'JetBrains Mono', 'Courier New', monospace; font-size: 3px; }\n");
@@ -87,6 +87,10 @@ fn write_css(html: &mut String) {
     );
     html.push_str(".sub_section_tips { color: #888; font-size: 12px; ");
     html.push_str("font-style: italic; margin: 10px 0; }\n");
+    html.push_str(".side-by-side { display: flex; gap: 20px; }\n");
+    html.push_str(".side-by-side > div { flex: 1; min-width: 0; overflow: hidden; }\n");
+    html.push_str(".side-by-side table { table-layout: fixed; }\n");
+    html.push_str(".side-by-side h2 { margin-top: 0; }\n");
     html.push_str("</style>\n");
 }
 
@@ -124,63 +128,122 @@ fn write_body(html: &mut String, report: &FasterpReport, args: &Args) {
         );
     }
 
-    // Base quality charts - Read1
+    // Base quality charts - Read1 (side by side)
+    html.push_str("<div class='side-by-side'>\n");
+    html.push_str("<div>\n");
     write_quality_chart(
         html,
         &report.read1_before_filtering,
         "Before filtering: Base Mean Quality",
         "chart_r1_before",
     );
+    html.push_str("</div>\n");
     if let Some(ref after_stats) = report.read1_after_filtering {
+        html.push_str("<div>\n");
         write_quality_chart(
             html,
             after_stats,
             "After filtering: Base Mean Quality",
             "chart_r1_after",
         );
+        html.push_str("</div>\n");
+        html.push_str("<div>\n");
+        write_quality_diff_chart(
+            html,
+            &report.read1_before_filtering,
+            after_stats,
+            "Difference: Base Mean Quality",
+            "chart_r1_diff",
+        );
+        html.push_str("</div>\n");
     }
+    html.push_str("</div>\n");
 
-    // Quality histograms - Read1
+    // Quality histograms - Read1 (side by side)
+    html.push_str("<div class='side-by-side'>\n");
+    html.push_str("<div>\n");
     write_quality_histogram(
         html,
         &report.read1_before_filtering,
         "Before filtering: Quality Score Histogram",
         "qual_hist_r1_before",
     );
+    html.push_str("</div>\n");
     if let Some(ref after_stats) = report.read1_after_filtering {
+        html.push_str("<div>\n");
         write_quality_histogram(
             html,
             after_stats,
             "After filtering: Quality Score Histogram",
             "qual_hist_r1_after",
         );
+        html.push_str("</div>\n");
+        html.push_str("<div>\n");
+        write_quality_histogram_diff(
+            html,
+            &report.read1_before_filtering,
+            after_stats,
+            "Difference: Quality Score Histogram",
+            "qual_hist_r1_diff",
+        );
+        html.push_str("</div>\n");
     }
+    html.push_str("</div>\n");
 
-    // Base contents charts - Read1
+    // Base contents charts - Read1 (side by side)
+    html.push_str("<div class='side-by-side'>\n");
+    html.push_str("<div>\n");
     write_base_contents_chart(
         html,
         &report.read1_before_filtering,
         "Before filtering: Base Contents",
         "contents_r1_before",
     );
+    html.push_str("</div>\n");
     if let Some(ref after_stats) = report.read1_after_filtering {
+        html.push_str("<div>\n");
         write_base_contents_chart(
             html,
             after_stats,
             "After filtering: Base Contents",
             "contents_r1_after",
         );
+        html.push_str("</div>\n");
+        html.push_str("<div>\n");
+        write_base_contents_diff_chart(
+            html,
+            &report.read1_before_filtering,
+            after_stats,
+            "Difference: Base Contents",
+            "contents_r1_diff",
+        );
+        html.push_str("</div>\n");
     }
+    html.push_str("</div>\n");
 
-    // KMER tables - Read1
+    // KMER tables - Read1 (side by side)
+    html.push_str("<div class='side-by-side'>\n");
+    html.push_str("<div>\n");
     write_kmer_table(
         html,
         &report.read1_before_filtering,
         "Before filtering: KMER Counting",
     );
+    html.push_str("</div>\n");
     if let Some(ref after_stats) = report.read1_after_filtering {
+        html.push_str("<div>\n");
         write_kmer_table(html, after_stats, "After filtering: KMER Counting");
+        html.push_str("</div>\n");
+        html.push_str("<div>\n");
+        write_kmer_diff_table(
+            html,
+            &report.read1_before_filtering,
+            after_stats,
+            "Difference: KMER Counting",
+        );
+        html.push_str("</div>\n");
     }
+    html.push_str("</div>\n");
 
     // Read2 charts if paired-end
     if let Some(ref r2_before) = report.read2_before_filtering {
@@ -188,59 +251,118 @@ fn write_body(html: &mut String, report: &FasterpReport, args: &Args) {
             "<h3 style='color: #a0a0a0; font-size: 16px; margin-top: 35px;'>Read 2</h3>\n",
         );
 
-        // Base quality charts - Read2
+        // Base quality charts - Read2 (side by side)
+        html.push_str("<div class='side-by-side'>\n");
+        html.push_str("<div>\n");
         write_quality_chart(
             html,
             r2_before,
             "Before filtering: Base Mean Quality",
             "chart_r2_before",
         );
+        html.push_str("</div>\n");
         if let Some(ref after_stats) = report.read2_after_filtering {
+            html.push_str("<div>\n");
             write_quality_chart(
                 html,
                 after_stats,
                 "After filtering: Base Mean Quality",
                 "chart_r2_after",
             );
+            html.push_str("</div>\n");
+            html.push_str("<div>\n");
+            write_quality_diff_chart(
+                html,
+                r2_before,
+                after_stats,
+                "Difference: Base Mean Quality",
+                "chart_r2_diff",
+            );
+            html.push_str("</div>\n");
         }
+        html.push_str("</div>\n");
 
-        // Quality histograms - Read2
+        // Quality histograms - Read2 (side by side)
+        html.push_str("<div class='side-by-side'>\n");
+        html.push_str("<div>\n");
         write_quality_histogram(
             html,
             r2_before,
             "Before filtering: Quality Score Histogram",
             "qual_hist_r2_before",
         );
+        html.push_str("</div>\n");
         if let Some(ref after_stats) = report.read2_after_filtering {
+            html.push_str("<div>\n");
             write_quality_histogram(
                 html,
                 after_stats,
                 "After filtering: Quality Score Histogram",
                 "qual_hist_r2_after",
             );
+            html.push_str("</div>\n");
+            html.push_str("<div>\n");
+            write_quality_histogram_diff(
+                html,
+                r2_before,
+                after_stats,
+                "Difference: Quality Score Histogram",
+                "qual_hist_r2_diff",
+            );
+            html.push_str("</div>\n");
         }
+        html.push_str("</div>\n");
 
-        // Base contents charts - Read2
+        // Base contents charts - Read2 (side by side)
+        html.push_str("<div class='side-by-side'>\n");
+        html.push_str("<div>\n");
         write_base_contents_chart(
             html,
             r2_before,
             "Before filtering: Base Contents",
             "contents_r2_before",
         );
+        html.push_str("</div>\n");
         if let Some(ref after_stats) = report.read2_after_filtering {
+            html.push_str("<div>\n");
             write_base_contents_chart(
                 html,
                 after_stats,
                 "After filtering: Base Contents",
                 "contents_r2_after",
             );
+            html.push_str("</div>\n");
+            html.push_str("<div>\n");
+            write_base_contents_diff_chart(
+                html,
+                r2_before,
+                after_stats,
+                "Difference: Base Contents",
+                "contents_r2_diff",
+            );
+            html.push_str("</div>\n");
         }
+        html.push_str("</div>\n");
 
-        // KMER tables - Read2
+        // KMER tables - Read2 (side by side)
+        html.push_str("<div class='side-by-side'>\n");
+        html.push_str("<div>\n");
         write_kmer_table(html, r2_before, "Before filtering: KMER Counting");
+        html.push_str("</div>\n");
         if let Some(ref after_stats) = report.read2_after_filtering {
+            html.push_str("<div>\n");
             write_kmer_table(html, after_stats, "After filtering: KMER Counting");
+            html.push_str("</div>\n");
+            html.push_str("<div>\n");
+            write_kmer_diff_table(
+                html,
+                r2_before,
+                after_stats,
+                "Difference: KMER Counting",
+            );
+            html.push_str("</div>\n");
         }
+        html.push_str("</div>\n");
     }
 
     // Command info
@@ -287,7 +409,11 @@ fn write_before_after_comparison(html: &mut String, report: &FasterpReport) {
     let before = &report.summary.before_filtering;
     let after = &report.summary.after_filtering;
 
+    // Side-by-side container
+    html.push_str("<div class='side-by-side'>\n");
+
     // Before Filtering section
+    html.push_str("<div>\n");
     html.push_str("<h2>Before Filtering</h2>\n");
     html.push_str("<table>\n");
     add_row(html, "total reads", &format_number(before.total_reads));
@@ -317,8 +443,10 @@ fn write_before_after_comparison(html: &mut String, report: &FasterpReport) {
         &format!("{}%", before.gc_content * 100.0),
     );
     html.push_str("</table>\n");
+    html.push_str("</div>\n");
 
     // After Filtering section
+    html.push_str("<div>\n");
     html.push_str("<h2>After Filtering</h2>\n");
     html.push_str("<table>\n");
     add_row(html, "total reads", &format_number(after.total_reads));
@@ -348,6 +476,10 @@ fn write_before_after_comparison(html: &mut String, report: &FasterpReport) {
         &format!("{}%", after.gc_content * 100.0),
     );
     html.push_str("</table>\n");
+    html.push_str("</div>\n");
+
+    // Close side-by-side container
+    html.push_str("</div>\n");
 }
 
 fn write_filtering_results(html: &mut String, report: &FasterpReport) {
@@ -475,7 +607,7 @@ fn write_base_contents_chart(
     html.push_str("  paper_bgcolor: '#242424',\n");
     html.push_str("  plot_bgcolor: '#2a2a2a'\n");
     html.push_str("};\n");
-    let _ = writeln!(html, "Plotly.newPlot('{div_id}', data, layout);");
+    let _ = writeln!(html, "Plotly.newPlot('{div_id}', data, layout, {{responsive: true}});");
     html.push_str("</script>\n");
 }
 
@@ -556,6 +688,89 @@ fn write_kmer_table(html: &mut String, stats: &DetailedReadStats, title: &str) {
     html.push_str("</table>\n");
 }
 
+fn write_kmer_diff_table(
+    html: &mut String,
+    before: &DetailedReadStats,
+    after: &DetailedReadStats,
+    title: &str,
+) {
+    html.push_str("<h2>");
+    html.push_str(title);
+    html.push_str("</h2>\n");
+    html.push_str("<div class='sub_section_tips'>Red = decreased, Green = increased. Hover to see change.</div>\n");
+    html.push_str("<table class='kmer_table' style='border-collapse: collapse; font-size: 3px; font-family: monospace;'>\n");
+
+    // Calculate mean counts for reference
+    let before_total: usize = before.kmer_count.values().sum();
+    let before_mean = if before.kmer_count.is_empty() {
+        1.0
+    } else {
+        before_total as f64 / before.kmer_count.len() as f64
+    };
+
+    // Create 16x16 grid (256 5-mers organized by first 3 and last 2 bases)
+    html.push_str("<tr><td style='font-size:3px;'></td>");
+    // Header row with 2-mer suffixes
+    let bases = ['A', 'T', 'C', 'G'];
+    for b1 in &bases {
+        for b2 in &bases {
+            let _ = write!(
+                html,
+                "<td style='color:#666; font-weight:bold; text-align:center; padding:1px; font-size:3px;'>{b1}{b2}</td>"
+            );
+        }
+    }
+    html.push_str("</tr>\n");
+
+    // Content rows with 3-mer prefixes
+    for b1 in &bases {
+        for b2 in &bases {
+            for b3 in &bases {
+                html.push_str("<tr>");
+                let _ = write!(
+                    html,
+                    "<td style='color:#666; font-weight:bold; padding:1px; font-size:3px;'>{b1}{b2}{b3}</td>"
+                );
+
+                // For each 2-mer suffix
+                for b4 in &bases {
+                    for b5 in &bases {
+                        let kmer = format!("{b1}{b2}{b3}{b4}{b5}");
+                        let before_count = before.kmer_count.get(&kmer).copied().unwrap_or(0) as i64;
+                        let after_count = after.kmer_count.get(&kmer).copied().unwrap_or(0) as i64;
+                        let diff = after_count - before_count;
+
+                        // Calculate color based on difference
+                        // Green for increase, red for decrease
+                        let (r, g, b) = if diff > 0 {
+                            // Green gradient for increase
+                            let intensity = ((diff as f64 / before_mean).min(2.0) * 127.0) as u8;
+                            (0, 100 + intensity, 0)
+                        } else if diff < 0 {
+                            // Red gradient for decrease
+                            let intensity = ((-diff as f64 / before_mean).min(2.0) * 127.0) as u8;
+                            (100 + intensity, 0, 0)
+                        } else {
+                            // Gray for no change
+                            (128, 128, 128)
+                        };
+
+                        let _ = write!(
+                            html,
+                            "<td style='background:#{r:02x}{g:02x}{b:02x}; text-align:center; padding:1px; cursor:help; font-size:3px;' title='{kmer}: {diff:+} (before:{before_count}, after:{after_count})'>"
+                        );
+                        html.push_str(&kmer);
+                        html.push_str("</td>");
+                    }
+                }
+                html.push_str("</tr>\n");
+            }
+        }
+    }
+
+    html.push_str("</table>\n");
+}
+
 fn write_quality_histogram(
     html: &mut String,
     stats: &DetailedReadStats,
@@ -606,7 +821,7 @@ fn write_quality_histogram(
         html.push_str("  paper_bgcolor: '#242424',\n");
         html.push_str("  plot_bgcolor: '#2a2a2a'\n");
         html.push_str("};\n");
-        let _ = writeln!(html, "Plotly.newPlot('{div_id}', data, layout);");
+        let _ = writeln!(html, "Plotly.newPlot('{div_id}', data, layout, {{responsive: true}});");
         html.push_str("</script>\n");
     } else {
         html.push_str("<p>No quality histogram data available</p>\n");
@@ -734,7 +949,197 @@ fn write_quality_chart(html: &mut String, stats: &DetailedReadStats, title: &str
     html.push_str("  paper_bgcolor: '#242424',\n");
     html.push_str("  plot_bgcolor: '#2a2a2a'\n");
     html.push_str("};\n");
-    let _ = writeln!(html, "Plotly.newPlot('{div_id}', data, layout);");
+    let _ = writeln!(html, "Plotly.newPlot('{div_id}', data, layout, {{responsive: true}});");
+    html.push_str("</script>\n");
+}
+
+fn write_quality_diff_chart(
+    html: &mut String,
+    before: &DetailedReadStats,
+    after: &DetailedReadStats,
+    title: &str,
+    div_id: &str,
+) {
+    html.push_str("<h2>");
+    html.push_str(title);
+    html.push_str("</h2>\n");
+    let _ = writeln!(html, "<div id='{div_id}' class='chart'></div>");
+    html.push_str("<script>\n");
+
+    // Calculate difference (after - before)
+    let len = before.quality_curves.mean.len().min(after.quality_curves.mean.len());
+
+    html.push_str("var diff_trace = {\n");
+    html.push_str("  x: [");
+    for i in 0..len {
+        if i > 0 {
+            html.push(',');
+        }
+        html.push_str(&i.to_string());
+    }
+    html.push_str("],\n  y: [");
+    for i in 0..len {
+        if i > 0 {
+            html.push(',');
+        }
+        let diff = after.quality_curves.mean[i] - before.quality_curves.mean[i];
+        let _ = write!(html, "{diff:.2}");
+    }
+    html.push_str("],\n  name: 'Difference',\n  type: 'scatter',\n  mode: 'lines',\n");
+    html.push_str("  fill: 'tozeroy',\n");
+    html.push_str("  line: {color: '#fb8072', width: 1}\n");
+    html.push_str("};\n");
+
+    html.push_str("var data = [diff_trace];\n");
+    html.push_str("var layout = {\n");
+    html.push_str(
+        "  xaxis: {title: 'Position in read (bp)', color: '#c0c0c0', gridcolor: '#3a3a3a'},\n",
+    );
+    html.push_str(
+        "  yaxis: {title: 'Quality change', color: '#c0c0c0', gridcolor: '#3a3a3a', zeroline: true, zerolinecolor: '#666'},\n",
+    );
+    html.push_str("  margin: {l: 50, r: 30, t: 30, b: 50},\n");
+    html.push_str("  showlegend: false,\n");
+    html.push_str("  paper_bgcolor: '#242424',\n");
+    html.push_str("  plot_bgcolor: '#2a2a2a'\n");
+    html.push_str("};\n");
+    let _ = writeln!(html, "Plotly.newPlot('{div_id}', data, layout, {{responsive: true}});");
+    html.push_str("</script>\n");
+}
+
+fn write_quality_histogram_diff(
+    html: &mut String,
+    before: &DetailedReadStats,
+    after: &DetailedReadStats,
+    title: &str,
+    div_id: &str,
+) {
+    html.push_str("<h2>");
+    html.push_str(title);
+    html.push_str("</h2>\n");
+
+    if let (Some(before_hist), Some(after_hist)) = (&before.qual_hist, &after.qual_hist) {
+        let _ = writeln!(html, "<div id='{div_id}' class='chart'></div>");
+        html.push_str("<script>\n");
+
+        // Build a map of quality scores to counts
+        let mut diff_map = std::collections::BTreeMap::new();
+        for (q, count) in before_hist {
+            *diff_map.entry(*q).or_insert(0i64) -= *count as i64;
+        }
+        for (q, count) in after_hist {
+            *diff_map.entry(*q).or_insert(0i64) += *count as i64;
+        }
+
+        html.push_str("var diff_trace = {\n");
+        html.push_str("  x: [");
+        let mut first = true;
+        for (q, _) in &diff_map {
+            if !first {
+                html.push(',');
+            }
+            html.push_str(&q.to_string());
+            first = false;
+        }
+        html.push_str("],\n  y: [");
+
+        first = true;
+        for (_, diff) in &diff_map {
+            if !first {
+                html.push(',');
+            }
+            html.push_str(&diff.to_string());
+            first = false;
+        }
+        html.push_str("],\n");
+        html.push_str("  type: 'bar',\n");
+        html.push_str("  marker: {color: '#fb8072'}\n");
+        html.push_str("};\n");
+
+        html.push_str("var data = [diff_trace];\n");
+        html.push_str("var layout = {\n");
+        html.push_str(
+            "  xaxis: {title: 'Base quality score', color: '#c0c0c0', gridcolor: '#3a3a3a'},\n",
+        );
+        html.push_str("  yaxis: {title: 'Count change', color: '#c0c0c0', gridcolor: '#3a3a3a'},\n");
+        html.push_str("  margin: {l: 60, r: 30, t: 30, b: 50},\n");
+        html.push_str("  showlegend: false,\n");
+        html.push_str("  paper_bgcolor: '#242424',\n");
+        html.push_str("  plot_bgcolor: '#2a2a2a'\n");
+        html.push_str("};\n");
+        let _ = writeln!(html, "Plotly.newPlot('{div_id}', data, layout, {{responsive: true}});");
+        html.push_str("</script>\n");
+    } else {
+        html.push_str("<p>No quality histogram data available</p>\n");
+    }
+}
+
+fn write_base_contents_diff_chart(
+    html: &mut String,
+    before: &DetailedReadStats,
+    after: &DetailedReadStats,
+    title: &str,
+    div_id: &str,
+) {
+    html.push_str("<h2>");
+    html.push_str(title);
+    html.push_str("</h2>\n");
+    let _ = writeln!(html, "<div id='{div_id}' class='chart'></div>");
+    html.push_str("<script>\n");
+
+    let len = before.content_curves.a.len().min(after.content_curves.a.len());
+
+    // Create diff traces for A, T, C, G, GC
+    let bases = [
+        ("A", "#8dd3c7", &before.content_curves.a, &after.content_curves.a),
+        ("T", "#bebada", &before.content_curves.t, &after.content_curves.t),
+        ("C", "#fb8072", &before.content_curves.c, &after.content_curves.c),
+        ("G", "#80b1d3", &before.content_curves.g, &after.content_curves.g),
+        ("GC", "#333", &before.content_curves.gc, &after.content_curves.gc),
+    ];
+
+    for (base_name, color, before_data, after_data) in &bases {
+        let _ = writeln!(html, "var {}_trace = {{", base_name.to_lowercase());
+        html.push_str("  x: [");
+        for i in 0..len {
+            if i > 0 {
+                html.push(',');
+            }
+            html.push_str(&i.to_string());
+        }
+        html.push_str("],\n  y: [");
+
+        for i in 0..len {
+            if i > 0 {
+                html.push(',');
+            }
+            let diff = after_data[i] - before_data[i];
+            let _ = write!(html, "{diff:.2}");
+        }
+
+        html.push_str("],\n");
+        let _ = writeln!(html, "  name: '{base_name}',");
+        html.push_str("  type: 'scatter',\n  mode: 'lines',\n");
+        let _ = writeln!(html, "  line: {{color: '{color}', width: 1}},");
+        html.push_str("  opacity: 0.8\n");
+        html.push_str("};\n");
+    }
+
+    html.push_str("var data = [a_trace, t_trace, c_trace, g_trace, gc_trace];\n");
+    html.push_str("var layout = {\n");
+    html.push_str(
+        "  xaxis: {title: 'Position in read (bp)', color: '#c0c0c0', gridcolor: '#3a3a3a'},\n",
+    );
+    html.push_str(
+        "  yaxis: {title: 'Content change (%)', color: '#c0c0c0', gridcolor: '#3a3a3a', zeroline: true, zerolinecolor: '#666'},\n",
+    );
+    html.push_str("  margin: {l: 50, r: 30, t: 30, b: 50},\n");
+    html.push_str("  showlegend: true,\n");
+    html.push_str("  legend: {x: 1, xanchor: 'right', y: 1, font: {color: '#c0c0c0'}},\n");
+    html.push_str("  paper_bgcolor: '#242424',\n");
+    html.push_str("  plot_bgcolor: '#2a2a2a'\n");
+    html.push_str("};\n");
+    let _ = writeln!(html, "Plotly.newPlot('{div_id}', data, layout, {{responsive: true}});");
     html.push_str("</script>\n");
 }
 
@@ -789,7 +1194,7 @@ fn write_insert_size_chart(html: &mut String, insert_size: &InsertSizeStats) {
     html.push_str("  paper_bgcolor: '#242424',\n");
     html.push_str("  plot_bgcolor: '#2a2a2a'\n");
     html.push_str("};\n");
-    html.push_str("Plotly.newPlot('insert_size_chart', data, layout);\n");
+    html.push_str("Plotly.newPlot('insert_size_chart', data, layout, {responsive: true});\n");
     html.push_str("</script>\n");
 }
 
@@ -821,6 +1226,12 @@ fn write_command_info(html: &mut String, args: &Args, report: &FasterpReport) {
 
 fn write_footer(html: &mut String) {
     html.push_str("</div>\n");
+    // Trigger Plotly resize after page load to fix flex container sizing
+    html.push_str("<script>\n");
+    html.push_str("window.addEventListener('load', function() {\n");
+    html.push_str("  window.dispatchEvent(new Event('resize'));\n");
+    html.push_str("});\n");
+    html.push_str("</script>\n");
     html.push_str("</body>\n</html>\n");
 }
 
