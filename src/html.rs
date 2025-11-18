@@ -9,13 +9,19 @@ use anyhow::{Context, Result};
 use std::fmt::Write as FmtWrite;
 use std::fs::File;
 use std::io::Write;
+use std::time::Duration;
 
 /// Generate HTML report from processing statistics
-pub fn generate_html_report(report: &FasterpReport, args: &Args, output_path: &str) -> Result<()> {
+pub fn generate_html_report(
+    report: &FasterpReport,
+    args: &Args,
+    output_path: &str,
+    elapsed: Duration,
+) -> Result<()> {
     let mut html = String::with_capacity(50_000);
 
     write_header(&mut html);
-    write_body(&mut html, report, args);
+    write_body(&mut html, report, args, elapsed);
     write_footer(&mut html);
 
     // Write to file
@@ -41,53 +47,105 @@ fn write_header(html: &mut String) {
     html.push_str("<link href='https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500&display=swap' rel='stylesheet'>\n");
 
     write_css(html);
+    // Set theme before body renders to prevent flicker
+    html.push_str("<script>\n");
+    html.push_str("if (localStorage.getItem('theme') === 'light') {\n");
+    html.push_str("  document.documentElement.setAttribute('data-theme', 'light');\n");
+    html.push_str("}\n");
+    html.push_str("function getChartColors() {\n");
+    html.push_str("  var style = getComputedStyle(document.documentElement);\n");
+    html.push_str("  return {\n");
+    html.push_str("    paper: style.getPropertyValue('--chart-paper').trim() || '#242424',\n");
+    html.push_str("    plot: style.getPropertyValue('--chart-bg').trim() || '#2a2a2a',\n");
+    html.push_str("    grid: style.getPropertyValue('--chart-grid').trim() || '#3a3a3a',\n");
+    html.push_str("    text: style.getPropertyValue('--text-secondary').trim() || '#c0c0c0'\n");
+    html.push_str("  };\n");
+    html.push_str("}\n");
+    html.push_str("</script>\n");
     html.push_str("</head>\n<body>\n");
+    html.push_str("<button class='theme-toggle' onclick='toggleTheme()'>Toggle Light/Dark</button>\n");
     html.push_str("<div id='container'>\n");
 }
 
 fn write_css(html: &mut String) {
     html.push_str("<style>\n");
+    // CSS Variables for theming - clean technical style
+    html.push_str(":root {\n");
+    html.push_str("  --bg-primary: #1a1a1a;\n");
+    html.push_str("  --bg-secondary: #242424;\n");
+    html.push_str("  --bg-tertiary: #2a2a2a;\n");
+    html.push_str("  --border-color: #3a3a3a;\n");
+    html.push_str("  --border-accent: #4a9eff;\n");
+    html.push_str("  --text-primary: #e8e8e8;\n");
+    html.push_str("  --text-secondary: #c0c0c0;\n");
+    html.push_str("  --text-tertiary: #909090;\n");
+    html.push_str("  --text-muted: #666666;\n");
+    html.push_str("  --text-value: #ffffff;\n");
+    html.push_str("  --badge-bg: #2a3a4a;\n");
+    html.push_str("  --badge-text: #8ac4ff;\n");
+    html.push_str("  --chart-bg: #2a2a2a;\n");
+    html.push_str("  --chart-paper: #242424;\n");
+    html.push_str("  --chart-grid: #3a3a3a;\n");
+    html.push_str("}\n");
+    html.push_str(":root[data-theme='light'], [data-theme='light'] {\n");
+    html.push_str("  --bg-primary: #f5f5f5;\n");
+    html.push_str("  --bg-secondary: #ffffff;\n");
+    html.push_str("  --bg-tertiary: #fafafa;\n");
+    html.push_str("  --border-color: #e0e0e0;\n");
+    html.push_str("  --border-accent: #2563eb;\n");
+    html.push_str("  --text-primary: #1a1a1a;\n");
+    html.push_str("  --text-secondary: #4a4a4a;\n");
+    html.push_str("  --text-tertiary: #6a6a6a;\n");
+    html.push_str("  --text-muted: #909090;\n");
+    html.push_str("  --text-value: #000000;\n");
+    html.push_str("  --badge-bg: #e8f0fe;\n");
+    html.push_str("  --badge-text: #1e40af;\n");
+    html.push_str("  --chart-bg: #fafafa;\n");
+    html.push_str("  --chart-paper: #ffffff;\n");
+    html.push_str("  --chart-grid: #e0e0e0;\n");
+    html.push_str("}\n");
     html.push_str("* { margin: 0; padding: 0; box-sizing: border-box; }\n");
     html.push_str(
-        "body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif; ",
+        "body { font-family: 'JetBrains Mono', 'Courier New', monospace; ",
     );
-    html.push_str("background: #1a1a1a; padding: 20px; line-height: 1.6; color: #e0e0e0; }\n");
-    html.push_str("#container { width: 100%; background: #242424; ");
-    html.push_str("border: 1px solid #3a3a3a; padding: 40px; }\n");
-    html.push_str("h1 { color: #f0f0f0; font-size: 28px; font-weight: 600; ");
+    html.push_str("background: var(--bg-primary); padding: 10px; line-height: 1.4; color: var(--text-primary); font-size: 12px; }\n");
+    html.push_str("#container { width: 100%; background: var(--bg-secondary); ");
+    html.push_str("border: 2px solid var(--border-color); padding: 20px; }\n");
+    html.push_str(".theme-toggle { position: fixed; top: 10px; right: 10px; ");
+    html.push_str("padding: 4px 8px; border: 1px solid var(--border-color); ");
+    html.push_str("background: var(--bg-tertiary); color: var(--text-primary); ");
+    html.push_str("cursor: pointer; font-size: 10px; font-family: 'JetBrains Mono', monospace; z-index: 1000; }\n");
+    html.push_str(".theme-toggle:hover { background: var(--border-accent); color: var(--bg-primary); }\n");
+    html.push_str("h1 { color: var(--text-primary); font-size: 18px; font-weight: 500; ");
+    html.push_str("margin-bottom: 20px; border-bottom: 1px solid var(--border-accent); padding-bottom: 10px; }\n");
+    html.push_str("h2 { color: var(--text-primary); font-size: 13px; font-weight: 500; ");
+    html.push_str("margin-top: 25px; margin-bottom: 10px; ");
+    html.push_str("border-left: 3px solid var(--border-accent); padding-left: 10px; }\n");
+    html.push_str("h3 { color: var(--text-secondary); font-size: 11px; font-weight: 400; margin-top: 15px; }\n");
+    html.push_str("table { width: 100%; border-collapse: collapse; margin: 10px 0 20px 0; font-size: 11px; }\n");
+    html.push_str("th { background: var(--bg-tertiary); color: var(--text-primary); padding: 8px 10px; ");
+    html.push_str("text-align: left; font-weight: 500; font-size: 11px; ");
+    html.push_str("border: 1px solid var(--border-color); }\n");
+    html.push_str("td { padding: 6px 10px; border: 1px solid var(--border-color); font-size: 11px; }\n");
+    html.push_str(".col1 { font-weight: 400; color: var(--text-tertiary); width: 180px; }\n");
+    html.push_str(".value { color: var(--text-value); }\n");
+    html.push_str(".badge { display: inline-block; padding: 1px 4px; ");
+    html.push_str("font-size: 9px; ");
+    html.push_str("background: var(--badge-bg); color: var(--badge-text); margin-left: 4px; border: 1px solid var(--border-color); }\n");
+    html.push_str("footer { margin-top: 30px; padding-top: 15px; ");
+    html.push_str("border-top: 1px solid var(--border-color); color: var(--text-muted); font-size: 9px; }\n");
+    html.push_str(".command { background: var(--bg-tertiary); padding: 8px; ");
+    html.push_str("border: 1px solid var(--border-color); margin: 8px 0; ");
+    html.push_str("font-size: 10px; color: var(--text-value); word-break: break-all; }\n");
+    html.push_str(".chart { width: 100%; height: 280px; margin: 8px 0; ");
+    html.push_str("border: 1px solid var(--border-color); }\n");
+    html.push_str(".kmer_table { border-collapse: collapse; margin: 10px 0; font-size: 3px; }\n");
     html.push_str(
-        "margin-bottom: 30px; border-bottom: 2px solid #4a4a4a; padding-bottom: 10px; }\n",
+        ".kmer_table td { border: 1px solid var(--border-color); padding: 1px; text-align: center; }\n",
     );
-    html.push_str("h2 { color: #c0c0c0; font-size: 18px; font-weight: 600; ");
-    html.push_str("margin-top: 35px; margin-bottom: 15px; text-transform: uppercase; ");
-    html.push_str("letter-spacing: 0.5px; }\n");
-    html.push_str("table { width: 100%; border-collapse: collapse; margin: 15px 0 30px 0; }\n");
-    html.push_str("th { background: #2a2a2a; color: #e0e0e0; padding: 10px; ");
-    html.push_str("text-align: left; font-weight: 600; font-size: 13px; ");
-    html.push_str("border-bottom: 2px solid #3a3a3a; }\n");
-    html.push_str("td { padding: 10px; border-bottom: 1px solid #333; font-size: 14px; }\n");
-    html.push_str("tr:last-child td { border-bottom: none; }\n");
-    html.push_str(".col1 { font-weight: 500; color: #999; width: 250px; }\n");
-    html.push_str(".value { color: #d0d0d0; }\n");
-    html.push_str(".badge { display: inline-block; padding: 2px 8px; ");
-    html.push_str("border-radius: 3px; font-size: 12px; ");
-    html.push_str("background: #3a3a3a; color: #b0b0b0; margin-left: 6px; }\n");
-    html.push_str("footer { margin-top: 50px; padding-top: 20px; ");
-    html.push_str("border-top: 1px solid #3a3a3a; color: #888; font-size: 12px; }\n");
-    html.push_str(".command { background: #2a2a2a; padding: 10px; ");
-    html.push_str("border-left: 3px solid #4a4a4a; margin: 10px 0; ");
-    html.push_str("font-family: 'JetBrains Mono', 'Courier New', monospace; font-size: 12px; ");
-    html.push_str("color: #b0b0b0; word-break: break-all; }\n");
-    html.push_str(".chart { width: 100%; height: 350px; margin: 10px 0; ");
-    html.push_str("border: 1px solid #3a3a3a; }\n");
-    html.push_str(".kmer_table { border-collapse: collapse; margin: 20px 0; ");
-    html.push_str("font-family: 'JetBrains Mono', 'Courier New', monospace; font-size: 3px; }\n");
-    html.push_str(
-        ".kmer_table td { border: 1px solid #3a3a3a; padding: 1px; text-align: center; }\n",
-    );
-    html.push_str(".sub_section_tips { color: #888; font-size: 12px; ");
-    html.push_str("font-style: italic; margin: 10px 0; }\n");
-    html.push_str(".side-by-side { display: flex; gap: 20px; }\n");
+    html.push_str(".sub_section_tips { color: var(--text-muted); font-size: 9px; ");
+    html.push_str("margin: 6px 0; text-transform: lowercase; }\n");
+    html.push_str(".side-by-side { display: flex; gap: 15px; }\n");
     html.push_str(".side-by-side > div { flex: 1; min-width: 0; overflow: hidden; }\n");
     html.push_str(".side-by-side table { table-layout: fixed; }\n");
     html.push_str(".side-by-side h2 { margin-top: 0; }\n");
@@ -95,12 +153,12 @@ fn write_css(html: &mut String) {
 }
 
 #[allow(clippy::too_many_lines)]
-fn write_body(html: &mut String, report: &FasterpReport, args: &Args) {
+fn write_body(html: &mut String, report: &FasterpReport, args: &Args, elapsed: Duration) {
     // Header
     html.push_str("<h1>fasterp Quality Control Report</h1>\n");
 
     // Summary section
-    write_summary(html, report);
+    write_summary(html, report, elapsed);
 
     // Before/After comparison
     write_before_after_comparison(html, report);
@@ -369,7 +427,7 @@ fn write_body(html: &mut String, report: &FasterpReport, args: &Args) {
     write_command_info(html, args, report);
 }
 
-fn write_summary(html: &mut String, report: &FasterpReport) {
+fn write_summary(html: &mut String, report: &FasterpReport, elapsed: Duration) {
     html.push_str("<h2>Summary</h2>\n");
     html.push_str("<table>\n");
 
@@ -379,6 +437,14 @@ fn write_summary(html: &mut String, report: &FasterpReport) {
         &format!("{} (fasterp)", report.summary.fastp_version),
     );
     add_row(html, "sequencing", &report.summary.sequencing);
+
+    // Format runtime
+    let runtime_str = if elapsed.as_secs() >= 1 {
+        format!("{:.3} seconds", elapsed.as_secs_f64())
+    } else {
+        format!("{} ms", elapsed.as_millis())
+    };
+    add_row(html, "runtime", &runtime_str);
 
     let before = &report.summary.before_filtering;
     let after = &report.summary.after_filtering;
@@ -408,78 +474,229 @@ fn write_summary(html: &mut String, report: &FasterpReport) {
 fn write_before_after_comparison(html: &mut String, report: &FasterpReport) {
     let before = &report.summary.before_filtering;
     let after = &report.summary.after_filtering;
+    let is_paired = report.read2_before_filtering.is_some();
 
-    // Side-by-side container
-    html.push_str("<div class='side-by-side'>\n");
+    // Helper to format difference with sign
+    fn format_diff(diff: i64) -> String {
+        if diff > 0 {
+            format!("+{}", format_number(diff as usize))
+        } else if diff < 0 {
+            format!("-{}", format_number((-diff) as usize))
+        } else {
+            "0".to_string()
+        }
+    }
 
-    // Before Filtering section
-    html.push_str("<div>\n");
-    html.push_str("<h2>Before Filtering</h2>\n");
-    html.push_str("<table>\n");
-    add_row(html, "total reads", &format_number(before.total_reads));
-    add_row(html, "total bases", &format_number(before.total_bases));
-    add_row(
-        html,
-        "Q20 bases",
-        &format!(
-            "{} <span class='badge'>{}%</span>",
+    fn format_pct_diff(diff: f64) -> String {
+        if diff > 0.0 {
+            format!("+{:.2}%", diff)
+        } else if diff < 0.0 {
+            format!("{:.2}%", diff)
+        } else {
+            "0%".to_string()
+        }
+    }
+
+    if is_paired {
+        // Paired-end: show Read1 and Read2 in separate tables
+        let r1_before = &report.read1_before_filtering;
+        let r2_before = report.read2_before_filtering.as_ref().unwrap();
+        let r1_after = report.read1_after_filtering.as_ref();
+        let r2_after = report.read2_after_filtering.as_ref();
+        let reads_per_file = before.total_reads / 2;
+        let after_reads_per_file = after.total_reads / 2;
+
+        // Read1 table
+        html.push_str("<h2>Read 1: Before / After</h2>\n");
+        html.push_str("<table>\n");
+        html.push_str("<tr><th></th><th>Before</th><th>After</th><th>Diff</th></tr>\n");
+
+        // Total reads
+        let reads_diff = after_reads_per_file as i64 - reads_per_file as i64;
+        html.push_str("<tr><td class='col1'>total reads</td>");
+        html.push_str(&format!("<td class='value'>{}</td>", format_number(reads_per_file)));
+        html.push_str(&format!("<td class='value'>{}</td>", format_number(after_reads_per_file)));
+        html.push_str(&format!("<td class='value'>{}</td></tr>\n", format_diff(reads_diff)));
+
+        // Total bases
+        html.push_str("<tr><td class='col1'>total bases</td>");
+        html.push_str(&format!("<td class='value'>{}</td>", format_number(r1_before.total_bases)));
+        if let Some(r1a) = r1_after {
+            let bases_diff = r1a.total_bases as i64 - r1_before.total_bases as i64;
+            html.push_str(&format!("<td class='value'>{}</td>", format_number(r1a.total_bases)));
+            html.push_str(&format!("<td class='value'>{}</td></tr>\n", format_diff(bases_diff)));
+        } else {
+            html.push_str("<td class='value'>-</td><td class='value'>-</td></tr>\n");
+        }
+
+        // Q20 bases
+        let r1_before_q20_pct = if r1_before.total_bases > 0 { r1_before.q20_bases as f64 * 100.0 / r1_before.total_bases as f64 } else { 0.0 };
+        html.push_str("<tr><td class='col1'>Q20 bases</td>");
+        html.push_str(&format!(
+            "<td class='value'>{} <span class='badge'>{:.2}%</span></td>",
+            format_number(r1_before.q20_bases),
+            r1_before_q20_pct
+        ));
+        if let Some(r1a) = r1_after {
+            let r1_after_q20_pct = if r1a.total_bases > 0 { r1a.q20_bases as f64 * 100.0 / r1a.total_bases as f64 } else { 0.0 };
+            let pct_diff = r1_after_q20_pct - r1_before_q20_pct;
+            html.push_str(&format!(
+                "<td class='value'>{} <span class='badge'>{:.2}%</span></td>",
+                format_number(r1a.q20_bases),
+                r1_after_q20_pct
+            ));
+            html.push_str(&format!("<td class='value'>{}</td></tr>\n", format_pct_diff(pct_diff)));
+        } else {
+            html.push_str("<td class='value'>-</td><td class='value'>-</td></tr>\n");
+        }
+
+        // Q30 bases
+        let r1_before_q30_pct = if r1_before.total_bases > 0 { r1_before.q30_bases as f64 * 100.0 / r1_before.total_bases as f64 } else { 0.0 };
+        html.push_str("<tr><td class='col1'>Q30 bases</td>");
+        html.push_str(&format!(
+            "<td class='value'>{} <span class='badge'>{:.2}%</span></td>",
+            format_number(r1_before.q30_bases),
+            r1_before_q30_pct
+        ));
+        if let Some(r1a) = r1_after {
+            let r1_after_q30_pct = if r1a.total_bases > 0 { r1a.q30_bases as f64 * 100.0 / r1a.total_bases as f64 } else { 0.0 };
+            let pct_diff = r1_after_q30_pct - r1_before_q30_pct;
+            html.push_str(&format!(
+                "<td class='value'>{} <span class='badge'>{:.2}%</span></td>",
+                format_number(r1a.q30_bases),
+                r1_after_q30_pct
+            ));
+            html.push_str(&format!("<td class='value'>{}</td></tr>\n", format_pct_diff(pct_diff)));
+        } else {
+            html.push_str("<td class='value'>-</td><td class='value'>-</td></tr>\n");
+        }
+
+        html.push_str("</table>\n");
+
+        // Read2 table
+        html.push_str("<h2>Read 2: Before / After</h2>\n");
+        html.push_str("<table>\n");
+        html.push_str("<tr><th></th><th>Before</th><th>After</th><th>Diff</th></tr>\n");
+
+        // Total reads
+        html.push_str("<tr><td class='col1'>total reads</td>");
+        html.push_str(&format!("<td class='value'>{}</td>", format_number(reads_per_file)));
+        html.push_str(&format!("<td class='value'>{}</td>", format_number(after_reads_per_file)));
+        html.push_str(&format!("<td class='value'>{}</td></tr>\n", format_diff(reads_diff)));
+
+        // Total bases
+        html.push_str("<tr><td class='col1'>total bases</td>");
+        html.push_str(&format!("<td class='value'>{}</td>", format_number(r2_before.total_bases)));
+        if let Some(r2a) = r2_after {
+            let bases_diff = r2a.total_bases as i64 - r2_before.total_bases as i64;
+            html.push_str(&format!("<td class='value'>{}</td>", format_number(r2a.total_bases)));
+            html.push_str(&format!("<td class='value'>{}</td></tr>\n", format_diff(bases_diff)));
+        } else {
+            html.push_str("<td class='value'>-</td><td class='value'>-</td></tr>\n");
+        }
+
+        // Q20 bases
+        let r2_before_q20_pct = if r2_before.total_bases > 0 { r2_before.q20_bases as f64 * 100.0 / r2_before.total_bases as f64 } else { 0.0 };
+        html.push_str("<tr><td class='col1'>Q20 bases</td>");
+        html.push_str(&format!(
+            "<td class='value'>{} <span class='badge'>{:.2}%</span></td>",
+            format_number(r2_before.q20_bases),
+            r2_before_q20_pct
+        ));
+        if let Some(r2a) = r2_after {
+            let r2_after_q20_pct = if r2a.total_bases > 0 { r2a.q20_bases as f64 * 100.0 / r2a.total_bases as f64 } else { 0.0 };
+            let pct_diff = r2_after_q20_pct - r2_before_q20_pct;
+            html.push_str(&format!(
+                "<td class='value'>{} <span class='badge'>{:.2}%</span></td>",
+                format_number(r2a.q20_bases),
+                r2_after_q20_pct
+            ));
+            html.push_str(&format!("<td class='value'>{}</td></tr>\n", format_pct_diff(pct_diff)));
+        } else {
+            html.push_str("<td class='value'>-</td><td class='value'>-</td></tr>\n");
+        }
+
+        // Q30 bases
+        let r2_before_q30_pct = if r2_before.total_bases > 0 { r2_before.q30_bases as f64 * 100.0 / r2_before.total_bases as f64 } else { 0.0 };
+        html.push_str("<tr><td class='col1'>Q30 bases</td>");
+        html.push_str(&format!(
+            "<td class='value'>{} <span class='badge'>{:.2}%</span></td>",
+            format_number(r2_before.q30_bases),
+            r2_before_q30_pct
+        ));
+        if let Some(r2a) = r2_after {
+            let r2_after_q30_pct = if r2a.total_bases > 0 { r2a.q30_bases as f64 * 100.0 / r2a.total_bases as f64 } else { 0.0 };
+            let pct_diff = r2_after_q30_pct - r2_before_q30_pct;
+            html.push_str(&format!(
+                "<td class='value'>{} <span class='badge'>{:.2}%</span></td>",
+                format_number(r2a.q30_bases),
+                r2_after_q30_pct
+            ));
+            html.push_str(&format!("<td class='value'>{}</td></tr>\n", format_pct_diff(pct_diff)));
+        } else {
+            html.push_str("<td class='value'>-</td><td class='value'>-</td></tr>\n");
+        }
+
+        html.push_str("</table>\n");
+    } else {
+        // Single-end: show simple before/after with diff
+        html.push_str("<h2>Before / After Filtering</h2>\n");
+        html.push_str("<table>\n");
+        html.push_str("<tr><th></th><th>Before</th><th>After</th><th>Diff</th></tr>\n");
+
+        // Total reads
+        let reads_diff = after.total_reads as i64 - before.total_reads as i64;
+        html.push_str("<tr><td class='col1'>total reads</td>");
+        html.push_str(&format!("<td class='value'>{}</td>", format_number(before.total_reads)));
+        html.push_str(&format!("<td class='value'>{}</td>", format_number(after.total_reads)));
+        html.push_str(&format!("<td class='value'>{}</td></tr>\n", format_diff(reads_diff)));
+
+        // Total bases
+        let bases_diff = after.total_bases as i64 - before.total_bases as i64;
+        html.push_str("<tr><td class='col1'>total bases</td>");
+        html.push_str(&format!("<td class='value'>{}</td>", format_number(before.total_bases)));
+        html.push_str(&format!("<td class='value'>{}</td>", format_number(after.total_bases)));
+        html.push_str(&format!("<td class='value'>{}</td></tr>\n", format_diff(bases_diff)));
+
+        // Q20 bases
+        let q20_pct_diff = (after.q20_rate - before.q20_rate) * 100.0;
+        html.push_str("<tr><td class='col1'>Q20 bases</td>");
+        html.push_str(&format!(
+            "<td class='value'>{} <span class='badge'>{:.2}%</span></td>",
             format_number(before.q20_bases),
             before.q20_rate * 100.0
-        ),
-    );
-    add_row(
-        html,
-        "Q30 bases",
-        &format!(
-            "{} <span class='badge'>{}%</span>",
-            format_number(before.q30_bases),
-            before.q30_rate * 100.0
-        ),
-    );
-    add_row(html, "Q40 bases", "0 <span class='badge'>0%</span>");
-    add_row(
-        html,
-        "GC content",
-        &format!("{}%", before.gc_content * 100.0),
-    );
-    html.push_str("</table>\n");
-    html.push_str("</div>\n");
-
-    // After Filtering section
-    html.push_str("<div>\n");
-    html.push_str("<h2>After Filtering</h2>\n");
-    html.push_str("<table>\n");
-    add_row(html, "total reads", &format_number(after.total_reads));
-    add_row(html, "total bases", &format_number(after.total_bases));
-    add_row(
-        html,
-        "Q20 bases",
-        &format!(
-            "{} <span class='badge'>{}%</span>",
+        ));
+        html.push_str(&format!(
+            "<td class='value'>{} <span class='badge'>{:.2}%</span></td>",
             format_number(after.q20_bases),
             after.q20_rate * 100.0
-        ),
-    );
-    add_row(
-        html,
-        "Q30 bases",
-        &format!(
-            "{} <span class='badge'>{}%</span>",
+        ));
+        html.push_str(&format!("<td class='value'>{}</td></tr>\n", format_pct_diff(q20_pct_diff)));
+
+        // Q30 bases
+        let q30_pct_diff = (after.q30_rate - before.q30_rate) * 100.0;
+        html.push_str("<tr><td class='col1'>Q30 bases</td>");
+        html.push_str(&format!(
+            "<td class='value'>{} <span class='badge'>{:.2}%</span></td>",
+            format_number(before.q30_bases),
+            before.q30_rate * 100.0
+        ));
+        html.push_str(&format!(
+            "<td class='value'>{} <span class='badge'>{:.2}%</span></td>",
             format_number(after.q30_bases),
             after.q30_rate * 100.0
-        ),
-    );
-    add_row(html, "Q40 bases", "0 <span class='badge'>0%</span>");
-    add_row(
-        html,
-        "GC content",
-        &format!("{}%", after.gc_content * 100.0),
-    );
-    html.push_str("</table>\n");
-    html.push_str("</div>\n");
+        ));
+        html.push_str(&format!("<td class='value'>{}</td></tr>\n", format_pct_diff(q30_pct_diff)));
 
-    // Close side-by-side container
-    html.push_str("</div>\n");
+        // GC content
+        let gc_diff = (after.gc_content - before.gc_content) * 100.0;
+        html.push_str("<tr><td class='col1'>GC content</td>");
+        html.push_str(&format!("<td class='value'>{:.2}%</td>", before.gc_content * 100.0));
+        html.push_str(&format!("<td class='value'>{:.2}%</td>", after.gc_content * 100.0));
+        html.push_str(&format!("<td class='value'>{}</td></tr>\n", format_pct_diff(gc_diff)));
+
+        html.push_str("</table>\n");
+    }
 }
 
 fn write_filtering_results(html: &mut String, report: &FasterpReport) {
@@ -561,7 +778,7 @@ fn write_base_contents_chart(
     let bases = [
         ("A", "#8dd3c7", &stats.content_curves.a),
         ("T", "#bebada", &stats.content_curves.t),
-        ("C", "#fb8072", &stats.content_curves.c),
+        ("C", "#5dade2", &stats.content_curves.c),
         ("G", "#80b1d3", &stats.content_curves.g),
         ("N", "#ff0000", &stats.content_curves.n),
         ("GC", "#333", &stats.content_curves.gc),
@@ -594,18 +811,19 @@ fn write_base_contents_chart(
     }
 
     html.push_str("var data = [a_trace, t_trace, c_trace, g_trace, n_trace, gc_trace];\n");
+    html.push_str("var colors = getChartColors();\n");
     html.push_str("var layout = {\n");
     html.push_str(
-        "  xaxis: {title: 'Position in read (bp)', color: '#c0c0c0', gridcolor: '#3a3a3a'},\n",
+        "  xaxis: {title: 'Position in read (bp)', color: colors.text, gridcolor: colors.grid},\n",
     );
     html.push_str(
-        "  yaxis: {title: 'Base content (%)', color: '#c0c0c0', gridcolor: '#3a3a3a'},\n",
+        "  yaxis: {title: 'Base content (%)', color: colors.text, gridcolor: colors.grid},\n",
     );
     html.push_str("  margin: {l: 50, r: 30, t: 30, b: 50},\n");
     html.push_str("  showlegend: true,\n");
-    html.push_str("  legend: {x: 1, xanchor: 'right', y: 1, font: {color: '#c0c0c0'}},\n");
-    html.push_str("  paper_bgcolor: '#242424',\n");
-    html.push_str("  plot_bgcolor: '#2a2a2a'\n");
+    html.push_str("  legend: {x: 1, xanchor: 'right', y: 1, font: {color: colors.text}},\n");
+    html.push_str("  paper_bgcolor: colors.paper,\n");
+    html.push_str("  plot_bgcolor: colors.plot\n");
     html.push_str("};\n");
     let _ = writeln!(html, "Plotly.newPlot('{div_id}', data, layout, {{responsive: true}});");
     html.push_str("</script>\n");
@@ -615,7 +833,7 @@ fn write_kmer_table(html: &mut String, stats: &DetailedReadStats, title: &str) {
     html.push_str("<h2>");
     html.push_str(title);
     html.push_str("</h2>\n");
-    html.push_str("<div class='sub_section_tips'>Darker background means larger counts. Hover to see count.</div>\n");
+    html.push_str("<div class='sub_section_tips'>Blue intensity shows count relative to mean. Hover to see count.</div>\n");
     html.push_str("<table class='kmer_table' style='border-collapse: collapse; font-size: 3px; font-family: monospace;'>\n");
 
     // Get top 256 kmers (5-mers as in fastp)
@@ -638,7 +856,7 @@ fn write_kmer_table(html: &mut String, stats: &DetailedReadStats, title: &str) {
         for b2 in &bases {
             let _ = write!(
                 html,
-                "<td style='color:#666; font-weight:bold; text-align:center; padding:1px; font-size:3px;'>{b1}{b2}</td>"
+                "<td style='color:var(--text-muted); font-weight:bold; text-align:center; padding:1px; font-size:3px;'>{b1}{b2}</td>"
             );
         }
     }
@@ -651,7 +869,7 @@ fn write_kmer_table(html: &mut String, stats: &DetailedReadStats, title: &str) {
                 html.push_str("<tr>");
                 let _ = write!(
                     html,
-                    "<td style='color:#666; font-weight:bold; padding:1px; font-size:3px;'>{b1}{b2}{b3}</td>"
+                    "<td style='color:var(--text-muted); font-weight:bold; padding:1px; font-size:3px;'>{b1}{b2}{b3}</td>"
                 );
 
                 // For each 2-mer suffix
@@ -660,7 +878,7 @@ fn write_kmer_table(html: &mut String, stats: &DetailedReadStats, title: &str) {
                         let kmer = format!("{b1}{b2}{b3}{b4}{b5}");
                         let count = stats.kmer_count.get(&kmer).copied().unwrap_or(0);
 
-                        // Calculate color intensity
+                        // Calculate color intensity - use subtle blue with transparency
                         let prop = count as f64 / mean_count;
                         let frac = if prop > 2.0 {
                             (prop - 2.0) / 20.0 + 0.5
@@ -670,11 +888,13 @@ fn write_kmer_table(html: &mut String, stats: &DetailedReadStats, title: &str) {
                             0.5
                         };
                         let frac = frac.clamp(0.01, 1.0);
-                        let gray = ((1.0 - frac) * 255.0) as u8;
+
+                        // Use rgba with transparency - blue tint that works in both themes
+                        let alpha = frac * 0.4;
 
                         let _ = write!(
                             html,
-                            "<td style='background:#{gray:02x}{gray:02x}{gray:02x}; text-align:center; padding:1px; cursor:help; font-size:3px;' title='{kmer}:{count} ({prop:.2}x mean)'>"
+                            "<td style='background:rgba(74,158,255,{alpha:.2}); color:var(--text-primary); text-align:center; padding:1px; cursor:help; font-size:3px;' title='{kmer}:{count} ({prop:.2}x mean)'>"
                         );
                         html.push_str(&kmer);
                         html.push_str("</td>");
@@ -697,7 +917,7 @@ fn write_kmer_diff_table(
     html.push_str("<h2>");
     html.push_str(title);
     html.push_str("</h2>\n");
-    html.push_str("<div class='sub_section_tips'>Red = decreased, Green = increased. Hover to see change.</div>\n");
+    html.push_str("<div class='sub_section_tips'>Orange = decreased, Teal = increased. Hover to see change.</div>\n");
     html.push_str("<table class='kmer_table' style='border-collapse: collapse; font-size: 3px; font-family: monospace;'>\n");
 
     // Calculate mean counts for reference
@@ -716,7 +936,7 @@ fn write_kmer_diff_table(
         for b2 in &bases {
             let _ = write!(
                 html,
-                "<td style='color:#666; font-weight:bold; text-align:center; padding:1px; font-size:3px;'>{b1}{b2}</td>"
+                "<td style='color:var(--text-muted); font-weight:bold; text-align:center; padding:1px; font-size:3px;'>{b1}{b2}</td>"
             );
         }
     }
@@ -729,7 +949,7 @@ fn write_kmer_diff_table(
                 html.push_str("<tr>");
                 let _ = write!(
                     html,
-                    "<td style='color:#666; font-weight:bold; padding:1px; font-size:3px;'>{b1}{b2}{b3}</td>"
+                    "<td style='color:var(--text-muted); font-weight:bold; padding:1px; font-size:3px;'>{b1}{b2}{b3}</td>"
                 );
 
                 // For each 2-mer suffix
@@ -740,24 +960,24 @@ fn write_kmer_diff_table(
                         let after_count = after.kmer_count.get(&kmer).copied().unwrap_or(0) as i64;
                         let diff = after_count - before_count;
 
-                        // Calculate color based on difference
-                        // Green for increase, red for decrease
-                        let (r, g, b) = if diff > 0 {
-                            // Green gradient for increase
-                            let intensity = ((diff as f64 / before_mean).min(2.0) * 127.0) as u8;
-                            (0, 100 + intensity, 0)
+                        // Calculate color based on difference using transparency
+                        // Teal for increase, orange for decrease
+                        let (r, g, b, alpha) = if diff > 0 {
+                            // Teal with transparency for increase
+                            let intensity = ((diff as f64 / before_mean).min(2.0) * 0.5).min(1.0);
+                            (0, 200, 150, intensity * 0.5)
                         } else if diff < 0 {
-                            // Red gradient for decrease
-                            let intensity = ((-diff as f64 / before_mean).min(2.0) * 127.0) as u8;
-                            (100 + intensity, 0, 0)
+                            // Orange with transparency for decrease
+                            let intensity = ((-diff as f64 / before_mean).min(2.0) * 0.5).min(1.0);
+                            (255, 150, 50, intensity * 0.5)
                         } else {
-                            // Gray for no change
-                            (128, 128, 128)
+                            // Neutral - no tint
+                            (128, 128, 128, 0.1)
                         };
 
                         let _ = write!(
                             html,
-                            "<td style='background:#{r:02x}{g:02x}{b:02x}; text-align:center; padding:1px; cursor:help; font-size:3px;' title='{kmer}: {diff:+} (before:{before_count}, after:{after_count})'>"
+                            "<td style='background:rgba({r},{g},{b},{alpha:.2}); color:var(--text-primary); text-align:center; padding:1px; cursor:help; font-size:3px;' title='{kmer}: {diff:+} (before:{before_count}, after:{after_count})'>"
                         );
                         html.push_str(&kmer);
                         html.push_str("</td>");
@@ -811,15 +1031,16 @@ fn write_quality_histogram(
         html.push_str("};\n");
 
         html.push_str("var data = [hist_trace];\n");
+        html.push_str("var colors = getChartColors();\n");
         html.push_str("var layout = {\n");
         html.push_str(
-            "  xaxis: {title: 'Base quality score', color: '#c0c0c0', gridcolor: '#3a3a3a'},\n",
+            "  xaxis: {title: 'Base quality score', color: colors.text, gridcolor: colors.grid},\n",
         );
-        html.push_str("  yaxis: {title: 'Base count', color: '#c0c0c0', gridcolor: '#3a3a3a'},\n");
+        html.push_str("  yaxis: {title: 'Base count', color: colors.text, gridcolor: colors.grid},\n");
         html.push_str("  margin: {l: 60, r: 30, t: 30, b: 50},\n");
         html.push_str("  showlegend: false,\n");
-        html.push_str("  paper_bgcolor: '#242424',\n");
-        html.push_str("  plot_bgcolor: '#2a2a2a'\n");
+        html.push_str("  paper_bgcolor: colors.paper,\n");
+        html.push_str("  plot_bgcolor: colors.plot\n");
         html.push_str("};\n");
         let _ = writeln!(html, "Plotly.newPlot('{div_id}', data, layout, {{responsive: true}});");
         html.push_str("</script>\n");
@@ -913,7 +1134,7 @@ fn write_quality_chart(html: &mut String, stats: &DetailedReadStats, title: &str
         let _ = write!(html, "{val:.2}");
     }
     html.push_str("],\n  name: 'C',\n  type: 'scatter',\n  mode: 'lines',\n");
-    html.push_str("  line: {color: '#fb8072', width: 1},\n  opacity: 0.6\n");
+    html.push_str("  line: {color: '#5dade2', width: 1},\n  opacity: 0.6\n");
     html.push_str("};\n");
 
     // G trace
@@ -938,16 +1159,17 @@ fn write_quality_chart(html: &mut String, stats: &DetailedReadStats, title: &str
 
     // Layout and plot
     html.push_str("var data = [mean_trace, a_trace, t_trace, c_trace, g_trace];\n");
+    html.push_str("var colors = getChartColors();\n");
     html.push_str("var layout = {\n");
     html.push_str(
-        "  xaxis: {title: 'Position in read (bp)', color: '#c0c0c0', gridcolor: '#3a3a3a'},\n",
+        "  xaxis: {title: 'Position in read (bp)', color: colors.text, gridcolor: colors.grid},\n",
     );
-    html.push_str("  yaxis: {title: 'Quality score', color: '#c0c0c0', gridcolor: '#3a3a3a'},\n");
+    html.push_str("  yaxis: {title: 'Quality score', color: colors.text, gridcolor: colors.grid},\n");
     html.push_str("  margin: {l: 50, r: 30, t: 30, b: 50},\n");
     html.push_str("  showlegend: true,\n");
-    html.push_str("  legend: {x: 1, xanchor: 'right', y: 1, font: {color: '#c0c0c0'}},\n");
-    html.push_str("  paper_bgcolor: '#242424',\n");
-    html.push_str("  plot_bgcolor: '#2a2a2a'\n");
+    html.push_str("  legend: {x: 1, xanchor: 'right', y: 1, font: {color: colors.text}},\n");
+    html.push_str("  paper_bgcolor: colors.paper,\n");
+    html.push_str("  plot_bgcolor: colors.plot\n");
     html.push_str("};\n");
     let _ = writeln!(html, "Plotly.newPlot('{div_id}', data, layout, {{responsive: true}});");
     html.push_str("</script>\n");
@@ -987,21 +1209,22 @@ fn write_quality_diff_chart(
     }
     html.push_str("],\n  name: 'Difference',\n  type: 'scatter',\n  mode: 'lines',\n");
     html.push_str("  fill: 'tozeroy',\n");
-    html.push_str("  line: {color: '#fb8072', width: 1}\n");
+    html.push_str("  line: {color: '#5dade2', width: 1}\n");
     html.push_str("};\n");
 
     html.push_str("var data = [diff_trace];\n");
+    html.push_str("var colors = getChartColors();\n");
     html.push_str("var layout = {\n");
     html.push_str(
-        "  xaxis: {title: 'Position in read (bp)', color: '#c0c0c0', gridcolor: '#3a3a3a'},\n",
+        "  xaxis: {title: 'Position in read (bp)', color: colors.text, gridcolor: colors.grid},\n",
     );
     html.push_str(
-        "  yaxis: {title: 'Quality change', color: '#c0c0c0', gridcolor: '#3a3a3a', zeroline: true, zerolinecolor: '#666'},\n",
+        "  yaxis: {title: 'Quality change', color: colors.text, gridcolor: colors.grid, zeroline: true, zerolinecolor: '#666'},\n",
     );
     html.push_str("  margin: {l: 50, r: 30, t: 30, b: 50},\n");
     html.push_str("  showlegend: false,\n");
-    html.push_str("  paper_bgcolor: '#242424',\n");
-    html.push_str("  plot_bgcolor: '#2a2a2a'\n");
+    html.push_str("  paper_bgcolor: colors.paper,\n");
+    html.push_str("  plot_bgcolor: colors.plot\n");
     html.push_str("};\n");
     let _ = writeln!(html, "Plotly.newPlot('{div_id}', data, layout, {{responsive: true}});");
     html.push_str("</script>\n");
@@ -1053,19 +1276,20 @@ fn write_quality_histogram_diff(
         }
         html.push_str("],\n");
         html.push_str("  type: 'bar',\n");
-        html.push_str("  marker: {color: '#fb8072'}\n");
+        html.push_str("  marker: {color: '#5dade2'}\n");
         html.push_str("};\n");
 
         html.push_str("var data = [diff_trace];\n");
+        html.push_str("var colors = getChartColors();\n");
         html.push_str("var layout = {\n");
         html.push_str(
-            "  xaxis: {title: 'Base quality score', color: '#c0c0c0', gridcolor: '#3a3a3a'},\n",
+            "  xaxis: {title: 'Base quality score', color: colors.text, gridcolor: colors.grid},\n",
         );
-        html.push_str("  yaxis: {title: 'Count change', color: '#c0c0c0', gridcolor: '#3a3a3a'},\n");
+        html.push_str("  yaxis: {title: 'Count change', color: colors.text, gridcolor: colors.grid},\n");
         html.push_str("  margin: {l: 60, r: 30, t: 30, b: 50},\n");
         html.push_str("  showlegend: false,\n");
-        html.push_str("  paper_bgcolor: '#242424',\n");
-        html.push_str("  plot_bgcolor: '#2a2a2a'\n");
+        html.push_str("  paper_bgcolor: colors.paper,\n");
+        html.push_str("  plot_bgcolor: colors.plot\n");
         html.push_str("};\n");
         let _ = writeln!(html, "Plotly.newPlot('{div_id}', data, layout, {{responsive: true}});");
         html.push_str("</script>\n");
@@ -1093,7 +1317,7 @@ fn write_base_contents_diff_chart(
     let bases = [
         ("A", "#8dd3c7", &before.content_curves.a, &after.content_curves.a),
         ("T", "#bebada", &before.content_curves.t, &after.content_curves.t),
-        ("C", "#fb8072", &before.content_curves.c, &after.content_curves.c),
+        ("C", "#5dade2", &before.content_curves.c, &after.content_curves.c),
         ("G", "#80b1d3", &before.content_curves.g, &after.content_curves.g),
         ("GC", "#333", &before.content_curves.gc, &after.content_curves.gc),
     ];
@@ -1126,18 +1350,19 @@ fn write_base_contents_diff_chart(
     }
 
     html.push_str("var data = [a_trace, t_trace, c_trace, g_trace, gc_trace];\n");
+    html.push_str("var colors = getChartColors();\n");
     html.push_str("var layout = {\n");
     html.push_str(
-        "  xaxis: {title: 'Position in read (bp)', color: '#c0c0c0', gridcolor: '#3a3a3a'},\n",
+        "  xaxis: {title: 'Position in read (bp)', color: colors.text, gridcolor: colors.grid},\n",
     );
     html.push_str(
-        "  yaxis: {title: 'Content change (%)', color: '#c0c0c0', gridcolor: '#3a3a3a', zeroline: true, zerolinecolor: '#666'},\n",
+        "  yaxis: {title: 'Content change (%)', color: colors.text, gridcolor: colors.grid, zeroline: true, zerolinecolor: '#666'},\n",
     );
     html.push_str("  margin: {l: 50, r: 30, t: 30, b: 50},\n");
     html.push_str("  showlegend: true,\n");
-    html.push_str("  legend: {x: 1, xanchor: 'right', y: 1, font: {color: '#c0c0c0'}},\n");
-    html.push_str("  paper_bgcolor: '#242424',\n");
-    html.push_str("  plot_bgcolor: '#2a2a2a'\n");
+    html.push_str("  legend: {x: 1, xanchor: 'right', y: 1, font: {color: colors.text}},\n");
+    html.push_str("  paper_bgcolor: colors.paper,\n");
+    html.push_str("  plot_bgcolor: colors.plot\n");
     html.push_str("};\n");
     let _ = writeln!(html, "Plotly.newPlot('{div_id}', data, layout, {{responsive: true}});");
     html.push_str("</script>\n");
@@ -1180,19 +1405,20 @@ fn write_insert_size_chart(html: &mut String, insert_size: &InsertSizeStats) {
     html.push_str("  x: insert_sizes,\n");
     html.push_str("  y: counts,\n");
     html.push_str("  type: 'bar',\n");
-    html.push_str("  marker: {color: '#fb8072'}\n");
+    html.push_str("  marker: {color: '#5dade2'}\n");
     html.push_str("};\n");
 
     html.push_str("var data = [trace];\n");
+    html.push_str("var colors = getChartColors();\n");
     html.push_str("var layout = {\n");
     html.push_str(
-        "  xaxis: {title: 'Insert size (bp)', color: '#c0c0c0', gridcolor: '#3a3a3a'},\n",
+        "  xaxis: {title: 'Insert size (bp)', color: colors.text, gridcolor: colors.grid},\n",
     );
-    html.push_str("  yaxis: {title: 'Read pairs', color: '#c0c0c0', gridcolor: '#3a3a3a'},\n");
+    html.push_str("  yaxis: {title: 'Read pairs', color: colors.text, gridcolor: colors.grid},\n");
     html.push_str("  margin: {l: 60, r: 30, t: 30, b: 50},\n");
     html.push_str("  showlegend: false,\n");
-    html.push_str("  paper_bgcolor: '#242424',\n");
-    html.push_str("  plot_bgcolor: '#2a2a2a'\n");
+    html.push_str("  paper_bgcolor: colors.paper,\n");
+    html.push_str("  plot_bgcolor: colors.plot\n");
     html.push_str("};\n");
     html.push_str("Plotly.newPlot('insert_size_chart', data, layout, {responsive: true});\n");
     html.push_str("</script>\n");
@@ -1226,10 +1452,41 @@ fn write_command_info(html: &mut String, args: &Args, report: &FasterpReport) {
 
 fn write_footer(html: &mut String) {
     html.push_str("</div>\n");
-    // Trigger Plotly resize after page load to fix flex container sizing
+    // Theme toggle and Plotly resize scripts
     html.push_str("<script>\n");
+    html.push_str("function updateChartColors() {\n");
+    html.push_str("  var colors = getChartColors();\n");
+    html.push_str("  var charts = document.querySelectorAll('.chart');\n");
+    html.push_str("  charts.forEach(function(chart) {\n");
+    html.push_str("    if (chart.data) {\n");
+    html.push_str("      Plotly.relayout(chart, {\n");
+    html.push_str("        'paper_bgcolor': colors.paper,\n");
+    html.push_str("        'plot_bgcolor': colors.plot,\n");
+    html.push_str("        'xaxis.gridcolor': colors.grid,\n");
+    html.push_str("        'xaxis.color': colors.text,\n");
+    html.push_str("        'yaxis.gridcolor': colors.grid,\n");
+    html.push_str("        'yaxis.color': colors.text,\n");
+    html.push_str("        'legend.font.color': colors.text\n");
+    html.push_str("      });\n");
+    html.push_str("    }\n");
+    html.push_str("  });\n");
+    html.push_str("}\n");
+    html.push_str("function toggleTheme() {\n");
+    html.push_str("  var root = document.documentElement;\n");
+    html.push_str("  if (root.getAttribute('data-theme') === 'light') {\n");
+    html.push_str("    root.removeAttribute('data-theme');\n");
+    html.push_str("    localStorage.setItem('theme', 'dark');\n");
+    html.push_str("  } else {\n");
+    html.push_str("    root.setAttribute('data-theme', 'light');\n");
+    html.push_str("    localStorage.setItem('theme', 'light');\n");
+    html.push_str("  }\n");
+    html.push_str("  setTimeout(updateChartColors, 50);\n");
+    html.push_str("}\n");
     html.push_str("window.addEventListener('load', function() {\n");
     html.push_str("  window.dispatchEvent(new Event('resize'));\n");
+    html.push_str("  if (localStorage.getItem('theme') === 'light') {\n");
+    html.push_str("    setTimeout(updateChartColors, 100);\n");
+    html.push_str("  }\n");
     html.push_str("});\n");
     html.push_str("</script>\n");
     html.push_str("</body>\n</html>\n");

@@ -750,7 +750,7 @@ fn build_and_write_paired_end_report(
     }
 
     // Generate HTML report
-    html::generate_html_report(&report, args, &args.html)
+    html::generate_html_report(&report, args, &args.html, elapsed)
         .context("Failed to generate HTML report")?;
 
     Ok(())
@@ -1655,7 +1655,7 @@ fn main() -> Result<()> {
     }
 
     // Generate HTML report
-    html::generate_html_report(&report, &args, &args.html)
+    html::generate_html_report(&report, &args, &args.html, elapsed)
         .context("Failed to generate HTML report")?;
 
     Ok(())
