@@ -28,6 +28,12 @@ jobs:
           target/
         key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
+    - name: Cache test data
+      uses: actions/cache@v4
+      with:
+        path: test_data/*.fastq.gz
+        key: test-data-v1-SRR5808766
+
     - name: Install dependencies
       run: |
         # Install nucgen for test data generation
@@ -44,6 +50,9 @@ jobs:
       run: |
         cd test_data
         bash getdata.sh
+
+    - name: Download real test data
+      run: bash .github/scripts/download_test_data.sh test_data
 
     - name: Build fasterp (release)
       run: cargo build --release
@@ -71,3 +80,42 @@ jobs:
         path: |
           test_data/*.fq
           target/debug/deps/*.log
+
+    - name: Generate HTML report
+      run: |
+        mkdir -p _site
+        ./target/release/fasterp \
+          -i test_data/SRR5808766_1.fastq.gz \
+          -I test_data/SRR5808766_2.fastq.gz \
+          -o /tmp/filtered_1.fq \
+          -O /tmp/filtered_2.fq \
+          -j /tmp/report.json \
+          -h _site/index.html
+
+    - name: Setup Pages
+      if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+      uses: actions/configure-pages@v4
+
+    - name: Upload Pages artifact
+      if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+      uses: actions/upload-pages-artifact@v3
+      with:
+        path: _site
+
+  deploy:
+    needs: test-and-benchmark
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+
+    permissions:
+      pages: write
+      id-token: write
+
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+
+    steps:
+    - name: Deploy to GitHub Pages
+      id: deployment
+      uses: actions/deploy-pages@v4
