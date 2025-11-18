@@ -11,6 +11,11 @@ jobs:
   test-and-benchmark:
     runs-on: ubuntu-latest
 
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+
     steps:
     - uses: actions/checkout@v4
 
@@ -95,6 +100,8 @@ jobs:
     - name: Setup Pages
       if: github.ref == 'refs/heads/main' && github.event_name == 'push'
       uses: actions/configure-pages@v4
+      with:
+        enablement: true
 
     - name: Upload Pages artifact
       if: github.ref == 'refs/heads/main' && github.event_name == 'push'

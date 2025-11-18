@@ -47,7 +47,7 @@ use trimming::TrimmingConfig;
 #[derive(Parser, Debug)]
 #[command(author, version, about = "A fast FASTQ preprocessor", long_about = None)]
 struct Args {
-    /// Input FASTQ file (use '-' for stdin, supports .gz)
+    /// Input FASTQ file or URL (use '-' for stdin, supports .gz and http(s)://)
     #[arg(short = 'i', long)]
     input: String,
 
@@ -55,7 +55,7 @@ struct Args {
     #[arg(short = 'o', long)]
     output: String,
 
-    /// Read2 input file (paired-end mode)
+    /// Read2 input file or URL (paired-end mode, supports .gz and http(s)://)
     #[arg(short = 'I', long = "in2")]
     input2: Option<String>,
 
@@ -1385,7 +1385,6 @@ fn main() -> Result<()> {
             // Wait for all threads
             producer.join().unwrap()?;
             for (index, worker) in workers.into_iter().enumerate() {
-                println!("Waiting for worker thread {index} to finish...");
                 worker.join().unwrap();
             }
             merger.join().unwrap()?

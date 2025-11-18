@@ -14,7 +14,74 @@ use gzp::ZWriter;
 use gzp::deflate::Gzip;
 use gzp::par::compress::{ParCompress, ParCompressBuilder};
 use std::fs::File;
-use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::io::{BufRead, BufReader, BufWriter, Read, Write};
+use std::path::PathBuf;
+
+/// Check if a path is a URL
+fn is_url(path: &str) -> bool {
+    path.starts_with("http://") || path.starts_with("https://")
+}
+
+/// Download a URL to a temporary file and return the path
+/// Uses cached file if it already exists
+fn download_url(url: &str) -> Result<PathBuf> {
+    // Get filename from URL or generate one
+    let filename = url
+        .split('/')
+        .next_back()
+        .unwrap_or("downloaded_file")
+        .split('?')
+        .next()
+        .unwrap_or("downloaded_file");
+
+    // Create temp directory if it doesn't exist
+    let temp_dir = std::env::temp_dir().join("fasterp_downloads");
+    std::fs::create_dir_all(&temp_dir).context("Failed to create temp directory for downloads")?;
+
+    let temp_path = temp_dir.join(filename);
+
+    // Check if file already exists (cached)
+    if temp_path.exists() {
+        let metadata =
+            std::fs::metadata(&temp_path).context("Failed to get cached file metadata")?;
+        eprintln!(
+            "Using cached {} ({} bytes)",
+            temp_path.display(),
+            metadata.len()
+        );
+        return Ok(temp_path);
+    }
+
+    eprintln!("Downloading {url}...");
+
+    let response = ureq::get(url)
+        .call()
+        .context(format!("Failed to download URL: {url}"))?;
+
+    // Download to file
+    let mut file =
+        File::create(&temp_path).context(format!("Failed to create temp file: {temp_path:?}"))?;
+
+    let mut reader = response.into_reader();
+    let mut buffer = vec![0u8; 8 * 1024 * 1024]; // 8MB buffer
+    let mut total_bytes = 0usize;
+
+    loop {
+        let bytes_read = reader
+            .read(&mut buffer)
+            .context("Failed to read from URL")?;
+        if bytes_read == 0 {
+            break;
+        }
+        file.write_all(&buffer[..bytes_read])
+            .context("Failed to write to temp file")?;
+        total_bytes += bytes_read;
+    }
+
+    eprintln!("Downloaded {total_bytes} bytes to {temp_path:?}");
+
+    Ok(temp_path)
+}
 
 /// Detect compression format from file extension or magic bytes
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -51,13 +118,34 @@ impl CompressionFormat {
     }
 }
 
-/// Open input file or stdin with automatic decompression
+/// Open input file, URL, or stdin with automatic decompression
 pub(crate) fn open_input(path: &str) -> Result<Box<dyn BufRead + Send>> {
     if path == "-" {
         // Read from stdin
         let stdin = std::io::stdin();
         let reader = BufReader::with_capacity(16 * 1024 * 1024, stdin);
         Ok(Box::new(reader))
+    } else if is_url(path) {
+        // Download URL to temp file, then open
+        let temp_path = download_url(path)?;
+        let temp_path_str = temp_path.to_string_lossy();
+
+        let file = File::open(&temp_path)
+            .context(format!("Failed to open downloaded file: {temp_path:?}"))?;
+        let format = CompressionFormat::from_path(&temp_path_str);
+
+        match format {
+            CompressionFormat::Gzip => {
+                let buffered_file = BufReader::with_capacity(64 * 1024 * 1024, file);
+                let decoder = GzDecoder::new(buffered_file);
+                let reader = BufReader::with_capacity(32 * 1024 * 1024, decoder);
+                Ok(Box::new(reader))
+            }
+            CompressionFormat::None => {
+                let reader = BufReader::with_capacity(16 * 1024 * 1024, file);
+                Ok(Box::new(reader))
+            }
+        }
     } else {
         // Open file and detect compression
         let file = File::open(path).context(format!("Failed to open input file: {path}"))?;
