@@ -444,13 +444,7 @@ pub(crate) fn worker_thread(
             // Get trimmed sequences
             let trimmed_seq = &seq[trimming_result.start_pos..trimming_result.end_pos];
             let trimmed_qual = &qual[trimming_result.start_pos..trimming_result.end_pos];
-
-            // Early length check - skip expensive stats computation for reads that are too short
             let trimmed_len = trimmed_seq.len();
-            if trimmed_len < min_len {
-                too_short += 1;
-                continue;
-            }
 
             // Recompute stats for trimmed read (used for filtering) - SIMD accelerated
             let trimmed_stats =
@@ -462,30 +456,38 @@ pub(crate) fn worker_thread(
             let trimmed_gc = trimmed_stats.gc;
             let unqualified_count = trimmed_stats.unqualified;
 
-            // Apply remaining filters on TRIMMED read
-
-            if trimmed_ncnt > n_limit {
-                too_many_n += 1;
-                continue;
-            }
+            // Apply filters in fastp order: quality first, then length, then N count, then complexity
 
             // Check unqualified percent (fastp -q/-u logic)
-            // unqualified_count already computed by SIMD above
+            // Match fastp's exact order of operations: lowQualNum > (unqualifiedPercentLimit * rlen / 100.0)
             if qualified_quality_phred > 0 && trimmed_len > 0 {
-                // Avoid division to prevent rounding issues: check if 100*unqualified > limit*len
-                if 100 * unqualified_count > unqualified_percent_limit * trimmed_len {
+                let threshold = (unqualified_percent_limit * trimmed_len) as f64 / 100.0;
+                if (unqualified_count as f64) > threshold {
                     low_quality += 1;
                     continue;
                 }
             }
 
             // Check average quality (fastp -e logic)
+            // Use integer division to match fastp exactly
             if average_qual > 0 && trimmed_len > 0 {
-                let mean_qual = f64::from(trimmed_qsum) / trimmed_len as f64;
-                if mean_qual < f64::from(average_qual) {
+                let mean_qual = trimmed_qsum / trimmed_len as u32;
+                if mean_qual < u32::from(average_qual) {
                     low_quality += 1;
                     continue;
                 }
+            }
+
+            // Check N base limit (fastp -n logic) - fastp checks this AFTER quality but BEFORE length
+            if trimmed_ncnt > n_limit {
+                too_many_n += 1;
+                continue;
+            }
+
+            // Length check (fastp -l logic) - AFTER quality checks to match fastp behavior
+            if trimmed_len < min_len {
+                too_short += 1;
+                continue;
             }
 
             // Check low complexity (fastp -y/-Y logic)

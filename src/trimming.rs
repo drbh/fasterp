@@ -365,10 +365,15 @@ pub(crate) fn trim_read_with_adapter(
             ) {
                 // Trim from the adapter position
                 let new_end = result.start_pos + adapter_match.position;
-                let bases_trimmed = result.end_pos - new_end;
                 result.end_pos = new_end;
                 result.adapter_trimmed = true;
-                result.adapter_bases_trimmed = bases_trimmed;
+                // For A-tailing (negative position), use overlap_len
+                // For normal matches, use full trimmed length (like fastp)
+                result.adapter_bases_trimmed = if adapter_match.is_atailing {
+                    adapter_match.overlap_len
+                } else {
+                    current_seq.len() - adapter_match.position
+                };
             }
         }
     }

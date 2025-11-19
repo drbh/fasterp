@@ -147,6 +147,11 @@ struct Args {
     #[arg(long)]
     max_backlog: Option<usize>,
 
+    /// Maximum memory usage in MB (e.g., 500 for 500MB, 2048 for 2GB)
+    /// When set, automatically configures threads, batch_bytes, and max_backlog
+    #[arg(long)]
+    max_memory: Option<usize>,
+
     /// Skip k-mer counting for ceiling performance tests
     #[arg(long)]
     no_kmer: bool,
@@ -1101,8 +1106,76 @@ fn main() -> Result<()> {
         }
     }
 
-    // Determine number of threads
-    let num_threads = args.threads.unwrap_or_else(num_cpus::get);
+    // Determine number of threads and memory configuration
+    let (num_threads, batch_bytes, max_backlog) = if let Some(max_memory_mb) = args.max_memory {
+        // Calculate optimal configuration based on memory limit
+        // Memory model: Total ≈ base_overhead + (batch_bytes × (backlog × 2 + workers))
+        // Base overhead includes I/O buffers (~120 MB for SE, ~240 MB for PE)
+        let base_overhead_mb = if is_paired_end { 240 } else { 120 };
+
+        if max_memory_mb <= base_overhead_mb {
+            anyhow::bail!(
+                "max_memory ({} MB) must be greater than base overhead ({} MB)",
+                max_memory_mb,
+                base_overhead_mb
+            );
+        }
+
+        let available_mb = max_memory_mb - base_overhead_mb;
+
+        // Strategy: Start with requested/default workers, then scale down if needed
+        let requested_threads = args.threads.unwrap_or_else(num_cpus::get);
+
+        // Try to find a configuration that fits
+        // Priority: maintain workers > maintain batch size > maintain backlog
+        let mut best_threads = requested_threads;
+        let mut best_batch_mb = 32usize; // Default 32 MB
+        let mut best_backlog = 2usize;   // Minimum reasonable backlog
+
+        // Calculate: available = batch × (backlog × 2 + workers)
+        // Rearrange: batch = available / (backlog × 2 + workers)
+
+        for threads in (1..=requested_threads).rev() {
+            let backlog = args.max_backlog.unwrap_or(threads.min(4)); // Cap default backlog at 4 for memory efficiency
+            let divisor = backlog * 2 + threads;
+            let batch_mb = available_mb / divisor;
+
+            // Minimum viable batch size is 4 MB
+            if batch_mb >= 4 {
+                best_threads = threads;
+                best_batch_mb = batch_mb.min(32); // Cap at 32 MB for efficiency
+                best_backlog = backlog;
+                break;
+            }
+        }
+
+        // Final calculation for actual memory usage
+        let actual_pipeline_mb = best_batch_mb * (best_backlog * 2 + best_threads);
+        let actual_total_mb = base_overhead_mb + actual_pipeline_mb;
+
+        eprintln!("Memory limit: {} MB (--max-memory)", max_memory_mb);
+        eprintln!("Inferred configuration:");
+        eprintln!("  threads:     {} (from --max-memory)", best_threads);
+        eprintln!("  batch_bytes: {} MB (from --max-memory)", best_batch_mb);
+        eprintln!("  max_backlog: {} (from --max-memory)", best_backlog);
+        eprintln!("  estimated usage: ~{} MB (base: {} MB, pipeline: {} MB)",
+            actual_total_mb, base_overhead_mb, actual_pipeline_mb);
+        eprintln!();
+
+        (best_threads, best_batch_mb * 1024 * 1024, Some(best_backlog))
+    } else {
+        // Use explicit or default values
+        let threads = args.threads.unwrap_or_else(num_cpus::get);
+        (threads, args.batch_bytes, args.max_backlog)
+    };
+
+    // Override args with calculated values (for use later in pipeline)
+    let args = {
+        let mut args = args;
+        args.batch_bytes = batch_bytes;
+        args.max_backlog = max_backlog;
+        args
+    };
 
     println!("Using {num_threads} thread(s) for processing");
 

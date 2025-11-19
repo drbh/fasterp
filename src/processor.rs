@@ -450,18 +450,24 @@ impl StreamAccumulator {
         if trimming_result.adapter_trimmed {
             self.adapter_trimmed_reads += 1;
             self.adapter_trimmed_bases += trimming_result.adapter_bases_trimmed;
+
+            // Debug output for investigating base count difference
+            if std::env::var("FASTERP_DEBUG_ADAPTER").is_ok() {
+                eprintln!(
+                    "ADAPTER_TRIM: read={} seq_len={} start={} end={} bases_trimmed={}",
+                    self.before.total_reads,
+                    seq.len(),
+                    trimming_result.start_pos,
+                    trimming_result.end_pos,
+                    trimming_result.adapter_bases_trimmed
+                );
+            }
         }
 
         // Get trimmed sequences
         let trimmed_seq = &seq[trimming_result.start_pos..trimming_result.end_pos];
         let trimmed_qual = &qual[trimming_result.start_pos..trimming_result.end_pos];
-
-        // Early length check - skip expensive stats computation for reads that are too short
         let trimmed_len = trimmed_seq.len();
-        if trimmed_len < min_len {
-            self.too_short += 1;
-            return Ok(());
-        }
 
         // Recompute stats for trimmed read (used for filtering) - SIMD accelerated
         let trimmed_stats = simd::compute_stats(trimmed_seq, trimmed_qual, qualified_quality_phred);
@@ -473,30 +479,37 @@ impl StreamAccumulator {
         let trimmed_gc = trimmed_stats.gc;
         let unqualified_count = trimmed_stats.unqualified;
 
-        // Apply remaining filters on TRIMMED read (match fastp's order: quality before N-bases)
+        // Apply filters in fastp order: quality FIRST, then N-bases, then length
 
         // Check unqualified percent (fastp -q/-u logic)
-        // unqualified_count already computed by SIMD above
+        // Match fastp's exact formula: lowQualNum > (unqualifiedPercentLimit * rlen / 100.0)
         if qualified_quality_phred > 0 && trimmed_len > 0 {
-            // Avoid division to prevent rounding issues: check if 100*unqualified > limit*len
-            if 100 * unqualified_count > unqualified_percent_limit * trimmed_len {
+            let threshold = (unqualified_percent_limit * trimmed_len) as f64 / 100.0;
+            if (unqualified_count as f64) > threshold {
                 self.low_quality += 1;
                 return Ok(());
             }
         }
 
         // Check average quality (fastp -e logic)
+        // Use integer division to match fastp exactly
         if average_qual > 0 && trimmed_len > 0 {
-            let mean_qual = f64::from(trimmed_qsum) / trimmed_len as f64;
-            if mean_qual < f64::from(average_qual) {
+            let mean_qual = trimmed_qsum / trimmed_len as u32;
+            if mean_qual < u32::from(average_qual) {
                 self.low_quality += 1;
                 return Ok(());
             }
         }
 
-        // Check N-base filter (after quality check to match fastp order)
+        // Check N-base filter (fastp checks this AFTER quality but BEFORE length)
         if trimmed_ncnt > n_limit {
             self.too_many_n += 1;
+            return Ok(());
+        }
+
+        // Length check (fastp -l logic) - AFTER quality checks to match fastp behavior
+        if trimmed_len < min_len {
+            self.too_short += 1;
             return Ok(());
         }
 
