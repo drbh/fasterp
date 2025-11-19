@@ -9,6 +9,49 @@
 const GOOD_QUAL: u8 = 30; // Q30 - high confidence base
 const BAD_QUAL: u8 = 14; // Q14 - low confidence base
 
+/// Quick inline SIMD check of first 16 bytes - returns mismatch count
+/// This avoids function call overhead for obviously bad offsets
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn quick_mismatch_check_16(ptr1: *const u8, ptr2: *const u8) -> usize {
+    use std::arch::aarch64::{vaddlvq_u8, vceqq_u8, vld1q_u8, vshrq_n_u8};
+    unsafe {
+        let v1 = vld1q_u8(ptr1);
+        let v2 = vld1q_u8(ptr2);
+        let eq = vceqq_u8(v1, v2);
+        let shifted = vshrq_n_u8(eq, 7);
+        let equals = vaddlvq_u8(shifted) as usize;
+        16 - equals
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn quick_mismatch_check_16(ptr1: *const u8, ptr2: *const u8) -> usize {
+    use std::arch::x86_64::{_mm_cmpeq_epi8, _mm_loadu_si128, _mm_movemask_epi8};
+    unsafe {
+        let v1 = _mm_loadu_si128(ptr1 as *const _);
+        let v2 = _mm_loadu_si128(ptr2 as *const _);
+        let eq = _mm_cmpeq_epi8(v1, v2);
+        let mask = _mm_movemask_epi8(eq) as u32;
+        16 - mask.count_ones() as usize
+    }
+}
+
+#[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+#[inline(always)]
+unsafe fn quick_mismatch_check_16(ptr1: *const u8, ptr2: *const u8) -> usize {
+    unsafe {
+        let mut mismatches = 0;
+        for i in 0..16 {
+            if *ptr1.add(i) != *ptr2.add(i) {
+                mismatches += 1;
+            }
+        }
+        mismatches
+    }
+}
+
 /// Result of overlap analysis between paired-end reads
 #[derive(Debug, Clone)]
 pub struct OverlapResult {
@@ -73,6 +116,25 @@ pub fn reverse_complement(seq: &[u8]) -> Vec<u8> {
     seq.iter().rev().map(|&b| complement_base(b)).collect()
 }
 
+// LUT is faster than match - no branch misprediction
+static RC_LUT: [u8; 256] = {
+    let mut lut = [0u8; 256];
+    let mut i = 0;
+    while i < 256 {
+        lut[i] = i as u8;
+        i += 1;
+    }
+    lut[b'A' as usize] = b'T';
+    lut[b'T' as usize] = b'A';
+    lut[b'C' as usize] = b'G';
+    lut[b'G' as usize] = b'C';
+    lut[b'N' as usize] = b'N';
+    lut
+};
+
+// Max read length we support on stack. 512bp covers all standard Illumina reads.
+const MAX_READ_LEN: usize = 512;
+
 /// Detect overlap between R1 and reverse-complement of R2
 ///
 /// This function tries different offset positions to find where R1 and `R2_rc`
@@ -86,15 +148,25 @@ pub fn detect_overlap(
         return None;
     }
 
-    // Fastp's complete_compare_require - for long overlaps (>50bp), accept even with high diff
-    #[allow(clippy::items_after_statements)]
     const COMPLETE_COMPARE_REQUIRE: usize = 50;
 
-    // Create reverse complement of R2
-    let r2_rc = reverse_complement(r2_seq);
-
+    // Stack-allocated buffer - no heap, no TLS overhead
+    let r2_len = r2_seq.len();
     let r1_len = r1_seq.len();
-    let r2_len = r2_rc.len();
+
+    // Use stack for normal reads, Vec for unusually long ones
+    let mut stack_buf = [0u8; MAX_READ_LEN];
+    let heap_buf: Vec<u8>;
+
+    let r2_rc: &[u8] = if r2_len <= MAX_READ_LEN {
+        for (i, &b) in r2_seq.iter().rev().enumerate() {
+            stack_buf[i] = RC_LUT[b as usize];
+        }
+        &stack_buf[..r2_len]
+    } else {
+        heap_buf = r2_seq.iter().rev().map(|&b| RC_LUT[b as usize]).collect();
+        &heap_buf
+    };
 
     // Try different offset positions
     // IMPORTANT: Fastp returns the FIRST valid overlap it finds, not the best one.
@@ -120,6 +192,18 @@ pub fn detect_overlap(
             config.max_diff,
             (overlap_len * config.max_diff_percent) / 100,
         );
+
+        // Quick prefix filter: check first 16 bytes inline to skip obviously bad offsets
+        // This avoids function call overhead for ~80-90% of offsets
+        if overlap_len >= 16 {
+            let first_mismatches =
+                unsafe { quick_mismatch_check_16(r1_seq[offset..].as_ptr(), r2_rc.as_ptr()) };
+            // If first 16 bytes already exceed limit, skip this offset
+            // (early termination would reject it anyway)
+            if first_mismatches > overlap_diff_limit {
+                continue;
+            }
+        }
 
         // Use SIMD-accelerated mismatch counting
         let (differences, i) = crate::simd::count_mismatches(
@@ -166,6 +250,18 @@ pub fn detect_overlap(
             config.max_diff,
             (overlap_len * config.max_diff_percent) / 100,
         );
+
+        // Quick prefix filter: check first 16 bytes inline to skip obviously bad offsets
+        // This avoids function call overhead for ~80-90% of offsets
+        if overlap_len >= 16 {
+            let first_mismatches =
+                unsafe { quick_mismatch_check_16(r1_seq.as_ptr(), r2_rc[offset..].as_ptr()) };
+            // If first 16 bytes already exceed limit, skip this offset
+            // (early termination would reject it anyway)
+            if first_mismatches > overlap_diff_limit {
+                continue;
+            }
+        }
 
         // Use SIMD-accelerated mismatch counting
         let (differences, i) = crate::simd::count_mismatches(

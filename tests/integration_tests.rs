@@ -4039,9 +4039,7 @@ fn test_multithreaded_pe_low_complexity() {
     compare_json_outputs(&PathBuf::from(single_json), &PathBuf::from(multi_json));
 }
 
-// ============================================================================
 // Base Correction Tests (PE Overlap)
-// ============================================================================
 
 #[test]
 fn test_base_correction_basic_functionality() {
@@ -4867,9 +4865,7 @@ fn test_dedup_multithreaded_consistency() {
     );
 }
 
-// ============================================================
 // OUTPUT SPLITTING TESTS
-// ============================================================
 
 #[test]
 fn test_split_by_lines_basic() {
@@ -7554,8 +7550,6 @@ fn test_asymmetric_max_len_extreme() {
     assert_eq!(r2_seq.len(), 140, "R2 should be 140bp");
 }
 
-// ===== MERGE FUNCTIONALITY TESTS =====
-
 /// Run fastp with merge mode for paired-end reads
 fn run_fastp_merge(
     input1: &str,
@@ -8366,8 +8360,6 @@ GACTAAAACCAAGCGAGAATCTGAGATGGTTTTCTGTGGGGAAGTATATAAGGTCAGCATTGTAACCCCTGACT
         "Failed: fastp passed {fastp_passed} reads, but fasterp passed {fasterp_passed} reads"
     );
 }
-
-// ===== OVERLAP-BASED ADAPTER TRIMMING INTEGRATION TESTS =====
 
 #[test]
 fn test_short_insert_heavy_overlap() {

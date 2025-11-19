@@ -110,26 +110,35 @@ pub(crate) fn base_idx(b: u8) -> Option<usize> {
 /// Any N base resets the window.
 #[inline]
 pub(crate) fn count_k5_2bit(seq: &[u8], kmer_table: &mut [usize; 1024]) {
-    let mut code: u32 = 0;
+    if seq.len() < 5 {
+        return;
+    }
+
     let mask: u32 = (1 << (2 * 5)) - 1; // 10 bits for 5-mer
-    let mut filled = 0u8;
+    let mut code: u32 = 0;
+    let mut valid_count: usize = 0;
 
-    for &b in seq {
-        let Some(c) = base_to_2bit(b) else {
-            // Hit an N or invalid base - reset window
-            code = 0;
-            filled = 0;
-            continue;
-        };
+    // SAFETY: All accesses are bounds-checked by the loop structure
+    // and LUT_BASE_TO_2BIT is 256 elements (all u8 values valid)
+    unsafe {
+        for i in 0..seq.len() {
+            let b = *seq.get_unchecked(i);
+            let c = *LUT_BASE_TO_2BIT.get_unchecked(b as usize);
 
-        code = ((code << 2) & mask) | c;
+            if c == 255 {
+                // Hit an N or invalid base - reset window
+                code = 0;
+                valid_count = 0;
+                continue;
+            }
 
-        if filled < 4 {
-            filled += 1;
-            continue;
+            code = ((code << 2) & mask) | u32::from(c);
+            valid_count += 1;
+
+            if valid_count >= 5 {
+                *kmer_table.get_unchecked_mut(code as usize) += 1;
+            }
         }
-
-        kmer_table[code as usize] += 1;
     }
 }
 

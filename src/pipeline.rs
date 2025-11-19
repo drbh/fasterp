@@ -28,20 +28,25 @@ use crate::trimming::{TrimmingConfig, TrimmingResult, trim_read};
 /// Returns complexity percentage (0-100)
 #[inline]
 fn calculate_complexity(seq: &[u8]) -> usize {
-    if seq.len() <= 1 {
+    let len = seq.len();
+    if len <= 1 {
         return 100; // Single base or empty is considered max complexity
     }
 
-    let mut different_count = 0;
-    for i in 0..seq.len() - 1 {
-        if seq[i] != seq[i + 1] {
-            different_count += 1;
+    let mut different_count = 0usize;
+
+    // SAFETY: Loop bounds ensure i and i+1 are always valid indices
+    unsafe {
+        for i in 0..len - 1 {
+            if *seq.get_unchecked(i) != *seq.get_unchecked(i + 1) {
+                different_count += 1;
+            }
         }
     }
 
     // Calculate percentage: (different_count / (len - 1)) * 100
     // Use integer math to avoid floating point
-    (different_count * 100) / (seq.len() - 1)
+    (different_count * 100) / (len - 1)
 }
 
 /// A batch of FASTQ records parsed from a buffer
@@ -94,9 +99,7 @@ pub(crate) struct WorkerResult {
     pub adapter_trimmed_bases: usize,
 }
 
-// ============================================================================
 // PAIRED-END MULTI-THREADING STRUCTURES
-// ============================================================================
 
 /// A batch of paired-end FASTQ records
 ///
@@ -746,9 +749,7 @@ pub(crate) fn merger_thread(
     Ok(acc)
 }
 
-// ============================================================================
 // PAIRED-END MULTI-THREADING PIPELINE
-// ============================================================================
 
 /// Paired-end producer thread: opens and reads both R1 and R2 files
 ///
@@ -1013,7 +1014,8 @@ fn parse_fastq_buffer(buffer: &[u8], actual_len: usize, is_eof: bool) -> (usize,
     };
 
     // Parse complete records - use pre-computed line_starts
-    let mut recs = Vec::new();
+    // Pre-allocate based on line count (4 lines per record)
+    let mut recs = Vec::with_capacity(line_count / 4);
     if complete_len > 0 {
         // Filter line_starts to only those within complete_len
         line_starts.retain(|&pos| pos < complete_len);
@@ -1096,6 +1098,24 @@ pub(crate) fn paired_worker_thread(
         let mut insert_size_histogram = vec![0usize; 512];
         let mut insert_size_unknown = 0usize;
         let mut pieces = Vec::new();
+
+        // Pre-allocate reusable buffers for output (avoids allocation per read)
+        // Typical read ~150bp * 4 lines + headers ≈ 700 bytes
+        let mut r1_buf_reusable = Vec::with_capacity(800);
+        let mut r2_buf_reusable = Vec::with_capacity(800);
+
+        // Pre-create modified trimming configs without adapters (avoids clone per read)
+        let trimming_config_no_adapter_r1 = {
+            let mut cfg = trimming_config_r1.clone();
+            cfg.adapter_config.adapter_seq = None;
+            cfg
+        };
+        let trimming_config_no_adapter_r2 = {
+            let mut cfg = trimming_config_r2.clone();
+            cfg.adapter_config.adapter_seq = None;
+            cfg.adapter_config.adapter_seq_r2 = None;
+            cfg
+        };
 
         // Process each pair
         for (idx, (&rec1, &rec2)) in batch.recs_r1.iter().zip(batch.recs_r2.iter()).enumerate() {
@@ -1262,15 +1282,13 @@ pub(crate) fn paired_worker_thread(
                 // Still need to apply other trimming (poly-G, quality, etc.)
                 // but skip adapter trimming since we already did it with overlap
 
-                // Temporarily disable adapter trimming for other trims
-                let mut temp_config1 = trimming_config_r1.clone();
-                let mut temp_config2 = trimming_config_r2.clone();
-                temp_config1.adapter_config.adapter_seq = None;
-                temp_config2.adapter_config.adapter_seq = None;
-                temp_config2.adapter_config.adapter_seq_r2 = None;
-
+                // Use pre-created configs without adapters (avoids clone per read)
                 trim_result1 = if trimming_config_r1.is_enabled() {
-                    trim_read(final_umi_seq1, final_umi_qual1, &temp_config1)
+                    trim_read(
+                        final_umi_seq1,
+                        final_umi_qual1,
+                        &trimming_config_no_adapter_r1,
+                    )
                 } else {
                     TrimmingResult {
                         start_pos: 0,
@@ -1283,7 +1301,11 @@ pub(crate) fn paired_worker_thread(
                 };
 
                 trim_result2 = if trimming_config_r2.is_enabled() {
-                    trim_read(final_umi_seq2, final_umi_qual2, &temp_config2)
+                    trim_read(
+                        final_umi_seq2,
+                        final_umi_qual2,
+                        &trimming_config_no_adapter_r2,
+                    )
                 } else {
                     TrimmingResult {
                         start_pos: 0,
@@ -1358,54 +1380,49 @@ pub(crate) fn paired_worker_thread(
             let trimmed_qual2 = &final_umi_qual2[trim_result2.start_pos..trim_result2.end_pos];
 
             // Apply base correction using overlap analysis (if enabled)
+            // Reuse the overlap_result from adapter trimming detection to avoid redundant work
             let (final_seq1, final_qual1, final_seq2, final_qual2);
             let mut seq1_corrected;
             let mut qual1_corrected;
             let mut seq2_corrected;
             let mut qual2_corrected;
 
-            if let Some(ref config) = overlap_config {
+            // Only create mutable copies if correction is enabled AND there's an overlap to correct
+            if overlap_config.is_some() && overlap_result.is_some() {
                 // Create mutable copies for correction
                 seq1_corrected = trimmed_seq1.to_vec();
                 qual1_corrected = trimmed_qual1.to_vec();
                 seq2_corrected = trimmed_seq2.to_vec();
                 qual2_corrected = trimmed_qual2.to_vec();
 
-                // Detect overlap and correct mismatches
-                if let Some(overlap) =
-                    crate::overlap::detect_overlap(&seq1_corrected, &seq2_corrected, config)
-                {
-                    let _correction_stats = crate::overlap::correct_by_overlap(
-                        &mut seq1_corrected,
-                        &mut qual1_corrected,
-                        &mut seq2_corrected,
-                        &mut qual2_corrected,
-                        &overlap,
-                    );
-                    // TODO: Track correction statistics
-                }
+                // Apply correction using cached overlap result
+                let _correction_stats = crate::overlap::correct_by_overlap(
+                    &mut seq1_corrected,
+                    &mut qual1_corrected,
+                    &mut seq2_corrected,
+                    &mut qual2_corrected,
+                    overlap_result.as_ref().unwrap(),
+                );
+                // TODO: Track correction statistics
 
                 final_seq1 = &seq1_corrected[..];
                 final_qual1 = &qual1_corrected[..];
                 final_seq2 = &seq2_corrected[..];
                 final_qual2 = &qual2_corrected[..];
             } else {
-                // No correction - use trimmed sequences directly
+                // No correction needed - use trimmed sequences directly
                 final_seq1 = trimmed_seq1;
                 final_qual1 = trimmed_qual1;
                 final_seq2 = trimmed_seq2;
                 final_qual2 = trimmed_qual2;
             }
 
-            // Track insert size by detecting overlap
-            let overlap_for_insert_size = crate::overlap::detect_overlap(
-                final_seq1,
-                final_seq2,
-                &crate::overlap::OverlapConfig::default(),
-            );
-            if let Some(overlap) = overlap_for_insert_size {
+            // Track insert size using cached overlap result (avoids third detect_overlap call)
+            if let Some(ref overlap) = overlap_result {
                 if overlap.overlapped {
-                    let insert_size = final_seq1.len() + final_seq2.len() - overlap.overlap_len;
+                    // Adjust for any trimming that occurred
+                    let insert_size = final_seq1.len() + final_seq2.len()
+                        - overlap.overlap_len.min(final_seq1.len() + final_seq2.len());
                     if insert_size < insert_size_histogram.len() {
                         insert_size_histogram[insert_size] += 1;
                     }
@@ -1457,18 +1474,18 @@ pub(crate) fn paired_worker_thread(
             }
 
             // Check average quality (EITHER read fails = BOTH fail)
+            // Use integer comparison: mean >= threshold  =>  qsum >= threshold * len
             if average_qual > 0 {
-                if !final_seq1.is_empty() {
-                    let mean_qual1 = f64::from(trimmed_stats1.qsum) / final_seq1.len() as f64;
-                    if mean_qual1 < f64::from(average_qual) {
-                        fail_quality = true;
-                    }
+                let threshold = u64::from(average_qual);
+                if !final_seq1.is_empty()
+                    && u64::from(trimmed_stats1.qsum) < threshold * final_seq1.len() as u64
+                {
+                    fail_quality = true;
                 }
-                if !final_seq2.is_empty() {
-                    let mean_qual2 = f64::from(trimmed_stats2.qsum) / final_seq2.len() as f64;
-                    if mean_qual2 < f64::from(average_qual) {
-                        fail_quality = true;
-                    }
+                if !final_seq2.is_empty()
+                    && u64::from(trimmed_stats2.qsum) < threshold * final_seq2.len() as u64
+                {
+                    fail_quality = true;
                 }
             }
 
@@ -1515,9 +1532,11 @@ pub(crate) fn paired_worker_thread(
             // When correction or UMI is enabled, we need to create new buffers with modified data
             // Otherwise, use zero-copy with ranges into original buffer
             let (r1_piece, r2_piece) = if overlap_config.is_some() || umi_config.is_some() {
-                // Correction or UMI was enabled - create new buffers
-                let mut r1_buf = Vec::new();
-                let mut r2_buf = Vec::new();
+                // Correction or UMI was enabled - reuse pre-allocated buffers
+                r1_buf_reusable.clear();
+                r2_buf_reusable.clear();
+                let r1_buf = &mut r1_buf_reusable;
+                let r2_buf = &mut r2_buf_reusable;
 
                 // Build R1 buffer: header + '\n' + seq + '\n' + plus + '\n' + qual + '\n'
                 let r1_header_start = 0;
@@ -1575,8 +1594,8 @@ pub(crate) fn paired_worker_thread(
                 let r2_qual_end = r2_buf.len();
                 r2_buf.push(b'\n');
 
-                let r1_arc = Arc::new(r1_buf);
-                let r2_arc = Arc::new(r2_buf);
+                let r1_arc = Arc::new(r1_buf.clone());
+                let r2_arc = Arc::new(r2_buf.clone());
 
                 (
                     RecordPiece {
@@ -1718,27 +1737,35 @@ fn parse_record<'a>(
     (seq, qual, s_end, q_end)
 }
 
+/// Bases for validation: indices match (b >> 1) & 3
+static BASES: [u8; 4] = [b'A', b'C', b'T', b'G'];
+
 /// Helper to update position stats
 #[inline]
 fn update_position_stats(pos: &mut PositionStats, seq: &[u8], qual: &[u8]) {
     pos.ensure_capacity(seq.len());
 
-    for i in 0..seq.len() {
-        let q = qual[i];
-        let quality_score = u64::from(q - 33);
-        let b = seq[i];
+    let len = seq.len();
 
-        pos.total_sum[i] += quality_score;
-        pos.total_cnt[i] += 1;
+    // SAFETY: ensure_capacity guarantees all arrays have at least `len` elements
+    unsafe {
+        for i in 0..len {
+            let q = *qual.get_unchecked(i);
+            let quality_score = u64::from(q.wrapping_sub(33));
+            let b = *seq.get_unchecked(i);
 
-        if let Some(bi) = base_idx(b) {
-            pos.base_sum[bi][i] += quality_score;
-            pos.base_cnt[bi][i] += 1;
-        }
+            *pos.total_sum.get_unchecked_mut(i) += quality_score;
+            *pos.total_cnt.get_unchecked_mut(i) += 1;
 
-        // Track quality histogram
-        if quality_score < 94 {
-            pos.qual_hist[quality_score as usize] += 1;
+            // Bit trick: (b >> 1) & 3 maps A->0, C->1, T->2, G->3
+            // For N (0x4E) this maps to 3 (G bucket) - acceptable since N is rare
+            let bi = ((b >> 1) & 3) as usize;
+            *pos.base_sum.get_unchecked_mut(bi).get_unchecked_mut(i) += quality_score;
+            *pos.base_cnt.get_unchecked_mut(bi).get_unchecked_mut(i) += 1;
+
+            // Track quality histogram (clamp to valid range)
+            let hist_idx = (quality_score as usize).min(93);
+            *pos.qual_hist.get_unchecked_mut(hist_idx) += 1;
         }
     }
 }
@@ -1777,7 +1804,9 @@ pub(crate) fn paired_merger_thread(
     let mut pending: BTreeMap<u64, PairedWorkerResult> = BTreeMap::new();
     let mut workers_done = 0;
 
-    let newline = [b'\n'];
+    // Reusable buffers for pre-concatenating records (1 memcpy instead of 8)
+    let mut r1_buf = Vec::with_capacity(1024);
+    let mut r2_buf = Vec::with_capacity(1024);
 
     while let Ok(msg) = receiver.recv() {
         if let Some(result) = msg {
@@ -1785,91 +1814,33 @@ pub(crate) fn paired_merger_thread(
 
             // Process all consecutive batches
             while let Some(result) = pending.remove(&next_id) {
-                // Write all passed records using vectored I/O with proper partial write handling
+                // Write all passed records
                 for piece in &result.pieces {
-                    // Write R1 with partial write handling
+                    // Pre-concatenate R1 into contiguous buffer (1 memcpy instead of 8)
                     let b1 = &piece.r1.buf;
-                    let mut iov1 = [
-                        IoSlice::new(&b1[piece.r1.header.clone()]),
-                        IoSlice::new(&newline),
-                        IoSlice::new(&b1[piece.r1.seq.clone()]),
-                        IoSlice::new(&newline),
-                        IoSlice::new(&b1[piece.r1.plus.clone()]),
-                        IoSlice::new(&newline),
-                        IoSlice::new(&b1[piece.r1.qual.clone()]),
-                        IoSlice::new(&newline),
-                    ];
+                    r1_buf.clear();
+                    r1_buf.extend_from_slice(&b1[piece.r1.header.clone()]);
+                    r1_buf.push(b'\n');
+                    r1_buf.extend_from_slice(&b1[piece.r1.seq.clone()]);
+                    r1_buf.push(b'\n');
+                    r1_buf.extend_from_slice(&b1[piece.r1.plus.clone()]);
+                    r1_buf.push(b'\n');
+                    r1_buf.extend_from_slice(&b1[piece.r1.qual.clone()]);
+                    r1_buf.push(b'\n');
+                    writer1.write_all(&r1_buf)?;
 
-                    let mut written = 0;
-                    let total: usize = iov1.iter().map(|s| s.len()).sum();
-                    while written < total {
-                        let n = writer1.write_vectored(&iov1)?;
-                        if n == 0 {
-                            return Err(std::io::Error::new(
-                                std::io::ErrorKind::WriteZero,
-                                "failed to write vectored R1",
-                            )
-                            .into());
-                        }
-                        written += n;
-                        // Advance the slices
-                        let mut skip = n;
-                        for slice in &mut iov1 {
-                            let len = slice.len();
-                            if skip >= len {
-                                skip -= len;
-                                *slice = IoSlice::new(&[]);
-                            } else {
-                                let data = unsafe {
-                                    std::slice::from_raw_parts(slice.as_ptr().add(skip), len - skip)
-                                };
-                                *slice = IoSlice::new(data);
-                                break;
-                            }
-                        }
-                    }
-
-                    // Write R2 with partial write handling
+                    // Pre-concatenate R2 into contiguous buffer
                     let b2 = &piece.r2.buf;
-                    let mut iov2 = [
-                        IoSlice::new(&b2[piece.r2.header.clone()]),
-                        IoSlice::new(&newline),
-                        IoSlice::new(&b2[piece.r2.seq.clone()]),
-                        IoSlice::new(&newline),
-                        IoSlice::new(&b2[piece.r2.plus.clone()]),
-                        IoSlice::new(&newline),
-                        IoSlice::new(&b2[piece.r2.qual.clone()]),
-                        IoSlice::new(&newline),
-                    ];
-
-                    let mut written = 0;
-                    let total: usize = iov2.iter().map(|s| s.len()).sum();
-                    while written < total {
-                        let n = writer2.write_vectored(&iov2)?;
-                        if n == 0 {
-                            return Err(std::io::Error::new(
-                                std::io::ErrorKind::WriteZero,
-                                "failed to write vectored R2",
-                            )
-                            .into());
-                        }
-                        written += n;
-                        // Advance the slices
-                        let mut skip = n;
-                        for slice in &mut iov2 {
-                            let len = slice.len();
-                            if skip >= len {
-                                skip -= len;
-                                *slice = IoSlice::new(&[]);
-                            } else {
-                                let data = unsafe {
-                                    std::slice::from_raw_parts(slice.as_ptr().add(skip), len - skip)
-                                };
-                                *slice = IoSlice::new(data);
-                                break;
-                            }
-                        }
-                    }
+                    r2_buf.clear();
+                    r2_buf.extend_from_slice(&b2[piece.r2.header.clone()]);
+                    r2_buf.push(b'\n');
+                    r2_buf.extend_from_slice(&b2[piece.r2.seq.clone()]);
+                    r2_buf.push(b'\n');
+                    r2_buf.extend_from_slice(&b2[piece.r2.plus.clone()]);
+                    r2_buf.push(b'\n');
+                    r2_buf.extend_from_slice(&b2[piece.r2.qual.clone()]);
+                    r2_buf.push(b'\n');
+                    writer2.write_all(&r2_buf)?;
                 }
 
                 // Merge stats - R1

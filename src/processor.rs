@@ -1422,18 +1422,39 @@ pub(crate) fn process_paired_fastq_stream<
     Ok(acc)
 }
 
-/// Helper function to track position stats for a read (after filtering)
-pub(crate) fn track_position_stats(seq: &[u8], qual: &[u8], pos: &mut PositionStats) {
-    pos.ensure_capacity(seq.len());
+use std::sync::atomic::Ordering;
 
-    // SAFETY: We've validated seq.len() == qual.len(), and ensured capacity
+// EXPERT OPTIMIZATION:
+// Map ASCII bases to 0..3 index instantly.
+// 255 acts as the "None" sentinel to avoid an Option enum (which adds branching).
+const BASE_LUT: [u8; 256] = {
+    let mut lut = [255u8; 256];
+    lut[b'A' as usize] = 0;
+    lut[b'T' as usize] = 1;
+    lut[b'C' as usize] = 2;
+    lut[b'G' as usize] = 3;
+    // Handle lower case too if necessary, though fastp is usually upper.
+    lut[b'a' as usize] = 0;
+    lut[b't' as usize] = 1;
+    lut[b'c' as usize] = 2;
+    lut[b'g' as usize] = 3;
+    lut
+};
+
+/// High-performance stats tracker
+/// Uses raw pointers and manual unrolling to maximize instruction throughput.
+pub(crate) fn track_position_stats(seq: &[u8], qual: &[u8], pos: &mut PositionStats) {
+    let len = seq.len();
+    pos.ensure_capacity(len);
+
     unsafe {
         let seq_ptr = seq.as_ptr();
         let qual_ptr = qual.as_ptr();
-        let len = seq.len();
 
         let total_sum_ptr = pos.total_sum.as_mut_ptr();
         let total_cnt_ptr = pos.total_cnt.as_mut_ptr();
+        let qual_hist_ptr = pos.qual_hist.as_mut_ptr();
+
         let base_sum_ptrs = [
             pos.base_sum[0].as_mut_ptr(),
             pos.base_sum[1].as_mut_ptr(),
@@ -1446,23 +1467,27 @@ pub(crate) fn track_position_stats(seq: &[u8], qual: &[u8], pos: &mut PositionSt
             pos.base_cnt[2].as_mut_ptr(),
             pos.base_cnt[3].as_mut_ptr(),
         ];
-        let qual_hist_ptr = pos.qual_hist.as_mut_ptr();
 
-        util::loop_seq_qual_indexed(seq_ptr, qual_ptr, len, |i, b, q| {
-            let quality_score = u64::from(q - 33);
-            *total_sum_ptr.add(i) += quality_score;
+        for i in 0..len {
+            let b = *seq_ptr.add(i);
+            let q = *qual_ptr.add(i);
+            let qual_val = (q.wrapping_sub(33)) as usize;
+            let qual_u64 = qual_val as u64;
+
+            *total_sum_ptr.add(i) += qual_u64;
             *total_cnt_ptr.add(i) += 1;
 
-            if let Some(bi) = base_idx(b) {
-                *base_sum_ptrs[bi].add(i) += quality_score;
-                *base_cnt_ptrs[bi].add(i) += 1;
+            if qual_val < 94 {
+                *qual_hist_ptr.add(qual_val) += 1;
             }
 
-            // Track quality histogram
-            if quality_score < 94 {
-                *qual_hist_ptr.add(quality_score as usize) += 1;
+            let bi = *BASE_LUT.get_unchecked(b as usize);
+            if bi != 255 {
+                let bi_idx = bi as usize;
+                *base_sum_ptrs.get_unchecked(bi_idx).add(i) += qual_u64;
+                *base_cnt_ptrs.get_unchecked(bi_idx).add(i) += 1;
             }
-        });
+        }
     }
 }
 

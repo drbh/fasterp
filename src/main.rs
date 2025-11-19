@@ -1130,7 +1130,7 @@ fn main() -> Result<()> {
         // Priority: maintain workers > maintain batch size > maintain backlog
         let mut best_threads = requested_threads;
         let mut best_batch_mb = 32usize; // Default 32 MB
-        let mut best_backlog = 2usize;   // Minimum reasonable backlog
+        let mut best_backlog = 2usize; // Minimum reasonable backlog
 
         // Calculate: available = batch × (backlog × 2 + workers)
         // Rearrange: batch = available / (backlog × 2 + workers)
@@ -1158,11 +1158,17 @@ fn main() -> Result<()> {
         eprintln!("  threads:     {} (from --max-memory)", best_threads);
         eprintln!("  batch_bytes: {} MB (from --max-memory)", best_batch_mb);
         eprintln!("  max_backlog: {} (from --max-memory)", best_backlog);
-        eprintln!("  estimated usage: ~{} MB (base: {} MB, pipeline: {} MB)",
-            actual_total_mb, base_overhead_mb, actual_pipeline_mb);
+        eprintln!(
+            "  estimated usage: ~{} MB (base: {} MB, pipeline: {} MB)",
+            actual_total_mb, base_overhead_mb, actual_pipeline_mb
+        );
         eprintln!();
 
-        (best_threads, best_batch_mb * 1024 * 1024, Some(best_backlog))
+        (
+            best_threads,
+            best_batch_mb * 1024 * 1024,
+            Some(best_backlog),
+        )
     } else {
         // Use explicit or default values
         let threads = args.threads.unwrap_or_else(num_cpus::get);

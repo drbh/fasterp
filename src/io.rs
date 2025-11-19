@@ -37,7 +37,10 @@ pub(crate) fn is_s3_path(path: &str) -> bool {
 pub(crate) fn parse_s3_path(path: &str) -> Result<(String, String)> {
     let path = path.strip_prefix("s3://").context("Invalid S3 path")?;
     let mut parts = path.splitn(2, '/');
-    let bucket = parts.next().context("Missing bucket in S3 path")?.to_string();
+    let bucket = parts
+        .next()
+        .context("Missing bucket in S3 path")?
+        .to_string();
     let key = parts.next().context("Missing key in S3 path")?.to_string();
 
     if bucket.is_empty() {
@@ -67,7 +70,9 @@ impl S3Reader {
         let runtime = Runtime::new().context("Failed to create tokio runtime")?;
 
         // Load AWS config and create S3 client
-        let config = runtime.block_on(aws_config::load_defaults(aws_config::BehaviorVersion::latest()));
+        let config = runtime.block_on(aws_config::load_defaults(
+            aws_config::BehaviorVersion::latest(),
+        ));
 
         // Check for custom endpoint (e.g., for Cloudflare R2)
         let client = if let Ok(endpoint) = std::env::var("AWS_ENDPOINT_URL_S3") {
@@ -88,14 +93,9 @@ impl S3Reader {
 
         // Start GetObject request
         eprintln!("Streaming from s3://{bucket}/{key}...");
-        let response = runtime.block_on(async {
-            client
-                .get_object()
-                .bucket(&bucket)
-                .key(&key)
-                .send()
-                .await
-        }).context(format!("Failed to get S3 object: s3://{bucket}/{key}"))?;
+        let response = runtime
+            .block_on(async { client.get_object().bucket(&bucket).key(&key).send().await })
+            .context(format!("Failed to get S3 object: s3://{bucket}/{key}"))?;
 
         Ok(Self {
             runtime: Arc::new(runtime),
@@ -112,7 +112,8 @@ impl Read for S3Reader {
         if self.buffer_pos < self.buffer.len() {
             let available = self.buffer.len() - self.buffer_pos;
             let to_copy = available.min(buf.len());
-            buf[..to_copy].copy_from_slice(&self.buffer[self.buffer_pos..self.buffer_pos + to_copy]);
+            buf[..to_copy]
+                .copy_from_slice(&self.buffer[self.buffer_pos..self.buffer_pos + to_copy]);
             self.buffer_pos += to_copy;
             return Ok(to_copy);
         }
@@ -123,9 +124,10 @@ impl Read for S3Reader {
             None => return Ok(0), // Stream exhausted
         };
 
-        let chunk = self.runtime.block_on(async {
-            byte_stream.try_next().await
-        }).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+        let chunk = self
+            .runtime
+            .block_on(async { byte_stream.try_next().await })
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
 
         match chunk {
             Some(data) => {
@@ -172,7 +174,9 @@ impl S3Writer {
         let runtime = Runtime::new().context("Failed to create tokio runtime")?;
 
         // Load AWS config and create S3 client
-        let config = runtime.block_on(aws_config::load_defaults(aws_config::BehaviorVersion::latest()));
+        let config = runtime.block_on(aws_config::load_defaults(
+            aws_config::BehaviorVersion::latest(),
+        ));
 
         // Check for custom endpoint (e.g., for Cloudflare R2)
         let client = if let Ok(endpoint) = std::env::var("AWS_ENDPOINT_URL_S3") {
@@ -193,14 +197,18 @@ impl S3Writer {
 
         // Start multipart upload
         eprintln!("Starting multipart upload to s3://{bucket}/{key}...");
-        let create_response = runtime.block_on(async {
-            client
-                .create_multipart_upload()
-                .bucket(&bucket)
-                .key(&key)
-                .send()
-                .await
-        }).context(format!("Failed to create multipart upload: s3://{bucket}/{key}"))?;
+        let create_response = runtime
+            .block_on(async {
+                client
+                    .create_multipart_upload()
+                    .bucket(&bucket)
+                    .key(&key)
+                    .send()
+                    .await
+            })
+            .context(format!(
+                "Failed to create multipart upload: s3://{bucket}/{key}"
+            ))?;
 
         let upload_id = create_response
             .upload_id()
@@ -245,17 +253,20 @@ impl S3Writer {
 
         let part_number = self.part_number;
 
-        let response = self.runtime.block_on(async {
-            self.client
-                .upload_part()
-                .bucket(&self.bucket)
-                .key(&self.key)
-                .upload_id(&self.upload_id)
-                .part_number(part_number)
-                .body(ByteStream::from(data))
-                .send()
-                .await
-        }).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+        let response = self
+            .runtime
+            .block_on(async {
+                self.client
+                    .upload_part()
+                    .bucket(&self.bucket)
+                    .key(&self.key)
+                    .upload_id(&self.upload_id)
+                    .part_number(part_number)
+                    .body(ByteStream::from(data))
+                    .send()
+                    .await
+            })
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
 
         let e_tag = response.e_tag().unwrap_or_default().to_string();
 
@@ -274,7 +285,8 @@ impl S3Writer {
     pub fn finish(mut self) -> Result<()> {
         // Upload any remaining data (force=true for final part)
         if !self.buffer.is_empty() {
-            self.upload_part(true).context("Failed to upload final part")?;
+            self.upload_part(true)
+                .context("Failed to upload final part")?;
         }
 
         // Complete multipart upload
@@ -282,16 +294,21 @@ impl S3Writer {
             .set_parts(Some(self.completed_parts.clone()))
             .build();
 
-        self.runtime.block_on(async {
-            self.client
-                .complete_multipart_upload()
-                .bucket(&self.bucket)
-                .key(&self.key)
-                .upload_id(&self.upload_id)
-                .multipart_upload(completed_upload)
-                .send()
-                .await
-        }).context(format!("Failed to complete multipart upload: s3://{}/{}", self.bucket, self.key))?;
+        self.runtime
+            .block_on(async {
+                self.client
+                    .complete_multipart_upload()
+                    .bucket(&self.bucket)
+                    .key(&self.key)
+                    .upload_id(&self.upload_id)
+                    .multipart_upload(completed_upload)
+                    .send()
+                    .await
+            })
+            .context(format!(
+                "Failed to complete multipart upload: s3://{}/{}",
+                self.bucket, self.key
+            ))?;
 
         eprintln!("Upload completed: s3://{}/{}", self.bucket, self.key);
 
@@ -549,8 +566,12 @@ impl OutputWriter {
             }
             OutputWriter::S3Gzip(mut w) => {
                 w.flush()?;
-                let encoder = w.into_inner().map_err(|e| anyhow::anyhow!("Failed to finish gzip writer for S3: {}", e.error()))?;
-                let s3_writer = encoder.finish().context("Failed to finish gzip encoding for S3")?;
+                let encoder = w.into_inner().map_err(|e| {
+                    anyhow::anyhow!("Failed to finish gzip writer for S3: {}", e.error())
+                })?;
+                let s3_writer = encoder
+                    .finish()
+                    .context("Failed to finish gzip encoding for S3")?;
                 s3_writer.finish().context("Failed to finish S3 upload")?;
                 Ok(())
             }
@@ -582,9 +603,7 @@ pub(crate) fn open_output(
                 let writer = BufWriter::with_capacity(16 * 1024 * 1024, encoder);
                 Ok(OutputWriter::S3Gzip(writer))
             }
-            CompressionFormat::None => {
-                Ok(OutputWriter::S3Plain(s3_writer))
-            }
+            CompressionFormat::None => Ok(OutputWriter::S3Plain(s3_writer)),
         }
     } else {
         // Create file and detect compression

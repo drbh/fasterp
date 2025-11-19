@@ -363,11 +363,9 @@ mod optimized {
             .collect();
 
         // Sort by count DESC, then by k-mer index ASC for deterministic tiebreaking
-        candidates.sort_by(|a, b| {
-            match b.1.cmp(&a.1) {
-                std::cmp::Ordering::Equal => a.0.cmp(&b.0),
-                other => other,
-            }
+        candidates.sort_by(|a, b| match b.1.cmp(&a.1) {
+            std::cmp::Ordering::Equal => a.0.cmp(&b.0),
+            other => other,
         });
         candidates.truncate(top_n);
         candidates
@@ -1262,8 +1260,6 @@ fn try_insertion_match_new(
     })
 }
 
-
-
 #[inline(always)]
 fn mismatch_ci(a: u8, b: u8) -> u16 {
     // ASCII-fold to uppercase: 'a'..'z' -> 'A'..'Z'
@@ -1325,7 +1321,11 @@ fn try_insertion_match(
     min_overlap: usize,
 ) -> Option<AdapterMatch> {
     // Same basic guards as before
-    if ins_data.len() < cmplen + 1 || normal_data.len() < cmplen || cmplen < min_overlap || cmplen < 8 {
+    if ins_data.len() < cmplen + 1
+        || normal_data.len() < cmplen
+        || cmplen < min_overlap
+        || cmplen < 8
+    {
         return None;
     }
 
@@ -1354,7 +1354,7 @@ fn try_insertion_match_stack<const MAX: usize>(
     let init: u16 = diff_limit.saturating_add(1);
 
     // Everything stays on the stack
-    let mut left:  [u16; MAX] = [init; MAX];
+    let mut left: [u16; MAX] = [init; MAX];
     let mut right: [u16; MAX] = [init; MAX];
 
     let last = cmplen - 1;
@@ -1447,7 +1447,7 @@ fn try_insertion_match_slow(
             right_buf.resize(cmplen, init);
         }
 
-        let left  = &mut left_buf[..cmplen];
+        let left = &mut left_buf[..cmplen];
         let right = &mut right_buf[..cmplen];
 
         // Initialize arrays to "infinite" diff (same semantics as original)
@@ -1520,7 +1520,6 @@ fn try_insertion_match_slow(
         None
     })
 }
-
 
 /// Try matching with single deletion from adapter (Stage 3)
 /// Fastp handles deletion by swapping arguments to matchWithOneInsertion:
@@ -1889,8 +1888,12 @@ mod tests {
             // Edge case: cmplen at minimum
             (b"AGATCGGXAAGAGCTT", b"AGATCGGAAGAGCTT", 8, 8),
             // Longer sequences
-            (b"AGATCGGAAGAGCACACGTCTGAACTCCAGTCACXNNNNNNATCTCGTATGCCGTCTTCTGCTTG",
-             b"AGATCGGAAGAGCACACGTCTGAACTCCAGTCACNNNNNNATCTCGTATGCCGTCTTCTGCTTG", 30, 10),
+            (
+                b"AGATCGGAAGAGCACACGTCTGAACTCCAGTCACXNNNNNNATCTCGTATGCCGTCTTCTGCTTG",
+                b"AGATCGGAAGAGCACACGTCTGAACTCCAGTCACNNNNNNATCTCGTATGCCGTCTTCTGCTTG",
+                30,
+                10,
+            ),
             // Multiple potential insertion points
             (b"ACGTXACGTACGT", b"ACGTACGTACGT", 12, 8),
         ];
@@ -1923,10 +1926,13 @@ mod tests {
                 _ => {
                     panic!(
                         "Test case {}: Results differ. Old: {:?}, New: {:?}\nInput: ins={:?}, normal={:?}, cmplen={}, min_overlap={}",
-                        i, result_old, result_new,
+                        i,
+                        result_old,
+                        result_new,
                         String::from_utf8_lossy(ins_data),
                         String::from_utf8_lossy(normal_data),
-                        cmplen, min_overlap
+                        cmplen,
+                        min_overlap
                     );
                 }
             }

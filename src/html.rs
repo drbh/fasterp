@@ -63,7 +63,9 @@ fn write_header(html: &mut String) {
     html.push_str("}\n");
     html.push_str("</script>\n");
     html.push_str("</head>\n<body>\n");
-    html.push_str("<button class='theme-toggle' onclick='toggleTheme()'>Toggle Light/Dark</button>\n");
+    html.push_str(
+        "<button class='theme-toggle' onclick='toggleTheme()'>Toggle Light/Dark</button>\n",
+    );
     html.push_str("<div id='container'>\n");
 }
 
@@ -105,9 +107,7 @@ fn write_css(html: &mut String) {
     html.push_str("  --chart-grid: #e0e0e0;\n");
     html.push_str("}\n");
     html.push_str("* { margin: 0; padding: 0; box-sizing: border-box; }\n");
-    html.push_str(
-        "body { font-family: 'JetBrains Mono', 'Courier New', monospace; ",
-    );
+    html.push_str("body { font-family: 'JetBrains Mono', 'Courier New', monospace; ");
     html.push_str("background: var(--bg-primary); padding: 10px; line-height: 1.4; color: var(--text-primary); font-size: 12px; }\n");
     html.push_str("#container { width: 100%; background: var(--bg-secondary); ");
     html.push_str("border: 2px solid var(--border-color); padding: 20px; }\n");
@@ -115,7 +115,9 @@ fn write_css(html: &mut String) {
     html.push_str("padding: 4px 8px; border: 1px solid var(--border-color); ");
     html.push_str("background: var(--bg-tertiary); color: var(--text-primary); ");
     html.push_str("cursor: pointer; font-size: 10px; font-family: 'JetBrains Mono', monospace; z-index: 1000; }\n");
-    html.push_str(".theme-toggle:hover { background: var(--border-accent); color: var(--bg-primary); }\n");
+    html.push_str(
+        ".theme-toggle:hover { background: var(--border-accent); color: var(--bg-primary); }\n",
+    );
     html.push_str("h1 { color: var(--text-primary); font-size: 18px; font-weight: 500; ");
     html.push_str("margin-bottom: 20px; border-bottom: 1px solid var(--border-accent); padding-bottom: 10px; }\n");
     html.push_str("h2 { color: var(--text-primary); font-size: 13px; font-weight: 500; ");
@@ -123,17 +125,23 @@ fn write_css(html: &mut String) {
     html.push_str("border-left: 3px solid var(--border-accent); padding-left: 10px; }\n");
     html.push_str("h3 { color: var(--text-secondary); font-size: 11px; font-weight: 400; margin-top: 15px; }\n");
     html.push_str("table { width: 100%; border-collapse: collapse; margin: 10px 0 20px 0; font-size: 11px; }\n");
-    html.push_str("th { background: var(--bg-tertiary); color: var(--text-primary); padding: 8px 10px; ");
+    html.push_str(
+        "th { background: var(--bg-tertiary); color: var(--text-primary); padding: 8px 10px; ",
+    );
     html.push_str("text-align: left; font-weight: 500; font-size: 11px; ");
     html.push_str("border: 1px solid var(--border-color); }\n");
-    html.push_str("td { padding: 6px 10px; border: 1px solid var(--border-color); font-size: 11px; }\n");
+    html.push_str(
+        "td { padding: 6px 10px; border: 1px solid var(--border-color); font-size: 11px; }\n",
+    );
     html.push_str(".col1 { font-weight: 400; color: var(--text-tertiary); width: 180px; }\n");
     html.push_str(".value { color: var(--text-value); }\n");
     html.push_str(".badge { display: inline-block; padding: 1px 4px; ");
     html.push_str("font-size: 9px; ");
     html.push_str("background: var(--badge-bg); color: var(--badge-text); margin-left: 4px; border: 1px solid var(--border-color); }\n");
     html.push_str("footer { margin-top: 30px; padding-top: 15px; ");
-    html.push_str("border-top: 1px solid var(--border-color); color: var(--text-muted); font-size: 9px; }\n");
+    html.push_str(
+        "border-top: 1px solid var(--border-color); color: var(--text-muted); font-size: 9px; }\n",
+    );
     html.push_str(".command { background: var(--bg-tertiary); padding: 8px; ");
     html.push_str("border: 1px solid var(--border-color); margin: 8px 0; ");
     html.push_str("font-size: 10px; color: var(--text-value); word-break: break-all; }\n");
@@ -412,12 +420,7 @@ fn write_body(html: &mut String, report: &FasterpReport, args: &Args, elapsed: D
             write_kmer_table(html, after_stats, "After filtering: KMER Counting");
             html.push_str("</div>\n");
             html.push_str("<div>\n");
-            write_kmer_diff_table(
-                html,
-                r2_before,
-                after_stats,
-                "Difference: KMER Counting",
-            );
+            write_kmer_diff_table(html, r2_before, after_stats, "Difference: KMER Counting");
             html.push_str("</div>\n");
         }
         html.push_str("</div>\n");
@@ -514,23 +517,45 @@ fn write_before_after_comparison(html: &mut String, report: &FasterpReport) {
         // Total reads
         let reads_diff = after_reads_per_file as i64 - reads_per_file as i64;
         html.push_str("<tr><td class='col1'>total reads</td>");
-        html.push_str(&format!("<td class='value'>{}</td>", format_number(reads_per_file)));
-        html.push_str(&format!("<td class='value'>{}</td>", format_number(after_reads_per_file)));
-        html.push_str(&format!("<td class='value'>{}</td></tr>\n", format_diff(reads_diff)));
+        html.push_str(&format!(
+            "<td class='value'>{}</td>",
+            format_number(reads_per_file)
+        ));
+        html.push_str(&format!(
+            "<td class='value'>{}</td>",
+            format_number(after_reads_per_file)
+        ));
+        html.push_str(&format!(
+            "<td class='value'>{}</td></tr>\n",
+            format_diff(reads_diff)
+        ));
 
         // Total bases
         html.push_str("<tr><td class='col1'>total bases</td>");
-        html.push_str(&format!("<td class='value'>{}</td>", format_number(r1_before.total_bases)));
+        html.push_str(&format!(
+            "<td class='value'>{}</td>",
+            format_number(r1_before.total_bases)
+        ));
         if let Some(r1a) = r1_after {
             let bases_diff = r1a.total_bases as i64 - r1_before.total_bases as i64;
-            html.push_str(&format!("<td class='value'>{}</td>", format_number(r1a.total_bases)));
-            html.push_str(&format!("<td class='value'>{}</td></tr>\n", format_diff(bases_diff)));
+            html.push_str(&format!(
+                "<td class='value'>{}</td>",
+                format_number(r1a.total_bases)
+            ));
+            html.push_str(&format!(
+                "<td class='value'>{}</td></tr>\n",
+                format_diff(bases_diff)
+            ));
         } else {
             html.push_str("<td class='value'>-</td><td class='value'>-</td></tr>\n");
         }
 
         // Q20 bases
-        let r1_before_q20_pct = if r1_before.total_bases > 0 { r1_before.q20_bases as f64 * 100.0 / r1_before.total_bases as f64 } else { 0.0 };
+        let r1_before_q20_pct = if r1_before.total_bases > 0 {
+            r1_before.q20_bases as f64 * 100.0 / r1_before.total_bases as f64
+        } else {
+            0.0
+        };
         html.push_str("<tr><td class='col1'>Q20 bases</td>");
         html.push_str(&format!(
             "<td class='value'>{} <span class='badge'>{:.2}%</span></td>",
@@ -538,20 +563,31 @@ fn write_before_after_comparison(html: &mut String, report: &FasterpReport) {
             r1_before_q20_pct
         ));
         if let Some(r1a) = r1_after {
-            let r1_after_q20_pct = if r1a.total_bases > 0 { r1a.q20_bases as f64 * 100.0 / r1a.total_bases as f64 } else { 0.0 };
+            let r1_after_q20_pct = if r1a.total_bases > 0 {
+                r1a.q20_bases as f64 * 100.0 / r1a.total_bases as f64
+            } else {
+                0.0
+            };
             let pct_diff = r1_after_q20_pct - r1_before_q20_pct;
             html.push_str(&format!(
                 "<td class='value'>{} <span class='badge'>{:.2}%</span></td>",
                 format_number(r1a.q20_bases),
                 r1_after_q20_pct
             ));
-            html.push_str(&format!("<td class='value'>{}</td></tr>\n", format_pct_diff(pct_diff)));
+            html.push_str(&format!(
+                "<td class='value'>{}</td></tr>\n",
+                format_pct_diff(pct_diff)
+            ));
         } else {
             html.push_str("<td class='value'>-</td><td class='value'>-</td></tr>\n");
         }
 
         // Q30 bases
-        let r1_before_q30_pct = if r1_before.total_bases > 0 { r1_before.q30_bases as f64 * 100.0 / r1_before.total_bases as f64 } else { 0.0 };
+        let r1_before_q30_pct = if r1_before.total_bases > 0 {
+            r1_before.q30_bases as f64 * 100.0 / r1_before.total_bases as f64
+        } else {
+            0.0
+        };
         html.push_str("<tr><td class='col1'>Q30 bases</td>");
         html.push_str(&format!(
             "<td class='value'>{} <span class='badge'>{:.2}%</span></td>",
@@ -559,14 +595,21 @@ fn write_before_after_comparison(html: &mut String, report: &FasterpReport) {
             r1_before_q30_pct
         ));
         if let Some(r1a) = r1_after {
-            let r1_after_q30_pct = if r1a.total_bases > 0 { r1a.q30_bases as f64 * 100.0 / r1a.total_bases as f64 } else { 0.0 };
+            let r1_after_q30_pct = if r1a.total_bases > 0 {
+                r1a.q30_bases as f64 * 100.0 / r1a.total_bases as f64
+            } else {
+                0.0
+            };
             let pct_diff = r1_after_q30_pct - r1_before_q30_pct;
             html.push_str(&format!(
                 "<td class='value'>{} <span class='badge'>{:.2}%</span></td>",
                 format_number(r1a.q30_bases),
                 r1_after_q30_pct
             ));
-            html.push_str(&format!("<td class='value'>{}</td></tr>\n", format_pct_diff(pct_diff)));
+            html.push_str(&format!(
+                "<td class='value'>{}</td></tr>\n",
+                format_pct_diff(pct_diff)
+            ));
         } else {
             html.push_str("<td class='value'>-</td><td class='value'>-</td></tr>\n");
         }
@@ -580,23 +623,45 @@ fn write_before_after_comparison(html: &mut String, report: &FasterpReport) {
 
         // Total reads
         html.push_str("<tr><td class='col1'>total reads</td>");
-        html.push_str(&format!("<td class='value'>{}</td>", format_number(reads_per_file)));
-        html.push_str(&format!("<td class='value'>{}</td>", format_number(after_reads_per_file)));
-        html.push_str(&format!("<td class='value'>{}</td></tr>\n", format_diff(reads_diff)));
+        html.push_str(&format!(
+            "<td class='value'>{}</td>",
+            format_number(reads_per_file)
+        ));
+        html.push_str(&format!(
+            "<td class='value'>{}</td>",
+            format_number(after_reads_per_file)
+        ));
+        html.push_str(&format!(
+            "<td class='value'>{}</td></tr>\n",
+            format_diff(reads_diff)
+        ));
 
         // Total bases
         html.push_str("<tr><td class='col1'>total bases</td>");
-        html.push_str(&format!("<td class='value'>{}</td>", format_number(r2_before.total_bases)));
+        html.push_str(&format!(
+            "<td class='value'>{}</td>",
+            format_number(r2_before.total_bases)
+        ));
         if let Some(r2a) = r2_after {
             let bases_diff = r2a.total_bases as i64 - r2_before.total_bases as i64;
-            html.push_str(&format!("<td class='value'>{}</td>", format_number(r2a.total_bases)));
-            html.push_str(&format!("<td class='value'>{}</td></tr>\n", format_diff(bases_diff)));
+            html.push_str(&format!(
+                "<td class='value'>{}</td>",
+                format_number(r2a.total_bases)
+            ));
+            html.push_str(&format!(
+                "<td class='value'>{}</td></tr>\n",
+                format_diff(bases_diff)
+            ));
         } else {
             html.push_str("<td class='value'>-</td><td class='value'>-</td></tr>\n");
         }
 
         // Q20 bases
-        let r2_before_q20_pct = if r2_before.total_bases > 0 { r2_before.q20_bases as f64 * 100.0 / r2_before.total_bases as f64 } else { 0.0 };
+        let r2_before_q20_pct = if r2_before.total_bases > 0 {
+            r2_before.q20_bases as f64 * 100.0 / r2_before.total_bases as f64
+        } else {
+            0.0
+        };
         html.push_str("<tr><td class='col1'>Q20 bases</td>");
         html.push_str(&format!(
             "<td class='value'>{} <span class='badge'>{:.2}%</span></td>",
@@ -604,20 +669,31 @@ fn write_before_after_comparison(html: &mut String, report: &FasterpReport) {
             r2_before_q20_pct
         ));
         if let Some(r2a) = r2_after {
-            let r2_after_q20_pct = if r2a.total_bases > 0 { r2a.q20_bases as f64 * 100.0 / r2a.total_bases as f64 } else { 0.0 };
+            let r2_after_q20_pct = if r2a.total_bases > 0 {
+                r2a.q20_bases as f64 * 100.0 / r2a.total_bases as f64
+            } else {
+                0.0
+            };
             let pct_diff = r2_after_q20_pct - r2_before_q20_pct;
             html.push_str(&format!(
                 "<td class='value'>{} <span class='badge'>{:.2}%</span></td>",
                 format_number(r2a.q20_bases),
                 r2_after_q20_pct
             ));
-            html.push_str(&format!("<td class='value'>{}</td></tr>\n", format_pct_diff(pct_diff)));
+            html.push_str(&format!(
+                "<td class='value'>{}</td></tr>\n",
+                format_pct_diff(pct_diff)
+            ));
         } else {
             html.push_str("<td class='value'>-</td><td class='value'>-</td></tr>\n");
         }
 
         // Q30 bases
-        let r2_before_q30_pct = if r2_before.total_bases > 0 { r2_before.q30_bases as f64 * 100.0 / r2_before.total_bases as f64 } else { 0.0 };
+        let r2_before_q30_pct = if r2_before.total_bases > 0 {
+            r2_before.q30_bases as f64 * 100.0 / r2_before.total_bases as f64
+        } else {
+            0.0
+        };
         html.push_str("<tr><td class='col1'>Q30 bases</td>");
         html.push_str(&format!(
             "<td class='value'>{} <span class='badge'>{:.2}%</span></td>",
@@ -625,14 +701,21 @@ fn write_before_after_comparison(html: &mut String, report: &FasterpReport) {
             r2_before_q30_pct
         ));
         if let Some(r2a) = r2_after {
-            let r2_after_q30_pct = if r2a.total_bases > 0 { r2a.q30_bases as f64 * 100.0 / r2a.total_bases as f64 } else { 0.0 };
+            let r2_after_q30_pct = if r2a.total_bases > 0 {
+                r2a.q30_bases as f64 * 100.0 / r2a.total_bases as f64
+            } else {
+                0.0
+            };
             let pct_diff = r2_after_q30_pct - r2_before_q30_pct;
             html.push_str(&format!(
                 "<td class='value'>{} <span class='badge'>{:.2}%</span></td>",
                 format_number(r2a.q30_bases),
                 r2_after_q30_pct
             ));
-            html.push_str(&format!("<td class='value'>{}</td></tr>\n", format_pct_diff(pct_diff)));
+            html.push_str(&format!(
+                "<td class='value'>{}</td></tr>\n",
+                format_pct_diff(pct_diff)
+            ));
         } else {
             html.push_str("<td class='value'>-</td><td class='value'>-</td></tr>\n");
         }
@@ -647,16 +730,34 @@ fn write_before_after_comparison(html: &mut String, report: &FasterpReport) {
         // Total reads
         let reads_diff = after.total_reads as i64 - before.total_reads as i64;
         html.push_str("<tr><td class='col1'>total reads</td>");
-        html.push_str(&format!("<td class='value'>{}</td>", format_number(before.total_reads)));
-        html.push_str(&format!("<td class='value'>{}</td>", format_number(after.total_reads)));
-        html.push_str(&format!("<td class='value'>{}</td></tr>\n", format_diff(reads_diff)));
+        html.push_str(&format!(
+            "<td class='value'>{}</td>",
+            format_number(before.total_reads)
+        ));
+        html.push_str(&format!(
+            "<td class='value'>{}</td>",
+            format_number(after.total_reads)
+        ));
+        html.push_str(&format!(
+            "<td class='value'>{}</td></tr>\n",
+            format_diff(reads_diff)
+        ));
 
         // Total bases
         let bases_diff = after.total_bases as i64 - before.total_bases as i64;
         html.push_str("<tr><td class='col1'>total bases</td>");
-        html.push_str(&format!("<td class='value'>{}</td>", format_number(before.total_bases)));
-        html.push_str(&format!("<td class='value'>{}</td>", format_number(after.total_bases)));
-        html.push_str(&format!("<td class='value'>{}</td></tr>\n", format_diff(bases_diff)));
+        html.push_str(&format!(
+            "<td class='value'>{}</td>",
+            format_number(before.total_bases)
+        ));
+        html.push_str(&format!(
+            "<td class='value'>{}</td>",
+            format_number(after.total_bases)
+        ));
+        html.push_str(&format!(
+            "<td class='value'>{}</td></tr>\n",
+            format_diff(bases_diff)
+        ));
 
         // Q20 bases
         let q20_pct_diff = (after.q20_rate - before.q20_rate) * 100.0;
@@ -671,7 +772,10 @@ fn write_before_after_comparison(html: &mut String, report: &FasterpReport) {
             format_number(after.q20_bases),
             after.q20_rate * 100.0
         ));
-        html.push_str(&format!("<td class='value'>{}</td></tr>\n", format_pct_diff(q20_pct_diff)));
+        html.push_str(&format!(
+            "<td class='value'>{}</td></tr>\n",
+            format_pct_diff(q20_pct_diff)
+        ));
 
         // Q30 bases
         let q30_pct_diff = (after.q30_rate - before.q30_rate) * 100.0;
@@ -686,14 +790,26 @@ fn write_before_after_comparison(html: &mut String, report: &FasterpReport) {
             format_number(after.q30_bases),
             after.q30_rate * 100.0
         ));
-        html.push_str(&format!("<td class='value'>{}</td></tr>\n", format_pct_diff(q30_pct_diff)));
+        html.push_str(&format!(
+            "<td class='value'>{}</td></tr>\n",
+            format_pct_diff(q30_pct_diff)
+        ));
 
         // GC content
         let gc_diff = (after.gc_content - before.gc_content) * 100.0;
         html.push_str("<tr><td class='col1'>GC content</td>");
-        html.push_str(&format!("<td class='value'>{:.2}%</td>", before.gc_content * 100.0));
-        html.push_str(&format!("<td class='value'>{:.2}%</td>", after.gc_content * 100.0));
-        html.push_str(&format!("<td class='value'>{}</td></tr>\n", format_pct_diff(gc_diff)));
+        html.push_str(&format!(
+            "<td class='value'>{:.2}%</td>",
+            before.gc_content * 100.0
+        ));
+        html.push_str(&format!(
+            "<td class='value'>{:.2}%</td>",
+            after.gc_content * 100.0
+        ));
+        html.push_str(&format!(
+            "<td class='value'>{}</td></tr>\n",
+            format_pct_diff(gc_diff)
+        ));
 
         html.push_str("</table>\n");
     }
@@ -825,7 +941,10 @@ fn write_base_contents_chart(
     html.push_str("  paper_bgcolor: colors.paper,\n");
     html.push_str("  plot_bgcolor: colors.plot\n");
     html.push_str("};\n");
-    let _ = writeln!(html, "Plotly.newPlot('{div_id}', data, layout, {{responsive: true}});");
+    let _ = writeln!(
+        html,
+        "Plotly.newPlot('{div_id}', data, layout, {{responsive: true}});"
+    );
     html.push_str("</script>\n");
 }
 
@@ -956,7 +1075,8 @@ fn write_kmer_diff_table(
                 for b4 in &bases {
                     for b5 in &bases {
                         let kmer = format!("{b1}{b2}{b3}{b4}{b5}");
-                        let before_count = before.kmer_count.get(&kmer).copied().unwrap_or(0) as i64;
+                        let before_count =
+                            before.kmer_count.get(&kmer).copied().unwrap_or(0) as i64;
                         let after_count = after.kmer_count.get(&kmer).copied().unwrap_or(0) as i64;
                         let diff = after_count - before_count;
 
@@ -1036,13 +1156,18 @@ fn write_quality_histogram(
         html.push_str(
             "  xaxis: {title: 'Base quality score', color: colors.text, gridcolor: colors.grid},\n",
         );
-        html.push_str("  yaxis: {title: 'Base count', color: colors.text, gridcolor: colors.grid},\n");
+        html.push_str(
+            "  yaxis: {title: 'Base count', color: colors.text, gridcolor: colors.grid},\n",
+        );
         html.push_str("  margin: {l: 60, r: 30, t: 30, b: 50},\n");
         html.push_str("  showlegend: false,\n");
         html.push_str("  paper_bgcolor: colors.paper,\n");
         html.push_str("  plot_bgcolor: colors.plot\n");
         html.push_str("};\n");
-        let _ = writeln!(html, "Plotly.newPlot('{div_id}', data, layout, {{responsive: true}});");
+        let _ = writeln!(
+            html,
+            "Plotly.newPlot('{div_id}', data, layout, {{responsive: true}});"
+        );
         html.push_str("</script>\n");
     } else {
         html.push_str("<p>No quality histogram data available</p>\n");
@@ -1164,14 +1289,19 @@ fn write_quality_chart(html: &mut String, stats: &DetailedReadStats, title: &str
     html.push_str(
         "  xaxis: {title: 'Position in read (bp)', color: colors.text, gridcolor: colors.grid},\n",
     );
-    html.push_str("  yaxis: {title: 'Quality score', color: colors.text, gridcolor: colors.grid},\n");
+    html.push_str(
+        "  yaxis: {title: 'Quality score', color: colors.text, gridcolor: colors.grid},\n",
+    );
     html.push_str("  margin: {l: 50, r: 30, t: 30, b: 50},\n");
     html.push_str("  showlegend: true,\n");
     html.push_str("  legend: {x: 1, xanchor: 'right', y: 1, font: {color: colors.text}},\n");
     html.push_str("  paper_bgcolor: colors.paper,\n");
     html.push_str("  plot_bgcolor: colors.plot\n");
     html.push_str("};\n");
-    let _ = writeln!(html, "Plotly.newPlot('{div_id}', data, layout, {{responsive: true}});");
+    let _ = writeln!(
+        html,
+        "Plotly.newPlot('{div_id}', data, layout, {{responsive: true}});"
+    );
     html.push_str("</script>\n");
 }
 
@@ -1189,7 +1319,11 @@ fn write_quality_diff_chart(
     html.push_str("<script>\n");
 
     // Calculate difference (after - before)
-    let len = before.quality_curves.mean.len().min(after.quality_curves.mean.len());
+    let len = before
+        .quality_curves
+        .mean
+        .len()
+        .min(after.quality_curves.mean.len());
 
     html.push_str("var diff_trace = {\n");
     html.push_str("  x: [");
@@ -1226,7 +1360,10 @@ fn write_quality_diff_chart(
     html.push_str("  paper_bgcolor: colors.paper,\n");
     html.push_str("  plot_bgcolor: colors.plot\n");
     html.push_str("};\n");
-    let _ = writeln!(html, "Plotly.newPlot('{div_id}', data, layout, {{responsive: true}});");
+    let _ = writeln!(
+        html,
+        "Plotly.newPlot('{div_id}', data, layout, {{responsive: true}});"
+    );
     html.push_str("</script>\n");
 }
 
@@ -1285,13 +1422,18 @@ fn write_quality_histogram_diff(
         html.push_str(
             "  xaxis: {title: 'Base quality score', color: colors.text, gridcolor: colors.grid},\n",
         );
-        html.push_str("  yaxis: {title: 'Count change', color: colors.text, gridcolor: colors.grid},\n");
+        html.push_str(
+            "  yaxis: {title: 'Count change', color: colors.text, gridcolor: colors.grid},\n",
+        );
         html.push_str("  margin: {l: 60, r: 30, t: 30, b: 50},\n");
         html.push_str("  showlegend: false,\n");
         html.push_str("  paper_bgcolor: colors.paper,\n");
         html.push_str("  plot_bgcolor: colors.plot\n");
         html.push_str("};\n");
-        let _ = writeln!(html, "Plotly.newPlot('{div_id}', data, layout, {{responsive: true}});");
+        let _ = writeln!(
+            html,
+            "Plotly.newPlot('{div_id}', data, layout, {{responsive: true}});"
+        );
         html.push_str("</script>\n");
     } else {
         html.push_str("<p>No quality histogram data available</p>\n");
@@ -1311,15 +1453,44 @@ fn write_base_contents_diff_chart(
     let _ = writeln!(html, "<div id='{div_id}' class='chart'></div>");
     html.push_str("<script>\n");
 
-    let len = before.content_curves.a.len().min(after.content_curves.a.len());
+    let len = before
+        .content_curves
+        .a
+        .len()
+        .min(after.content_curves.a.len());
 
     // Create diff traces for A, T, C, G, GC
     let bases = [
-        ("A", "#8dd3c7", &before.content_curves.a, &after.content_curves.a),
-        ("T", "#bebada", &before.content_curves.t, &after.content_curves.t),
-        ("C", "#5dade2", &before.content_curves.c, &after.content_curves.c),
-        ("G", "#80b1d3", &before.content_curves.g, &after.content_curves.g),
-        ("GC", "#333", &before.content_curves.gc, &after.content_curves.gc),
+        (
+            "A",
+            "#8dd3c7",
+            &before.content_curves.a,
+            &after.content_curves.a,
+        ),
+        (
+            "T",
+            "#bebada",
+            &before.content_curves.t,
+            &after.content_curves.t,
+        ),
+        (
+            "C",
+            "#5dade2",
+            &before.content_curves.c,
+            &after.content_curves.c,
+        ),
+        (
+            "G",
+            "#80b1d3",
+            &before.content_curves.g,
+            &after.content_curves.g,
+        ),
+        (
+            "GC",
+            "#333",
+            &before.content_curves.gc,
+            &after.content_curves.gc,
+        ),
     ];
 
     for (base_name, color, before_data, after_data) in &bases {
@@ -1364,7 +1535,10 @@ fn write_base_contents_diff_chart(
     html.push_str("  paper_bgcolor: colors.paper,\n");
     html.push_str("  plot_bgcolor: colors.plot\n");
     html.push_str("};\n");
-    let _ = writeln!(html, "Plotly.newPlot('{div_id}', data, layout, {{responsive: true}});");
+    let _ = writeln!(
+        html,
+        "Plotly.newPlot('{div_id}', data, layout, {{responsive: true}});"
+    );
     html.push_str("</script>\n");
 }
 

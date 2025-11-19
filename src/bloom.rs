@@ -7,6 +7,19 @@ use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 
 const PRIME_ARRAY_LEN: usize = 1 << 9; // 512 primes per buffer
 
+// DATA ORIENTED OPTIMIZATION:
+// A static Lookup Table (LUT) maps DNA bases to their Fastp integer values.
+// This allows O(1) conversion without 'if/else' or 'match' branching,
+// preventing pipeline stalls on the CPU.
+static BASE_LUT: [u64; 256] = {
+    let mut lut = [13u64; 256]; // Default to 13 (N/other)
+    lut[b'A' as usize] = 7;
+    lut[b'T' as usize] = 222;
+    lut[b'C' as usize] = 74;
+    lut[b'G' as usize] = 31;
+    lut
+};
+
 /// Duplicate detector using Bloom filter
 /// Memory layout and algorithm matches fastp for exact parity
 pub struct DuplicateDetector {
@@ -117,60 +130,87 @@ impl DuplicateDetector {
         true
     }
 
-    /// Hash sequence to integer vector (matches fastp's seq2intvector)
-    /// For paired-end, call twice: once for R1 (`pos_offset=0`) and once for R2 (`pos_offset=R1.len()`)
-    fn seq2intvector(&self, data: &[u8], pos_offset: usize, output: &mut [u64]) {
-        for (p, &base_char) in data.iter().enumerate() {
-            let base: u64 = match base_char {
-                b'A' => 7,
-                b'T' => 222,
-                b'C' => 74,
-                b'G' => 31,
-                _ => 13, // N or any other character
-            };
+    /// Optimized hash accumulation with linear memory access
+    ///
+    /// Changes from original seq2intvector:
+    /// 1. Uses LUT for branchless base mapping (no match/if)
+    /// 2. Linear memory access pattern for CPU prefetching
+    /// 3. Uses unsafe get_unchecked (bounds are mathematically guaranteed by mask)
+    #[inline(always)]
+    fn accumulate_hash(&self, seq: &[u8], start_offset: usize, accumulators: &mut [u64]) {
+        let buf_num = self.buf_num;
+        let mask = self.offset_mask;
 
-            for (i, output_item) in output.iter_mut().take(self.buf_num).enumerate() {
-                let offset = ((p + pos_offset) * self.buf_num + i) & self.offset_mask;
-                *output_item += self.prime_arrays[offset] * (base + (p + pos_offset) as u64);
+        // Calculate the starting index in the prime array.
+        // We track this linearly to avoid multiplication in the loop.
+        let mut current_prime_base_idx = start_offset * buf_num;
+
+        for &byte in seq {
+            // 1. LUT Lookup (No Branching)
+            // SAFETY: byte is u8, so it is always a valid index for [u64; 256]
+            let base = unsafe { *BASE_LUT.get_unchecked(byte as usize) };
+
+            // Calculate position component once per base
+            let pos = current_prime_base_idx / buf_num;
+            let val_component = base + pos as u64;
+
+            // 2. Update Accumulators
+            // We iterate buf_num times (2-6). LLVM will unroll this small loop.
+            for i in 0..buf_num {
+                // Handle the circular buffer wrap-around using bitwise AND
+                let prime_idx = (current_prime_base_idx + i) & mask;
+
+                // SAFETY: prime_arrays length matches mask+1, and mask guarantees bounds
+                let prime = unsafe { *self.prime_arrays.get_unchecked(prime_idx) };
+
+                // Update the accumulator
+                accumulators[i] += prime * val_component;
             }
+
+            // Stride forward by buf_num (Linear Memory Access)
+            current_prime_base_idx += buf_num;
         }
     }
 
-    /// Apply Bloom filter: check if bits are set, and set them if not
-    /// Returns true if this is a duplicate
+    /// Check if a paired-end read is duplicate
     ///
-    /// Note: fastp's implementation only checks the LAST buffer's bit (due to overwriting
-    /// isDup each iteration instead of ANDing). We replicate this for exact parity.
-    fn apply_bloom_filter(&self, positions: &[u64]) -> bool {
+    /// Optimized to use:
+    /// - Stack allocation instead of heap (Vec -> fixed array)
+    /// - Linear memory access pattern
+    /// - Inlined Bloom filter logic
+    pub fn check_pair(&self, seq1: &[u8], seq2: &[u8]) -> bool {
+        // OPTIMIZATION: Stack Allocation
+        // Instead of vec![0u64; self.buf_num] (heap), we use a fixed array.
+        // Max buf_num is 6 (accuracy level 6). 16 provides safety margin.
+        let mut positions = [0u64; 16];
+
+        // Slice to actual size needed
+        let active_accs = &mut positions[..self.buf_num];
+
+        // Hash R1 starting at position 0
+        self.accumulate_hash(seq1, 0, active_accs);
+
+        // Hash R2 starting at position seq1.len()
+        self.accumulate_hash(seq2, seq1.len(), active_accs);
+
+        // Apply Bloom filter (inlined for reduced overhead)
         let mut is_dup = true;
 
-        for (i, &position) in positions.iter().enumerate().take(self.buf_num) {
+        for (i, &position) in active_accs.iter().enumerate() {
             let pos = position % self.buf_len_in_bits;
-            let byte_pos = (pos >> 3) as usize; // Divide by 8 to get byte position
-            let bit_offset = (pos & 0x07) as u8; // Remainder is bit position within byte
-            let bit_mask = 1u8 << bit_offset;
+            let byte_pos = (pos >> 3) as usize;
+            let bit_mask = 1u8 << (pos & 0x07);
 
-            // Atomically fetch old value and set the bit
-            let old_value = self.bit_arrays[i][byte_pos].fetch_or(bit_mask, Ordering::Relaxed);
+            // SAFETY: bit_arrays are initialized to buf_len_in_bytes.
+            // The modulo arithmetic guarantees we are in bounds.
+            let bit_array = unsafe { self.bit_arrays.get_unchecked(i) };
+            let byte_ptr = unsafe { bit_array.get_unchecked(byte_pos) };
+
+            let old_value = byte_ptr.fetch_or(bit_mask, Ordering::Relaxed);
 
             // Match fastp: overwrite (not AND) - only last buffer's result matters
             is_dup = (old_value & bit_mask) != 0;
         }
-
-        is_dup
-    }
-
-    /// Check if a paired-end read is duplicate
-    /// Hashes R1 and R2 concatenated together
-    pub fn check_pair(&self, seq1: &[u8], seq2: &[u8]) -> bool {
-        let mut positions = vec![0u64; self.buf_num];
-
-        // Hash R1 starting at position 0
-        self.seq2intvector(seq1, 0, &mut positions);
-        // Hash R2 starting at position R1.len()
-        self.seq2intvector(seq2, seq1.len(), &mut positions);
-
-        let is_dup = self.apply_bloom_filter(&positions);
 
         self.total_reads.fetch_add(1, Ordering::Relaxed);
         if is_dup {

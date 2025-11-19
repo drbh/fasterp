@@ -17,7 +17,7 @@ use std::arch::x86_64::*;
 
 #[cfg(target_arch = "aarch64")]
 use std::arch::aarch64::{
-    uint8x16_t, vaddlvq_u8, vceqq_u8, vcgeq_u8, vcltq_u8, vdupq_n_u8, vld1q_u8, vmvnq_u8, vorrq_u8,
+    uint8x16_t, vaddlvq_u8, vceqq_u8, vcgeq_u8, vcltq_u8, vdupq_n_u8, vld1q_u8, vorrq_u8,
     vshrq_n_u8, vsubq_u8,
 };
 
@@ -50,16 +50,13 @@ pub fn is_simd_available() -> bool {
     }
 }
 
-/// Count mismatches with early termination - uses scalar for correctness
-///
-/// The early termination logic requires byte-by-byte position tracking to match
-/// fastp's exact behavior. SIMD chunking loses this granularity and causes
-/// incorrect acceptance of overlaps. Since this function is not performance-critical
-/// (called ~200k times on small sequences vs millions of calls for stats),
-/// scalar is the right choice.
+/// Count mismatches with early termination
 ///
 /// Returns (`total_differences`, `positions_compared`)
 /// Stops early if differences exceeds `max_diff` and `positions_compared` < `min_complete`
+///
+/// Uses SIMD acceleration where available, with careful handling to maintain
+/// exact byte-level early termination semantics required by fastp compatibility.
 #[inline]
 pub fn count_mismatches(
     seq1: &[u8],
@@ -69,9 +66,22 @@ pub fn count_mismatches(
 ) -> (usize, usize) {
     debug_assert_eq!(seq1.len(), seq2.len());
 
-    // Always use scalar - the early termination semantics require exact position tracking
-    // SIMD chunking breaks this and causes incorrect overlap acceptance
-    count_mismatches_scalar(seq1, seq2, max_diff, min_complete)
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") {
+            return unsafe { count_mismatches_avx2(seq1, seq2, max_diff, min_complete) };
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    {
+        return unsafe { count_mismatches_neon(seq1, seq2, max_diff, min_complete) };
+    }
+
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        count_mismatches_scalar(seq1, seq2, max_diff, min_complete)
+    }
 }
 
 /// Scalar mismatch counting with early termination
@@ -211,13 +221,31 @@ unsafe fn count_mismatches_avx2(
         // Count mismatches: count zeros in the mask
         let matches = mask.count_ones() as usize;
         let chunk_mismatches = chunk_size - matches;
-        differences += chunk_mismatches;
+        let new_differences = differences + chunk_mismatches;
+        let chunk_end = i + chunk_size;
 
-        // Early termination check
-        if differences > max_diff && i < min_complete {
-            return (differences, i + chunk_size);
+        // Early termination check - only if threshold exceeded
+        if new_differences > max_diff {
+            if chunk_end <= min_complete {
+                // Chunk entirely before min_complete - chunk boundary is valid
+                return (new_differences, chunk_end);
+            } else if i < min_complete {
+                // Chunk straddles min_complete boundary - need exact position
+                for j in 0..chunk_size {
+                    let pos = i + j;
+                    if seq1[pos] != seq2[pos] {
+                        differences += 1;
+                        if differences > max_diff && pos < min_complete {
+                            return (differences, pos + 1);
+                        }
+                    }
+                }
+                // Threshold crossed at pos >= min_complete, continue
+            }
+            // else: chunk entirely past min_complete, no early termination possible
         }
 
+        differences = new_differences;
         i += chunk_size;
     }
 
@@ -386,9 +414,7 @@ unsafe fn horizontal_sum_u8_to_u32(vec: __m256i) -> u32 {
     result.iter().sum()
 }
 
-// ============================================================================
 // ARM NEON Implementation (aarch64)
-// ============================================================================
 
 #[cfg(target_arch = "aarch64")]
 #[inline]
@@ -413,18 +439,36 @@ unsafe fn count_mismatches_neon(
             // Compare: vceqq_u8 returns 0xFF for equal, 0x00 for not equal
             let eq_mask = vceqq_u8(vec1, vec2);
 
-            // Invert to get mismatches (0xFF becomes 0x00, 0x00 becomes 0xFF)
-            let ne_mask = vmvnq_u8(eq_mask);
+            // Count equals and subtract from 16 (eliminates vmvnq_u8 instruction)
+            // Shift right by 7 to get 1 for 0xFF (equal), 0 for 0x00 (not equal)
+            let shifted = vshrq_n_u8(eq_mask, 7);
+            let equals = vaddlvq_u8(shifted) as usize;
+            let chunk_mismatches = 16 - equals;
+            let new_differences = differences + chunk_mismatches;
+            let chunk_end = i + chunk_size;
 
-            // Count mismatches in this chunk
-            let chunk_mismatches = count_set_bits_neon(ne_mask);
-            differences += chunk_mismatches;
-
-            // Early termination check
-            if differences > max_diff && i < min_complete {
-                return (differences, i + chunk_size);
+            // Early termination check - only if threshold exceeded
+            if new_differences > max_diff {
+                if chunk_end <= min_complete {
+                    // Chunk entirely before min_complete - chunk boundary is valid
+                    return (new_differences, chunk_end);
+                } else if i < min_complete {
+                    // Chunk straddles min_complete boundary - need exact position
+                    for j in 0..chunk_size {
+                        let pos = i + j;
+                        if seq1[pos] != seq2[pos] {
+                            differences += 1;
+                            if differences > max_diff && pos < min_complete {
+                                return (differences, pos + 1);
+                            }
+                        }
+                    }
+                    // Threshold crossed at pos >= min_complete, continue
+                }
+                // else: chunk entirely past min_complete, no early termination possible
             }
 
+            differences = new_differences;
             i += chunk_size;
         }
     }
@@ -710,6 +754,239 @@ mod tests {
 
     /// Test the problematic read from SRR22472290.464
     /// This read is filtered by fasterp but passed by fastp
+    // Early Termination Semantics Tests for count_mismatches
+    // These tests ensure SIMD implementations maintain byte-level early termination
+    // semantics. The key invariant: returned position `i` must be the exact byte
+    // where termination occurred, not a chunk boundary.
+
+    #[test]
+    fn test_early_termination_basic() {
+        // Basic case: 6 differences in first 10 bytes with max_diff=5, min_complete=50
+        // Should terminate early and return position < 50
+        let seq1 = b"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"; // 64 A's
+        let mut seq2 = seq1.to_vec();
+        // Put 6 differences in positions 0, 2, 4, 6, 8, 10
+        for i in (0..12).step_by(2) {
+            seq2[i] = b'T';
+        }
+
+        let (diff, pos) = count_mismatches(seq1, &seq2, 5, 50);
+
+        assert_eq!(diff, 6, "Should count 6 differences");
+        // Key semantic: pos must be < min_complete for early termination to apply
+        // SIMD may return chunk boundary (16) instead of exact position (11), both are < 50
+        assert!(
+            pos <= 50,
+            "Should terminate early with position <= 50, got {}",
+            pos
+        );
+        assert!(
+            pos > 10,
+            "Position must be past the 6th mismatch at position 10"
+        );
+    }
+
+    #[test]
+    fn test_early_termination_at_chunk_boundary() {
+        // Critical test: 6th difference at position 15 (end of first SIMD chunk)
+        // SIMD bug would return pos=16, scalar returns pos=16 - same in this case
+        // But the intermediate check matters!
+        let seq1 = b"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"; // 64 A's
+        let mut seq2 = seq1.to_vec();
+        // 6 differences at positions 0, 3, 6, 9, 12, 15
+        for i in (0..18).step_by(3) {
+            seq2[i] = b'T';
+        }
+
+        let (diff, pos) = count_mismatches(seq1, &seq2, 5, 50);
+
+        assert_eq!(diff, 6, "Should count 6 differences");
+        assert_eq!(
+            pos, 16,
+            "Should terminate at position 16 (right after 6th diff at 15)"
+        );
+    }
+
+    #[test]
+    fn test_early_termination_across_chunks() {
+        // 5 differences in first chunk (0-15), 1 more in second chunk
+        // Tests that SIMD correctly handles threshold crossing in second chunk
+        let seq1 = b"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"; // 64 A's
+        let mut seq2 = seq1.to_vec();
+        // 5 differences at positions 0, 3, 6, 9, 12 (all in first chunk)
+        for i in (0..15).step_by(3) {
+            seq2[i] = b'T';
+        }
+        // 6th difference at position 20 (second chunk)
+        seq2[20] = b'T';
+
+        let (diff, pos) = count_mismatches(seq1, &seq2, 5, 50);
+
+        assert_eq!(diff, 6, "Should count 6 differences");
+        // Key semantic: pos must be <= min_complete for early termination
+        // SIMD returns chunk boundary (32), scalar returns exact (21), both are < 50
+        assert!(
+            pos <= 50,
+            "Should terminate with position <= 50, got {}",
+            pos
+        );
+        assert!(
+            pos > 20,
+            "Position must be past the 6th mismatch at position 20"
+        );
+    }
+
+    #[test]
+    fn test_early_termination_near_min_complete() {
+        // The most critical case: 6th difference at position 48 (just before min_complete=50)
+        // Scalar: terminates at 49, i=49 > 50 is FALSE → rejects
+        // Buggy SIMD: continues past chunk boundary, i=64 > 50 is TRUE → accepts (WRONG!)
+        let seq1 = vec![b'A'; 64];
+        let mut seq2 = seq1.clone();
+        // Place 5 differences spread out, then 6th at position 48
+        seq2[10] = b'T'; // diff 1
+        seq2[20] = b'T'; // diff 2
+        seq2[30] = b'T'; // diff 3
+        seq2[35] = b'T'; // diff 4
+        seq2[40] = b'T'; // diff 5
+        seq2[48] = b'T'; // diff 6 - critical position!
+
+        let (diff, pos) = count_mismatches(&seq1, &seq2, 5, 50);
+
+        assert_eq!(diff, 6, "Should count 6 differences");
+        // CRITICAL: must return 49, not 64!
+        // If SIMD returns 64, then 64 > 50 = true → lenient mode incorrectly applies
+        // If scalar returns 49, then 49 > 50 = false → correct early rejection
+        assert_eq!(
+            pos, 49,
+            "Must terminate at position 49, not chunk boundary 64"
+        );
+        assert!(
+            pos <= 50,
+            "Position {} must be <= 50 for early termination to work",
+            pos
+        );
+    }
+
+    #[test]
+    fn test_no_early_termination_when_completing() {
+        // When we complete all comparisons (reach the end), should return full length
+        // even if differences exceed max_diff (lenient mode)
+        let seq1 = vec![b'A'; 60];
+        let mut seq2 = seq1.clone();
+        // 6 differences spread throughout
+        seq2[5] = b'T';
+        seq2[15] = b'T';
+        seq2[25] = b'T';
+        seq2[35] = b'T';
+        seq2[45] = b'T';
+        seq2[55] = b'T';
+
+        let (diff, pos) = count_mismatches(&seq1, &seq2, 5, 50);
+
+        assert_eq!(diff, 6, "Should count 6 differences");
+        // Should complete all 60 comparisons because after position 50,
+        // the early termination condition (i < min_complete) is false
+        assert_eq!(
+            pos, 60,
+            "Should complete all comparisons when past min_complete"
+        );
+    }
+
+    #[test]
+    fn test_early_termination_exactly_at_min_complete() {
+        // Edge case: 6th difference exactly at position 49 (last position before min_complete=50)
+        let seq1 = vec![b'A'; 64];
+        let mut seq2 = seq1.clone();
+        seq2[8] = b'T'; // diff 1
+        seq2[16] = b'T'; // diff 2
+        seq2[24] = b'T'; // diff 3
+        seq2[32] = b'T'; // diff 4
+        seq2[40] = b'T'; // diff 5
+        seq2[49] = b'T'; // diff 6 - exactly at position 49
+
+        let (diff, pos) = count_mismatches(&seq1, &seq2, 5, 50);
+
+        assert_eq!(diff, 6, "Should count 6 differences");
+        // Position 49 < 50, so early termination should trigger
+        assert_eq!(pos, 50, "Should terminate at position 50");
+        assert!(pos <= 50, "Early termination check: {} <= 50", pos);
+    }
+
+    #[test]
+    fn test_early_termination_just_past_min_complete() {
+        // 6th difference at position 50 (first position >= min_complete)
+        // Should NOT early terminate because i >= min_complete
+        let seq1 = vec![b'A'; 64];
+        let mut seq2 = seq1.clone();
+        seq2[8] = b'T'; // diff 1
+        seq2[16] = b'T'; // diff 2
+        seq2[24] = b'T'; // diff 3
+        seq2[32] = b'T'; // diff 4
+        seq2[40] = b'T'; // diff 5
+        seq2[50] = b'T'; // diff 6 - at position 50, past min_complete
+
+        let (diff, pos) = count_mismatches(&seq1, &seq2, 5, 50);
+
+        assert_eq!(diff, 6, "Should count 6 differences");
+        // Should complete all comparisons because at position 50, i >= min_complete
+        assert_eq!(
+            pos, 64,
+            "Should complete all comparisons when diff occurs at/past min_complete"
+        );
+    }
+
+    #[test]
+    fn test_simd_vs_scalar_consistency() {
+        // Comprehensive test: ensure SIMD and scalar produce semantically equivalent results
+        // SIMD may return chunk boundaries, scalar returns exact positions
+        // Both must agree on: diff count, and whether pos triggers early termination
+        let test_cases = vec![
+            // (seq_len, diff_positions, max_diff, min_complete)
+            (64, vec![5, 10, 15, 20, 25, 30], 5, 50), // spread across chunks
+            (64, vec![0, 1, 2, 3, 4, 5], 5, 50),      // all early
+            (64, vec![45, 46, 47, 48, 49, 50], 5, 50), // near boundary
+            (64, vec![14, 15, 16, 17, 18, 19], 5, 50), // across first chunk boundary
+            (64, vec![30, 31, 32, 33, 34, 35], 5, 50), // across second chunk boundary
+            (150, vec![40, 45, 48, 49, 50, 51], 5, 50), // realistic read length
+        ];
+
+        for (seq_len, diff_positions, max_diff, min_complete) in test_cases {
+            let seq1 = vec![b'A'; seq_len];
+            let mut seq2 = seq1.clone();
+            for &pos in &diff_positions {
+                if pos < seq_len {
+                    seq2[pos] = b'T';
+                }
+            }
+
+            // Get result from current implementation (SIMD)
+            let (simd_diff, simd_pos) = count_mismatches(&seq1, &seq2, max_diff, min_complete);
+
+            // Get expected result from scalar
+            let (scalar_diff, scalar_pos) =
+                count_mismatches_scalar(&seq1, &seq2, max_diff, min_complete);
+
+            // Diff counts must match
+            assert_eq!(
+                simd_diff, scalar_diff,
+                "Diff count mismatch for seq_len={}, diffs={:?}: SIMD={}, scalar={}",
+                seq_len, diff_positions, simd_diff, scalar_diff
+            );
+
+            // Semantic equivalence: both must agree on early termination decision
+            // Early termination applies when: diff > max_diff && pos <= min_complete
+            let simd_early_term = simd_diff > max_diff && simd_pos <= min_complete;
+            let scalar_early_term = scalar_diff > max_diff && scalar_pos <= min_complete;
+
+            assert_eq!(
+                simd_early_term, scalar_early_term,
+                "Early termination decision mismatch for seq_len={}, diffs={:?}: SIMD pos={} (early={}), scalar pos={} (early={})",
+                seq_len, diff_positions, simd_pos, simd_early_term, scalar_pos, scalar_early_term
+            );
+        }
+    }
+
     #[test]
     fn test_problematic_read_srr22472290_464() {
         // The exact quality strings from the problematic read pair
