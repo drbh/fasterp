@@ -1422,8 +1422,6 @@ pub(crate) fn process_paired_fastq_stream<
     Ok(acc)
 }
 
-use std::sync::atomic::Ordering;
-
 // EXPERT OPTIMIZATION:
 // Map ASCII bases to 0..3 index instantly.
 // 255 acts as the "None" sentinel to avoid an Option enum (which adds branching).

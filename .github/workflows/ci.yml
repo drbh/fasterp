@@ -55,6 +55,10 @@ jobs:
         sudo mv fastp /usr/local/bin/
         fastp --version
 
+        # Install mdBook for documentation
+        cargo install mdbook --force
+        mdbook --version
+
     - name: Generate test data
       run: |
         cd test_data
@@ -90,16 +94,28 @@ jobs:
           test_data/*.fq
           target/debug/deps/*.log
 
-    - name: Generate HTML report
+    - name: Build documentation
       run: |
-        mkdir -p _site
-        ./target/release/fasterp \
-          -i test_data/SRR5808766_1.fastq.gz \
-          -I test_data/SRR5808766_2.fastq.gz \
-          -o /tmp/filtered_1.fq \
-          -O /tmp/filtered_2.fq \
-          -j /tmp/report.json \
-          --html _site/index.html
+        # Build mdBook
+        cd book && mdbook build
+
+        # Generate fastp report
+        fastp \
+          -i ../test_data/SRR5808766_1.fastq.gz \
+          -I ../test_data/SRR5808766_2.fastq.gz \
+          -o /tmp/fastp_out_1.fq \
+          -O /tmp/fastp_out_2.fq \
+          -j /tmp/fastp_report.json \
+          -h book/fastp_report.html
+
+        # Generate fasterp report
+        ../target/release/fasterp \
+          -i ../test_data/SRR5808766_1.fastq.gz \
+          -I ../test_data/SRR5808766_2.fastq.gz \
+          -o /tmp/fasterp_out_1.fq \
+          -O /tmp/fasterp_out_2.fq \
+          -j /tmp/fasterp_report.json \
+          --html book/fasterp_report.html
 
     - name: Setup Pages
       if: github.ref == 'refs/heads/main' && github.event_name == 'push'
@@ -111,7 +127,7 @@ jobs:
       if: github.ref == 'refs/heads/main' && github.event_name == 'push'
       uses: actions/upload-pages-artifact@v3
       with:
-        path: _site
+        path: book/book
 
   deploy:
     needs: test-and-benchmark

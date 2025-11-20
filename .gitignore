@@ -22,6 +22,11 @@ bulk_bottom.fastq.gz
 comp.sh
 
 fastq_preprocessor_test
-SRR27128759
+SRR*
+SRX*
 download_ena_fastq.py
 fasterp.html
+book/src/*.html
+book/book
+.wrangler
+node_modules

@@ -1,0 +1,15 @@
+[book]
+title = "fasterp"
+authors = ["drbh"]
+description = "High-performance FASTQ preprocessing in Rust"
+language = "en"
+src = "src"
+
+[build]
+build-dir = "book"
+
+[output.html]
+default-theme = "rust"
+preferred-dark-theme = "ayu"
+git-repository-url = "https://github.com/drbh/fasterp"
+edit-url-template = "https://github.com/drbh/fasterp/edit/main/book/{path}"

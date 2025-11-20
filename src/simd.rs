@@ -71,6 +71,7 @@ pub fn count_mismatches(
         if is_x86_feature_detected!("avx2") {
             return unsafe { count_mismatches_avx2(seq1, seq2, max_diff, min_complete) };
         }
+        return count_mismatches_scalar(seq1, seq2, max_diff, min_complete);
     }
 
     #[cfg(target_arch = "aarch64")]
@@ -195,6 +196,7 @@ fn compute_stats_scalar(seq: &[u8], qual: &[u8], qual_threshold: u8) -> Stats {
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
+#[allow(unsafe_op_in_unsafe_fn)]
 unsafe fn count_mismatches_avx2(
     seq1: &[u8],
     seq2: &[u8],
@@ -209,14 +211,14 @@ unsafe fn count_mismatches_avx2(
     // Process 32 bytes at a time with AVX2
     while i + chunk_size <= len {
         // Load both sequences
-        let vec1 = _mm256_loadu_si256(seq1[i..].as_ptr() as *const __m256i);
-        let vec2 = _mm256_loadu_si256(seq2[i..].as_ptr() as *const __m256i);
+        let vec1 = unsafe { _mm256_loadu_si256(seq1[i..].as_ptr() as *const __m256i) };
+        let vec2 = unsafe { _mm256_loadu_si256(seq2[i..].as_ptr() as *const __m256i) };
 
         // Compare: returns 0xFF for equal, 0x00 for not equal
-        let eq_mask = _mm256_cmpeq_epi8(vec1, vec2);
+        let eq_mask = unsafe { _mm256_cmpeq_epi8(vec1, vec2) };
 
         // Convert to movemask (1 bit per byte, 1 = equal)
-        let mask = _mm256_movemask_epi8(eq_mask) as u32;
+        let mask = unsafe { _mm256_movemask_epi8(eq_mask) } as u32;
 
         // Count mismatches: count zeros in the mask
         let matches = mask.count_ones() as usize;
@@ -265,6 +267,7 @@ unsafe fn count_mismatches_avx2(
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
+#[allow(unsafe_op_in_unsafe_fn)]
 unsafe fn compute_stats_avx2(seq: &[u8], qual: &[u8], qual_threshold: u8) -> Stats {
     let len = seq.len().min(qual.len());
     let mut qsum = 0u32;
@@ -386,6 +389,7 @@ unsafe fn compute_stats_avx2(seq: &[u8], qual: &[u8], qual_threshold: u8) -> Sta
 
 #[cfg(target_arch = "x86_64")]
 #[inline]
+#[allow(unsafe_op_in_unsafe_fn)]
 unsafe fn count_set_bits_avx2(mask: __m256i) -> usize {
     // Convert comparison mask to bitmask
     let bitmask = _mm256_movemask_epi8(mask) as u32;
@@ -394,6 +398,7 @@ unsafe fn count_set_bits_avx2(mask: __m256i) -> usize {
 
 #[cfg(target_arch = "x86_64")]
 #[inline]
+#[allow(unsafe_op_in_unsafe_fn)]
 unsafe fn horizontal_sum_u8_to_u32(vec: __m256i) -> u32 {
     // Unpack bytes to 16-bit integers (with zero extension)
     let zero = _mm256_setzero_si256();
