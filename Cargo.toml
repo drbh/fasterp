@@ -48,7 +48,7 @@ libdeflater = {version = "1.21", optional = true}
 num_cpus = {version = "1.16", optional = true}
 rayon = {version = "1.10", optional = true}
 tokio = {version = "1.0", features = ["rt-multi-thread"], optional = true}
-ureq = {version = "2.9", default-features = false, features = ["native-tls"], optional = true}
+ureq = {version = "2.9", default-features = false, features = ["tls"], optional = true}
 
 # WASM-only dependencies
 js-sys = {version = "=0.3.69", optional = true}
