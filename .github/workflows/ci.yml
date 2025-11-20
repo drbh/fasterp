@@ -31,7 +31,8 @@ jobs:
           ~/.cargo/registry/cache/
           ~/.cargo/git/db/
           target/
-        key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          ~/.rustup/toolchains/*/lib/rustlib/wasm32-unknown-unknown/
+        key: ${{ runner.os }}-cargo-wasm-${{ hashFiles('**/Cargo.lock') }}-v2
 
     - name: Cache test data
       uses: actions/cache@v4
@@ -93,6 +94,27 @@ jobs:
         path: |
           test_data/*.fq
           target/debug/deps/*.log
+
+    - name: Build WASM for playground
+      run: |
+        # Install wasm32 target
+        rustup target add wasm32-unknown-unknown
+
+        # Install wasm-bindgen-cli (matching version in Cargo.toml)
+        cargo install wasm-bindgen-cli --version 0.2.92 --force
+
+        # Build WASM
+        cargo build --target wasm32-unknown-unknown --no-default-features --features wasm --lib --release
+
+        # Generate JS bindings
+        wasm-bindgen target/wasm32-unknown-unknown/release/fasterp.wasm \
+          --out-dir pkg \
+          --target web \
+          --typescript
+
+        # Copy to book playground
+        mkdir -p book/src/playground/pkg
+        cp -r pkg/* book/src/playground/pkg/
 
     - name: Build documentation
       run: |

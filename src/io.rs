@@ -5,6 +5,8 @@
 //! - `open_input()`: Open input with auto-decompression (gzip support)
 //! - `OutputWriter`: Wrapper for `BufWriter` with optional compression
 //! - `open_output()`: Open output with optional compression
+//!
+//! Note: This module requires the `native` feature (file I/O, S3, HTTP).
 
 use anyhow::{Context, Result, bail};
 use flate2::Compression;

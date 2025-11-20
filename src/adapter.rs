@@ -7,6 +7,7 @@
 //! - Auto-detection using PE overlap analysis
 //! - Mismatch-tolerant matching
 
+#[cfg(feature = "native")]
 use rayon::prelude::*;
 use std::cell::RefCell;
 use std::cmp::min;
@@ -196,7 +197,8 @@ fn find_consensus_adapter(
 //
 
 mod optimized {
-    use super::{ParallelIterator, ParallelSlice};
+    #[cfg(feature = "native")]
+    use rayon::prelude::*;
 
     /// 2-bit encoding for DNA bases: A=00, C=01, G=10, T=11
     #[inline]
@@ -332,7 +334,8 @@ mod optimized {
         counts
     }
 
-    /// Parallel k-mer counting using rayon
+    /// Parallel k-mer counting using rayon (native) or serial (WASM)
+    #[cfg(feature = "native")]
     pub fn count_k10_2bit_parallel(seqs: &[&[u8]], start: usize) -> Vec<u32> {
         const K: usize = 10;
         const ARRAY_SIZE: usize = 1 << (K * 2);
@@ -351,6 +354,13 @@ mod optimized {
         }
 
         final_counts
+    }
+
+    /// Serial k-mer counting for WASM
+    #[cfg(not(feature = "native"))]
+    pub fn count_k10_2bit_parallel(seqs: &[&[u8]], start: usize) -> Vec<u32> {
+        // Fall back to serial processing on WASM
+        count_k10_2bit_tail(seqs, start)
     }
 
     /// Find top N k-mer candidates by count

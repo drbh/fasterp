@@ -1,0 +1,814 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>fasterp WASM Sandbox</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+    <style>
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            height: 100vh;
+            display: flex;
+            flex-direction: column;
+            background: #0a0a0a;
+            color: #e5e5e5;
+        }
+        header {
+            padding: 12px 20px;
+            background: #171717;
+            border-bottom: 1px solid #262626;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+        }
+        header h1 {
+            font-size: 18px;
+            font-weight: 600;
+        }
+        .header-left {
+            display: flex;
+            align-items: center;
+            gap: 16px;
+        }
+        .header-buttons {
+            display: flex;
+            gap: 8px;
+        }
+        .header-btn {
+            padding: 6px 12px;
+            background: #262626;
+            color: #a3a3a3;
+            border: 1px solid #333333;
+            border-radius: 4px;
+            font-size: 12px;
+            text-decoration: none;
+            cursor: pointer;
+            transition: all 0.2s;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+        .header-btn:hover {
+            background: #333333;
+            color: #e5e5e5;
+            border-color: #404040;
+        }
+        .header-stats {
+            display: flex;
+            gap: 20px;
+            font-size: 13px;
+        }
+        .stat {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+        .stat-label {
+            color: #737373;
+        }
+        .stat-value {
+            font-weight: 600;
+            font-family: 'JetBrains Mono', 'Monaco', monospace;
+        }
+        .stat-value.success { color: #4ade80; }
+        .stat-value.error { color: #f87171; }
+        .stat-value.info { color: #a3a3a3; }
+
+        .main-container {
+            flex: 1;
+            display: grid;
+            grid-template-columns: 280px 1fr 1fr;
+            gap: 1px;
+            background: #262626;
+            overflow: hidden;
+        }
+
+        .panel {
+            background: #171717;
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+        }
+        .panel-header {
+            padding: 12px 16px;
+            font-size: 12px;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            color: #737373;
+            border-bottom: 1px solid #262626;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        .panel-content {
+            flex: 1;
+            overflow-y: auto;
+            padding: 16px;
+        }
+
+        /* Controls Panel */
+        .control-group {
+            margin-bottom: 20px;
+        }
+        .control-group-title {
+            font-size: 11px;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            color: #525252;
+            margin-bottom: 10px;
+        }
+        .control-item {
+            margin-bottom: 12px;
+        }
+        .control-item label {
+            display: block;
+            font-size: 12px;
+            color: #a3a3a3;
+            margin-bottom: 4px;
+        }
+        .control-item input[type="number"] {
+            width: 100%;
+            padding: 8px 10px;
+            background: #0a0a0a;
+            border: 1px solid #262626;
+            border-radius: 4px;
+            color: #e5e5e5;
+            font-size: 13px;
+            font-family: 'JetBrains Mono', 'Monaco', monospace;
+        }
+        .control-item input[type="number"]:focus {
+            outline: none;
+            border-color: #525252;
+        }
+        .control-item-checkbox {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+        .control-item-checkbox input[type="checkbox"] {
+            width: 16px;
+            height: 16px;
+            accent-color: #737373;
+        }
+        .control-item-checkbox label {
+            margin: 0;
+            cursor: pointer;
+        }
+
+        .process-btn {
+            width: 100%;
+            padding: 12px;
+            background: #404040;
+            color: white;
+            border: none;
+            border-radius: 6px;
+            font-size: 14px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: background 0.2s;
+        }
+        .process-btn:hover {
+            background: #525252;
+        }
+        .process-btn:disabled {
+            background: #262626;
+            cursor: not-allowed;
+        }
+        .process-btn:active {
+            transform: scale(0.98);
+        }
+
+        /* Editor with syntax highlighting */
+        .editor-container {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+            position: relative;
+        }
+        .editor-wrapper {
+            flex: 1;
+            position: relative;
+            overflow: hidden;
+        }
+        .editor-highlight {
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            padding: 16px;
+            font-family: 'JetBrains Mono', 'Monaco', 'Menlo', 'Consolas', monospace;
+            font-size: 12px;
+            line-height: 1.5;
+            white-space: pre-wrap;
+            word-wrap: break-word;
+            overflow-y: auto;
+            pointer-events: none;
+            color: transparent;
+        }
+        .editor-textarea {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            padding: 16px;
+            background: transparent;
+            border: none;
+            color: transparent;
+            caret-color: #e2e8f0;
+            font-family: 'JetBrains Mono', 'Monaco', 'Menlo', 'Consolas', monospace;
+            font-size: 12px;
+            line-height: 1.5;
+            resize: none;
+            outline: none;
+            white-space: pre-wrap;
+            word-wrap: break-word;
+            overflow-y: auto;
+        }
+        .editor-textarea::selection {
+            background: rgba(115, 115, 115, 0.5);
+        }
+        .editor-background {
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: #0a0a0a;
+        }
+
+        /* Syntax highlighting colors */
+        .hl-header { color: #d4d4d4; font-weight: 500; }
+        .hl-comment { color: #525252; }
+        .hl-plus { color: #525252; }
+        .hl-quality { color: #737373; }
+        .hl-quality-high {
+            background: #4ade80;
+            color: #0a0a0a;
+            font-weight: 500;
+        }
+        .hl-quality-med {
+            background: #fbbf24;
+            color: #0a0a0a;
+            font-weight: 500;
+        }
+        .hl-quality-low {
+            background: #f87171;
+            color: #0a0a0a;
+            font-weight: 500;
+        }
+
+        /* DNA base colors - background highlights */
+        .hl-A {
+            background: #4ade80;
+            color: #0a0a0a;
+            font-weight: 500;
+        } /* Green - Adenine */
+        .hl-T {
+            background: #f87171;
+            color: #0a0a0a;
+            font-weight: 500;
+        } /* Red - Thymine */
+        .hl-G {
+            background: #fbbf24;
+            color: #0a0a0a;
+            font-weight: 500;
+        } /* Yellow - Guanine */
+        .hl-C {
+            background: #60a5fa;
+            color: #0a0a0a;
+            font-weight: 500;
+        } /* Blue - Cytosine */
+        .hl-N {
+            background: #525252;
+            color: #e5e5e5;
+            font-weight: 500;
+        } /* Gray - Unknown */
+
+        /* Notice */
+        .notice {
+            background: #1a1a1a;
+            border: 1px solid #333333;
+            border-radius: 6px;
+            padding: 12px;
+            margin-bottom: 16px;
+            font-size: 11px;
+        }
+        .notice strong {
+            color: #a3a3a3;
+            display: block;
+            margin-bottom: 6px;
+        }
+        .notice p {
+            color: #737373;
+            margin: 0 0 8px 0;
+            line-height: 1.4;
+        }
+        .notice code {
+            display: block;
+            background: #0a0a0a;
+            padding: 8px 10px;
+            border-radius: 4px;
+            color: #4ade80;
+            font-family: 'JetBrains Mono', 'Monaco', monospace;
+            font-size: 11px;
+        }
+
+        /* Status */
+        #status {
+            padding: 8px 12px;
+            font-size: 12px;
+            border-radius: 4px;
+            margin-bottom: 16px;
+        }
+        #status.loading {
+            background: #1a1a1a;
+            color: #fbbf24;
+        }
+        #status.ready {
+            background: #0a1a0a;
+            color: #4ade80;
+        }
+        #status.error {
+            background: #1a0a0a;
+            color: #f87171;
+        }
+
+        /* JSON Report Toggle */
+        .report-toggle {
+            font-size: 11px;
+            color: #737373;
+            cursor: pointer;
+            text-decoration: underline;
+        }
+        .report-toggle:hover {
+            color: #a3a3a3;
+        }
+        .report-panel {
+            display: none;
+            position: fixed;
+            bottom: 0;
+            left: 0;
+            right: 0;
+            height: 300px;
+            background: #171717;
+            border-top: 1px solid #262626;
+            z-index: 100;
+        }
+        .report-panel.visible {
+            display: flex;
+            flex-direction: column;
+        }
+        .report-panel pre {
+            flex: 1;
+            margin: 0;
+            padding: 16px;
+            overflow: auto;
+            font-size: 11px;
+            background: #0a0a0a;
+            color: #e5e5e5;
+        }
+        .close-report {
+            position: absolute;
+            top: 8px;
+            right: 16px;
+            background: none;
+            border: none;
+            color: #737373;
+            cursor: pointer;
+            font-size: 18px;
+        }
+        .close-report:hover {
+            color: #a3a3a3;
+        }
+
+        /* Responsive */
+        @media (max-width: 1024px) {
+            .main-container {
+                grid-template-columns: 1fr;
+                grid-template-rows: auto 1fr 1fr;
+            }
+            .panel:first-child {
+                max-height: 300px;
+            }
+            header {
+                flex-direction: column;
+                gap: 12px;
+                align-items: flex-start;
+            }
+            .header-left {
+                width: 100%;
+                justify-content: space-between;
+            }
+            .header-stats {
+                font-size: 11px;
+                gap: 12px;
+            }
+        }
+    </style>
+</head>
+<body>
+    <header>
+        <div class="header-left">
+            <h1>fasterp Sandbox</h1>
+            <div class="header-buttons">
+                <a href="https://drbh.github.io/fasterp/" target="_blank" class="header-btn">
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+                        <polyline points="14 2 14 8 20 8"/>
+                    </svg>
+                    Docs
+                </a>
+                <a href="https://github.com/drbh/fasterp" target="_blank" class="header-btn">
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor">
+                        <path d="M12 0c-6.626 0-12 5.373-12 12 0 5.302 3.438 9.8 8.207 11.387.599.111.793-.261.793-.577v-2.234c-3.338.726-4.033-1.416-4.033-1.416-.546-1.387-1.333-1.756-1.333-1.756-1.089-.745.083-.729.083-.729 1.205.084 1.839 1.237 1.839 1.237 1.07 1.834 2.807 1.304 3.492.997.107-.775.418-1.305.762-1.604-2.665-.305-5.467-1.334-5.467-5.931 0-1.311.469-2.381 1.236-3.221-.124-.303-.535-1.524.117-3.176 0 0 1.008-.322 3.301 1.23.957-.266 1.983-.399 3.003-.404 1.02.005 2.047.138 3.006.404 2.291-1.552 3.297-1.23 3.297-1.23.653 1.653.242 2.874.118 3.176.77.84 1.235 1.911 1.235 3.221 0 4.609-2.807 5.624-5.479 5.921.43.372.823 1.102.823 2.222v3.293c0 .319.192.694.801.576 4.765-1.589 8.199-6.086 8.199-11.386 0-6.627-5.373-12-12-12z"/>
+                    </svg>
+                    GitHub
+                </a>
+            </div>
+        </div>
+        <div class="header-stats">
+            <div class="stat">
+                <span class="stat-label">Input:</span>
+                <span class="stat-value info" id="input-reads">0</span>
+                <span class="stat-label">reads</span>
+            </div>
+            <div class="stat">
+                <span class="stat-label">Passed:</span>
+                <span class="stat-value success" id="passed-reads">0</span>
+            </div>
+            <div class="stat">
+                <span class="stat-label">Failed:</span>
+                <span class="stat-value error" id="failed-reads">0</span>
+            </div>
+            <div class="stat">
+                <span class="stat-label">Rate:</span>
+                <span class="stat-value info" id="pass-rate">-</span>
+            </div>
+            <span class="report-toggle" onclick="toggleReport()">View Report</span>
+        </div>
+    </header>
+
+    <div class="main-container">
+        <!-- Controls Panel -->
+        <div class="panel">
+            <div class="panel-header">Controls</div>
+            <div class="panel-content">
+                <div id="status" class="loading">Loading WASM...</div>
+
+                <div class="notice">
+                    <strong>Demo Only</strong>
+                    <p>This web UI is for small datasets and demonstrations. For large-scale processing, install the CLI:</p>
+                    <code>cargo install fasterp</code>
+                </div>
+
+                <div class="control-group">
+                    <div class="control-group-title">Length Filtering</div>
+                    <div class="control-item">
+                        <label>Min Length</label>
+                        <input type="number" id="min_length" value="15">
+                    </div>
+                    <div class="control-item">
+                        <label>Max Length (0 = no limit)</label>
+                        <input type="number" id="max_length" value="0">
+                    </div>
+                </div>
+
+                <div class="control-group">
+                    <div class="control-group-title">Quality Filtering</div>
+                    <div class="control-item">
+                        <label>N Base Limit</label>
+                        <input type="number" id="n_base_limit" value="5">
+                    </div>
+                    <div class="control-item">
+                        <label>Quality Threshold (Phred)</label>
+                        <input type="number" id="qualified_quality" value="15">
+                    </div>
+                    <div class="control-item">
+                        <label>Unqualified % Limit</label>
+                        <input type="number" id="unqualified_limit" value="40">
+                    </div>
+                </div>
+
+                <div class="control-group">
+                    <div class="control-group-title">Sliding Window</div>
+                    <div class="control-item">
+                        <label>Mean Quality</label>
+                        <input type="number" id="cut_mean_quality" value="20">
+                    </div>
+                    <div class="control-item">
+                        <label>Window Size</label>
+                        <input type="number" id="window_size" value="4">
+                    </div>
+                    <div class="control-item control-item-checkbox">
+                        <input type="checkbox" id="cut_front">
+                        <label for="cut_front">Cut Front</label>
+                    </div>
+                    <div class="control-item control-item-checkbox">
+                        <input type="checkbox" id="cut_tail" checked>
+                        <label for="cut_tail">Cut Tail</label>
+                    </div>
+                </div>
+
+                <div class="control-group">
+                    <div class="control-group-title">Poly Trimming</div>
+                    <div class="control-item control-item-checkbox">
+                        <input type="checkbox" id="trim_poly_g" checked>
+                        <label for="trim_poly_g">Trim Poly-G</label>
+                    </div>
+                    <div class="control-item control-item-checkbox">
+                        <input type="checkbox" id="trim_poly_x">
+                        <label for="trim_poly_x">Trim Poly-X</label>
+                    </div>
+                </div>
+
+                <button class="process-btn" id="processBtn" onclick="processData()" disabled>
+                    Process FASTQ
+                </button>
+            </div>
+        </div>
+
+        <!-- Input Panel -->
+        <div class="panel">
+            <div class="panel-header">
+                Input FASTQ
+                <span style="font-size: 11px; color: #525252; font-weight: normal;">Paste or edit</span>
+            </div>
+            <div class="editor-container">
+                <div class="editor-wrapper">
+                    <div class="editor-background"></div>
+                    <div class="editor-highlight" id="input-highlight"></div>
+                    <textarea class="editor-textarea" id="input" spellcheck="false">@READ_1 good quality read
+GATTTGGGGTTCAAAGCAGTATCGATCAAATAGTAAATCCATTTGTTCAACTCACAGTTT
++
+IIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII
+@READ_2 all N bases - will be filtered
+NNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNN
++
+IIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII
+@READ_3 low quality - will be filtered
+ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGT
++
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+@READ_4 good quality read
+GCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTA
++
+HHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHH
+@READ_5 too short - will be filtered
+ATCGATCGATCG
++
+IIIIIIIIIIII
+@READ_6 poly-G tail - will be trimmed
+ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTGGGGGGGGGGGGGGGGGGGG
++
+IIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII
+@READ_7 good quality read
+TATATATATATATATATATATATATATATATATATATATATATATATATATATATATATA
++
+JJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJ</textarea>
+                </div>
+            </div>
+        </div>
+
+        <!-- Output Panel -->
+        <div class="panel">
+            <div class="panel-header">
+                Processed Output
+                <span style="font-size: 11px; color: #525252; font-weight: normal;" id="output-info"></span>
+            </div>
+            <div class="editor-container">
+                <div class="editor-wrapper">
+                    <div class="editor-background"></div>
+                    <div class="editor-highlight" id="output-highlight"></div>
+                    <textarea class="editor-textarea" id="output" spellcheck="false" readonly placeholder="Click 'Process FASTQ' to see results..."></textarea>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- JSON Report Panel -->
+    <div class="report-panel" id="reportPanel">
+        <div class="panel-header">
+            JSON Report
+            <button class="close-report" onclick="toggleReport()">&times;</button>
+        </div>
+        <pre id="report">{}</pre>
+    </div>
+
+    <script type="module">
+        let wasm;
+
+        // FASTQ syntax highlighter
+        function highlightFastq(text) {
+            if (!text) return '';
+
+            const lines = text.split('\n');
+            const highlightedLines = [];
+            let lineType = 0; // 0=header, 1=seq, 2=plus, 3=qual
+
+            for (let i = 0; i < lines.length; i++) {
+                const line = lines[i];
+
+                if (line.startsWith('@')) {
+                    // Header line
+                    const escaped = escapeHtml(line);
+                    highlightedLines.push(`<span class="hl-header">${escaped}</span>`);
+                    lineType = 1;
+                } else if (line.startsWith('+') && lineType === 2) {
+                    // Plus line
+                    highlightedLines.push(`<span class="hl-plus">${escapeHtml(line)}</span>`);
+                    lineType = 3;
+                } else if (lineType === 1) {
+                    // Sequence line - color each base
+                    let colored = '';
+                    for (const char of line) {
+                        const upper = char.toUpperCase();
+                        if ('ATGCN'.includes(upper)) {
+                            colored += `<span class="hl-${upper}">${char}</span>`;
+                        } else {
+                            colored += escapeHtml(char);
+                        }
+                    }
+                    highlightedLines.push(colored);
+                    lineType = 2;
+                } else if (lineType === 3) {
+                    // Quality line - color by quality score
+                    let colored = '';
+                    for (const char of line) {
+                        const score = char.charCodeAt(0) - 33; // Phred+33
+                        let cls = 'hl-quality-low';
+                        if (score >= 30) cls = 'hl-quality-high';
+                        else if (score >= 20) cls = 'hl-quality-med';
+                        colored += `<span class="${cls}">${escapeHtml(char)}</span>`;
+                    }
+                    highlightedLines.push(colored);
+                    lineType = 0;
+                } else {
+                    highlightedLines.push(escapeHtml(line));
+                }
+            }
+
+            return highlightedLines.join('\n');
+        }
+
+        function escapeHtml(text) {
+            return text
+                .replace(/&/g, '&amp;')
+                .replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;');
+        }
+
+        function updateHighlight(textareaId, highlightId) {
+            const textarea = document.getElementById(textareaId);
+            const highlight = document.getElementById(highlightId);
+            highlight.innerHTML = highlightFastq(textarea.value) + '\n'; // Extra newline for scroll
+        }
+
+        function syncScroll(textareaId, highlightId) {
+            const textarea = document.getElementById(textareaId);
+            const highlight = document.getElementById(highlightId);
+            highlight.scrollTop = textarea.scrollTop;
+            highlight.scrollLeft = textarea.scrollLeft;
+        }
+
+        async function init() {
+            const status = document.getElementById('status');
+
+            // Set up input highlighting
+            const inputTextarea = document.getElementById('input');
+            inputTextarea.addEventListener('input', () => {
+                updateHighlight('input', 'input-highlight');
+            });
+            inputTextarea.addEventListener('scroll', () => {
+                syncScroll('input', 'input-highlight');
+            });
+
+            // Set up output highlighting
+            const outputTextarea = document.getElementById('output');
+            outputTextarea.addEventListener('scroll', () => {
+                syncScroll('output', 'output-highlight');
+            });
+
+            // Initial highlight
+            updateHighlight('input', 'input-highlight');
+
+            try {
+                const wasmModule = await import('./pkg/fasterp.js');
+                await wasmModule.default();
+                wasm = wasmModule;
+
+                status.textContent = 'Ready';
+                status.className = 'ready';
+                document.getElementById('processBtn').disabled = false;
+
+                window.wasm = wasm;
+
+                // Auto-process on load
+                setTimeout(() => processData(), 100);
+            } catch (e) {
+                status.textContent = `Failed: ${e.message}`;
+                status.className = 'error';
+                console.error('WASM load error:', e);
+            }
+        }
+
+        window.processData = function() {
+            if (!window.wasm) {
+                alert('WASM module not loaded');
+                return;
+            }
+
+            const input = document.getElementById('input').value;
+            const encoder = new TextEncoder();
+            const inputBytes = encoder.encode(input);
+
+            // Count input reads
+            const inputReads = (input.match(/^@/gm) || []).length;
+            document.getElementById('input-reads').textContent = inputReads;
+
+            // Create config
+            const config = new window.wasm.WasmConfig();
+            config.min_length = parseInt(document.getElementById('min_length').value) || 15;
+            config.max_length = parseInt(document.getElementById('max_length').value) || 0;
+            config.n_base_limit = parseInt(document.getElementById('n_base_limit').value) || 5;
+            config.qualified_quality_phred = parseInt(document.getElementById('qualified_quality').value) || 15;
+            config.unqualified_percent_limit = parseInt(document.getElementById('unqualified_limit').value) || 40;
+            config.cut_mean_quality = parseInt(document.getElementById('cut_mean_quality').value) || 20;
+            config.cut_window_size = parseInt(document.getElementById('window_size').value) || 4;
+            config.cut_front = document.getElementById('cut_front').checked;
+            config.cut_tail = document.getElementById('cut_tail').checked;
+            config.trim_poly_g = document.getElementById('trim_poly_g').checked;
+            config.trim_poly_x = document.getElementById('trim_poly_x').checked;
+
+            try {
+                const result = window.wasm.process_single_end(inputBytes, config);
+
+                // Update stats
+                const passed = result.passed_reads;
+                const failed = result.failed_reads;
+                const total = passed + failed;
+                const passRate = total > 0 ? ((passed / total) * 100).toFixed(0) + '%' : '-';
+
+                document.getElementById('passed-reads').textContent = passed;
+                document.getElementById('failed-reads').textContent = failed;
+                document.getElementById('pass-rate').textContent = passRate;
+
+                // Show output
+                const decoder = new TextDecoder();
+                const outputText = decoder.decode(new Uint8Array(result.output));
+                document.getElementById('output').value = outputText;
+                updateHighlight('output', 'output-highlight');
+
+                // Output info
+                const outputReads = (outputText.match(/^@/gm) || []).length;
+                document.getElementById('output-info').textContent = `${outputReads} reads`;
+
+                // Show report
+                const report = JSON.parse(result.json_report);
+                document.getElementById('report').textContent = JSON.stringify(report, null, 2);
+
+            } catch (e) {
+                alert('Processing error: ' + e.message);
+                console.error('Processing error:', e);
+            }
+        };
+
+        window.toggleReport = function() {
+            const panel = document.getElementById('reportPanel');
+            panel.classList.toggle('visible');
+        };
+
+        // Process on input change (debounced)
+        let debounceTimer;
+        document.getElementById('input').addEventListener('input', () => {
+            clearTimeout(debounceTimer);
+            debounceTimer = setTimeout(() => {
+                if (window.wasm) processData();
+            }, 500);
+        });
+
+        // Process on config change
+        document.querySelectorAll('input').forEach(input => {
+            if (input.id !== 'input') {
+                input.addEventListener('change', () => {
+                    if (window.wasm) processData();
+                });
+            }
+        });
+
+        init();
+    </script>
+</body>
+</html>

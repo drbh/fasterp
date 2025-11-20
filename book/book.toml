@@ -13,3 +13,5 @@ default-theme = "rust"
 preferred-dark-theme = "ayu"
 git-repository-url = "https://github.com/drbh/fasterp"
 edit-url-template = "https://github.com/drbh/fasterp/edit/main/book/{path}"
+additional-css = ["custom.css"]
+additional-js = ["custom.js"]

@@ -755,7 +755,14 @@ fn build_and_write_paired_end_report(
     }
 
     // Generate HTML report
-    html::generate_html_report(&report, args, &args.html, elapsed)
+    let html_config = html::HtmlReportConfig {
+        input: args.input.clone(),
+        output: args.output.clone(),
+        json: args.json.clone(),
+        input2: args.input2.clone(),
+        output2: args.output2.clone(),
+    };
+    html::generate_html_report(&report, &html_config, &args.html, elapsed)
         .context("Failed to generate HTML report")?;
 
     Ok(())
@@ -1734,7 +1741,14 @@ fn main() -> Result<()> {
     }
 
     // Generate HTML report
-    html::generate_html_report(&report, &args, &args.html, elapsed)
+    let html_config = html::HtmlReportConfig {
+        input: args.input.clone(),
+        output: args.output.clone(),
+        json: args.json.clone(),
+        input2: args.input2.clone(),
+        output2: args.output2.clone(),
+    };
+    html::generate_html_report(&report, &html_config, &args.html, elapsed)
         .context("Failed to generate HTML report")?;
 
     Ok(())

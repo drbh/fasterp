@@ -1,0 +1,40 @@
+/* Custom navigation buttons */
+.nav-buttons {
+    display: flex;
+    gap: 8px;
+    margin-left: 10px;
+}
+
+.nav-btn {
+    padding: 6px 12px;
+    background: var(--sidebar-bg);
+    color: var(--sidebar-fg);
+    border: 1px solid var(--sidebar-non-existant);
+    border-radius: 4px;
+    font-size: 13px;
+    text-decoration: none;
+    cursor: pointer;
+    transition: all 0.2s;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    white-space: nowrap;
+}
+
+.nav-btn:hover {
+    background: var(--sidebar-non-existant);
+    color: var(--sidebar-active);
+    border-color: var(--theme-hover);
+}
+
+.nav-btn svg {
+    width: 14px;
+    height: 14px;
+    flex-shrink: 0;
+}
+
+@media only screen and (max-width: 768px) {
+    .nav-buttons {
+        display: none;
+    }
+}
