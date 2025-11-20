@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
 
 jobs:
-  test-and-benchmark:
+  test-and-build:
     runs-on: ubuntu-latest
 
     permissions:
@@ -76,16 +76,6 @@ jobs:
       env:
         RUST_BACKTRACE: 1
 
-    - name: Run benchmarks
-      run: |
-        cargo run --release --example bench_chart 2>&1 | tee benchmark_output.txt
-
-    - name: Upload benchmark results
-      uses: actions/upload-artifact@v4
-      with:
-        name: benchmark-results
-        path: benchmark_output.txt
-
     - name: Upload test results on failure
       if: failure()
       uses: actions/upload-artifact@v4
@@ -152,7 +142,7 @@ jobs:
         path: book/book
 
   deploy:
-    needs: test-and-benchmark
+    needs: test-and-build
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
     runs-on: ubuntu-latest
 
