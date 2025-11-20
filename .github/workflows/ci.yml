@@ -21,6 +21,8 @@ jobs:
 
     - name: Install Rust
       uses: dtolnay/rust-toolchain@stable
+      with:
+        targets: wasm32-unknown-unknown
 
     - name: Cache cargo dependencies
       uses: actions/cache@v4
@@ -87,9 +89,6 @@ jobs:
 
     - name: Build WASM for playground
       run: |
-        # Install wasm32 target
-        rustup target add wasm32-unknown-unknown
-
         # Install wasm-bindgen-cli (matching version in Cargo.toml)
         cargo install wasm-bindgen-cli --version 0.2.92 --force
 
