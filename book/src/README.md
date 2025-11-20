@@ -1,6 +1,6 @@
 # fasterp
 
-High-performance FASTQ preprocessing in Rust. A drop-in replacement for [fastp](https://github.com/OpenGene/fastp) with 5-10x faster performance.
+High-performance FASTQ preprocessing in Rust. A drop-in replacement for [fastp](https://github.com/OpenGene/fastp) with blazing fast performance.
 
 ## Installation
 

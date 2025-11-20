@@ -1,40 +1,43 @@
-/* Custom navigation buttons */
-.nav-buttons {
-    display: flex;
-    gap: 8px;
-    margin-left: 10px;
-}
-
-.nav-btn {
+/* Playground button styling */
+.playground-btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
     padding: 6px 12px;
+    margin-right: 8px;
     background: var(--sidebar-bg);
-    color: var(--sidebar-fg);
-    border: 1px solid var(--sidebar-non-existant);
+    color: var(--fg);
+    border: 1px solid var(--theme-popup-border);
     border-radius: 4px;
-    font-size: 13px;
+    font-size: 14px;
     text-decoration: none;
     cursor: pointer;
     transition: all 0.2s;
-    display: flex;
-    align-items: center;
-    gap: 6px;
     white-space: nowrap;
 }
 
-.nav-btn:hover {
-    background: var(--sidebar-non-existant);
+.playground-btn:hover {
+    background: var(--theme-hover);
     color: var(--sidebar-active);
-    border-color: var(--theme-hover);
+    text-decoration: none;
 }
 
-.nav-btn svg {
-    width: 14px;
-    height: 14px;
+.playground-btn svg {
+    width: 16px;
+    height: 16px;
     flex-shrink: 0;
 }
 
+.playground-btn span {
+    font-weight: 500;
+}
+
 @media only screen and (max-width: 768px) {
-    .nav-buttons {
+    .playground-btn span {
         display: none;
+    }
+    .playground-btn {
+        padding: 6px;
     }
 }
