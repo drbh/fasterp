@@ -227,24 +227,18 @@ unsafe fn count_mismatches_avx2(
         let chunk_end = i + chunk_size;
 
         // Early termination check - only if threshold exceeded
-        if new_differences > max_diff {
-            if chunk_end <= min_complete {
-                // Chunk entirely before min_complete - chunk boundary is valid
-                return (new_differences, chunk_end);
-            } else if i < min_complete {
-                // Chunk straddles min_complete boundary - need exact position
-                for j in 0..chunk_size {
-                    let pos = i + j;
-                    if seq1[pos] != seq2[pos] {
-                        differences += 1;
-                        if differences > max_diff && pos < min_complete {
-                            return (differences, pos + 1);
-                        }
+        if new_differences > max_diff && i < min_complete {
+            // Need exact position where threshold was exceeded
+            for j in 0..chunk_size {
+                let pos = i + j;
+                if seq1[pos] != seq2[pos] {
+                    differences += 1;
+                    if differences > max_diff && pos < min_complete {
+                        return (differences, pos + 1);
                     }
                 }
-                // Threshold crossed at pos >= min_complete, continue
             }
-            // else: chunk entirely past min_complete, no early termination possible
+            // Threshold crossed at pos >= min_complete, continue with updated differences
         }
 
         differences = new_differences;

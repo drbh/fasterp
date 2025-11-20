@@ -1,6 +1,16 @@
-# fasterp
 
-A faster [fastp](https://github.com/OpenGene/fastp) — same interface, same output, **2-10x faster**.
+```
+    ░████                          ░██                                   
+   ░██                             ░██                                   
+░████████  ░██████    ░███████  ░████████  ░███████  ░██░████ ░████████  
+   ░██          ░██  ░██           ░██    ░██    ░██ ░███     ░██    ░██ 
+   ░██     ░███████   ░███████     ░██    ░█████████ ░██      ░██    ░██ 
+   ░██    ░██   ░██         ░██    ░██    ░██        ░██      ░███   ░██ 
+   ░██     ░█████░██  ░███████      ░████  ░███████  ░██      ░██░█████  
+                                                              ░██        
+                                                              ░██        
+```
+fasterp - A faster [fastp](https://github.com/OpenGene/fastp) — same interface, same output, **2-10x faster**.
 
 ```
 10M read pairs:  fastp 11s → fasterp 6s

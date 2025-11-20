@@ -1,0 +1,14 @@
+target
+book
+*.fq
+*.fastq
+*.gz
+*.json
+*.html
+*.svg
+*.trace
+.git
+.github
+fastp
+node_modules
+.wrangler
