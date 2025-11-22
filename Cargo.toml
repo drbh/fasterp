@@ -27,6 +27,7 @@ native = [
   "flate2/zlib-ng",
 ]
 wasm = ["dep:wasm-bindgen", "dep:js-sys", "flate2/rust_backend"]
+python = ["dep:pyo3", "native"]
 
 [dependencies]
 anyhow = "1.0"
@@ -53,6 +54,9 @@ ureq = {version = "2.9", default-features = false, features = ["tls"], optional 
 # WASM-only dependencies
 js-sys = {version = "=0.3.69", optional = true}
 wasm-bindgen = {version = "=0.2.92", optional = true}
+
+# Python-only dependencies
+pyo3 = {version = "0.22", optional = true, features = ["extension-module"]}
 
 # Optional features
 zstd = {version = "0.13", optional = true}

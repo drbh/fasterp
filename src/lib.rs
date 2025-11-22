@@ -65,6 +65,117 @@ pub struct ProcessResult {
 }
 
 #[cfg(feature = "python")]
+#[pyclass]
+#[derive(Clone)]
+pub struct FastqRecord {
+    #[pyo3(get)]
+    pub header: String,
+    #[pyo3(get)]
+    pub sequence: String,
+    #[pyo3(get)]
+    pub quality: String,
+    #[pyo3(get)]
+    pub passed: bool,
+    #[pyo3(get)]
+    pub fail_reason: Option<String>,
+    #[pyo3(get)]
+    pub trimmed: bool,
+    #[pyo3(get)]
+    pub original_length: usize,
+}
+
+#[cfg(feature = "python")]
+#[pymethods]
+impl FastqRecord {
+    fn to_fastq(&self) -> String {
+        format!("@{}\n{}\n+\n{}\n", self.header, self.sequence, self.quality)
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "FastqRecord(header='{}', length={}, passed={})",
+            self.header,
+            self.sequence.len(),
+            self.passed
+        )
+    }
+
+    fn __str__(&self) -> String {
+        let status = if self.passed { "PASS" } else { "FAIL" };
+        let reason = self.fail_reason.as_ref().map(|r| format!(" ({})", r)).unwrap_or_default();
+        format!(
+            ">{} [{}{}] len={} trimmed={}",
+            self.header,
+            status,
+            reason,
+            self.sequence.len(),
+            self.trimmed
+        )
+    }
+
+    #[getter]
+    fn length(&self) -> usize {
+        self.sequence.len()
+    }
+}
+
+#[cfg(feature = "python")]
+#[pyclass]
+#[derive(Clone)]
+pub struct ProcessRecordsResult {
+    #[pyo3(get)]
+    pub records: Vec<FastqRecord>,
+    #[pyo3(get)]
+    pub passed_reads: usize,
+    #[pyo3(get)]
+    pub failed_reads: usize,
+    #[pyo3(get)]
+    pub total_bases_before: usize,
+    #[pyo3(get)]
+    pub total_bases_after: usize,
+    #[pyo3(get)]
+    pub q20_rate: f64,
+    #[pyo3(get)]
+    pub q30_rate: f64,
+    #[pyo3(get)]
+    pub gc_content: f64,
+    #[pyo3(get)]
+    pub duplication_rate: f64,
+    #[pyo3(get)]
+    pub adapter_trimmed_reads: usize,
+    #[pyo3(get)]
+    pub adapter_trimmed_bases: usize,
+    #[pyo3(get)]
+    pub json_report: String,
+}
+
+#[cfg(feature = "python")]
+#[pymethods]
+impl ProcessRecordsResult {
+    fn __repr__(&self) -> String {
+        format!(
+            "ProcessRecordsResult(records={}, passed={}, failed={})",
+            self.records.len(),
+            self.passed_reads,
+            self.failed_reads
+        )
+    }
+
+    #[getter]
+    fn total_reads(&self) -> usize {
+        self.passed_reads + self.failed_reads
+    }
+
+    fn passed_records(&self) -> Vec<FastqRecord> {
+        self.records.iter().filter(|r| r.passed).cloned().collect()
+    }
+
+    fn failed_records(&self) -> Vec<FastqRecord> {
+        self.records.iter().filter(|r| !r.passed).cloned().collect()
+    }
+}
+
+#[cfg(feature = "python")]
 #[pyfunction]
 #[pyo3(signature = (
     input,
@@ -458,9 +569,231 @@ pub fn process(
 }
 
 #[cfg(feature = "python")]
+#[pyfunction]
+#[pyo3(signature = (
+    input=None,
+    input_bytes=None,
+    include_failed=false,
+    min_length=15,
+    max_length=0,
+    average_qual=0,
+    n_base_limit=5,
+    qualified_quality_phred=15,
+    unqualified_percent_limit=40,
+    low_complexity_filter=false,
+    complexity_threshold=30,
+    trim_front=0,
+    trim_tail=0,
+    cut_front=false,
+    cut_tail=true,
+    cut_mean_quality=20,
+    cut_window_size=4,
+    trim_poly_g=true,
+    trim_poly_x=false,
+    poly_g_min_len=10,
+    adapter_sequence=None,
+    adapter_sequence_r2=None,
+    disable_adapter_trimming=false,
+    compression_level=4
+))]
+#[allow(clippy::too_many_arguments)]
+pub fn process_records(
+    input: Option<String>,
+    input_bytes: Option<Vec<u8>>,
+    include_failed: bool,
+    min_length: usize,
+    max_length: usize,
+    average_qual: u8,
+    n_base_limit: usize,
+    qualified_quality_phred: u8,
+    unqualified_percent_limit: usize,
+    low_complexity_filter: bool,
+    complexity_threshold: usize,
+    trim_front: usize,
+    trim_tail: usize,
+    cut_front: bool,
+    cut_tail: bool,
+    cut_mean_quality: u8,
+    cut_window_size: usize,
+    trim_poly_g: bool,
+    trim_poly_x: bool,
+    poly_g_min_len: usize,
+    adapter_sequence: Option<String>,
+    adapter_sequence_r2: Option<String>,
+    disable_adapter_trimming: bool,
+    compression_level: u32,
+) -> PyResult<ProcessRecordsResult> {
+    use crate::adapter::AdapterConfig;
+    use crate::processor::process_fastq_stream;
+    use crate::stats;
+    use crate::trimming::TrimmingConfig;
+    use std::io::Cursor;
+
+    // Validate input
+    if input.is_some() && input_bytes.is_some() {
+        return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+            "Cannot specify both 'input' and 'input_bytes'",
+        ));
+    }
+    if input.is_none() && input_bytes.is_none() {
+        return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+            "Must specify either 'input' or 'input_bytes'",
+        ));
+    }
+
+    // Create adapter configuration
+    let mut adapter_config = AdapterConfig::new();
+    if disable_adapter_trimming {
+        adapter_config.detect_adapter_for_pe = false;
+    } else {
+        if let Some(ref seq) = adapter_sequence {
+            adapter_config.adapter_seq = Some(seq.as_bytes().to_vec());
+        }
+        if let Some(ref seq) = adapter_sequence_r2 {
+            adapter_config.adapter_seq_r2 = Some(seq.as_bytes().to_vec());
+        }
+    }
+
+    // Create trimming configuration
+    let trimming_config = TrimmingConfig {
+        enable_trim_front: cut_front && cut_mean_quality > 0,
+        enable_trim_tail: cut_tail && cut_mean_quality > 0,
+        cut_mean_quality,
+        cut_window_size,
+        trim_front_bases: trim_front,
+        trim_tail_bases: trim_tail,
+        max_len: max_length,
+        enable_poly_g: trim_poly_g,
+        enable_poly_x: trim_poly_x,
+        poly_min_len: poly_g_min_len,
+        adapter_config: adapter_config.clone(),
+    };
+
+    // Create reader from file or bytes
+    let reader: Box<dyn std::io::BufRead> = if let Some(path) = input {
+        Box::new(crate::io::open_input(&path).map_err(|e| {
+            PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Failed to open input: {}", e))
+        })?)
+    } else {
+        let bytes = input_bytes.unwrap();
+        // Check if gzip compressed
+        if bytes.len() >= 2 && bytes[0] == 0x1f && bytes[1] == 0x8b {
+            use flate2::read::GzDecoder;
+            let decoder = GzDecoder::new(Cursor::new(bytes));
+            Box::new(std::io::BufReader::new(decoder))
+        } else {
+            Box::new(std::io::BufReader::new(Cursor::new(bytes)))
+        }
+    };
+
+    // Create output buffer
+    let mut output_buffer = Vec::new();
+
+    // Process the stream
+    let acc = process_fastq_stream(
+        reader,
+        &mut output_buffer,
+        min_length,
+        n_base_limit,
+        qualified_quality_phred,
+        unqualified_percent_limit,
+        average_qual,
+        low_complexity_filter,
+        complexity_threshold,
+        &trimming_config,
+    )
+    .map_err(|e| {
+        PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Processing failed: {}", e))
+    })?;
+
+    // Build statistics
+    let before_stats = acc.before.to_read_stats();
+    let after_stats = acc.after.to_read_stats();
+    let kmer_map = acc.kmer_table_to_map();
+    let duplication_rate = stats::calculate_duplication_rate(&kmer_map);
+
+    // Build JSON report
+    let report = serde_json::json!({
+        "summary": {
+            "before_filtering": {
+                "total_reads": before_stats.total_reads,
+                "total_bases": before_stats.total_bases,
+                "q20_bases": before_stats.q20_bases,
+                "q30_bases": before_stats.q30_bases,
+                "gc_content": before_stats.gc_content,
+            },
+            "after_filtering": {
+                "total_reads": after_stats.total_reads,
+                "total_bases": after_stats.total_bases,
+                "q20_bases": after_stats.q20_bases,
+                "q30_bases": after_stats.q30_bases,
+                "gc_content": after_stats.gc_content,
+            }
+        },
+        "filtering_result": {
+            "passed_filter_reads": acc.after.total_reads,
+            "low_quality_reads": acc.low_quality,
+            "low_complexity_reads": acc.low_complexity,
+            "too_many_n_reads": acc.too_many_n,
+            "too_short_reads": acc.too_short,
+        },
+        "duplication": {
+            "rate": duplication_rate
+        }
+    });
+
+    let json_report = serde_json::to_string_pretty(&report).unwrap_or_default();
+
+    // Parse output buffer to extract records
+    let mut records = Vec::new();
+    let output_cursor = Cursor::new(&output_buffer);
+    let mut parser = crate::processor::FastqParser::new(std::io::BufReader::new(output_cursor));
+
+    while let Some((header, seq, _plus, qual)) = parser.next_record().map_err(|e| {
+        PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Failed to parse records: {}", e))
+    })? {
+        let header_str = String::from_utf8_lossy(&header[1..]).to_string(); // Skip '@'
+        let seq_str = String::from_utf8_lossy(&seq).to_string();
+        let qual_str = String::from_utf8_lossy(&qual).to_string();
+
+        records.push(FastqRecord {
+            header: header_str,
+            sequence: seq_str.clone(),
+            quality: qual_str,
+            passed: true,
+            fail_reason: None,
+            trimmed: false, // TODO: track if trimming occurred
+            original_length: seq_str.len(),
+        });
+    }
+
+    // If include_failed is true, we need to also process the input again to get failed records
+    // For now, we'll just return the passed records
+    // TODO: Implement failed record collection
+
+    Ok(ProcessRecordsResult {
+        records,
+        passed_reads: acc.after.total_reads,
+        failed_reads: acc.before.total_reads - acc.after.total_reads,
+        total_bases_before: before_stats.total_bases,
+        total_bases_after: after_stats.total_bases,
+        q20_rate: after_stats.q20_rate,
+        q30_rate: after_stats.q30_rate,
+        gc_content: after_stats.gc_content,
+        duplication_rate,
+        adapter_trimmed_reads: acc.adapter_trimmed_reads,
+        adapter_trimmed_bases: acc.adapter_trimmed_bases,
+        json_report,
+    })
+}
+
+#[cfg(feature = "python")]
 #[pymodule]
 fn fasterp(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<ProcessResult>()?;
+    m.add_class::<FastqRecord>()?;
+    m.add_class::<ProcessRecordsResult>()?;
     m.add_function(wrap_pyfunction!(process, m)?)?;
+    m.add_function(wrap_pyfunction!(process_records, m)?)?;
     Ok(())
 }

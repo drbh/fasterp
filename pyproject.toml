@@ -1,0 +1,35 @@
+[build-system]
+requires = ["maturin>=1.0,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "fasterp"
+version = "0.2.1"
+description = "High-performance FASTQ preprocessing tool"
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "MIT" }
+authors = [{ name = "drbh" }]
+keywords = ["bioinformatics", "fastq", "genomics", "preprocessing", "quality-control"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering :: Bio-Informatics",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+
+[project.urls]
+Homepage = "https://drbh.github.io/fasterp/"
+Documentation = "https://drbh.github.io/fasterp/"
+Repository = "https://github.com/drbh/fasterp"
+
+[tool.maturin]
+features = ["python"]
+python-source = "python"

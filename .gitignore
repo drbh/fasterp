@@ -30,3 +30,5 @@ book/src/*.html
 book/book
 .wrangler
 node_modules
+*.so
+*.pyc
