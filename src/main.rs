@@ -329,8 +329,10 @@ fn create_trimming_config(args: &Args) -> TrimmingConfig {
         // Disable auto-detection if flag is set
         if args.disable_adapter_detection {
             adapter_config.detect_adapter_for_pe = false;
+        } else {
+            // Explicitly enable it, because AdapterConfig::new() defaults to false
+            adapter_config.detect_adapter_for_pe = true;
         }
-        // Otherwise keep the default (true, auto-detection enabled)
     }
 
     // Determine trim values - prefer read-specific args, fall back to generic
@@ -382,8 +384,10 @@ fn create_trimming_config_r2(args: &Args) -> TrimmingConfig {
         // Disable auto-detection if flag is set
         if args.disable_adapter_detection {
             adapter_config.detect_adapter_for_pe = false;
+        } else {
+            // Explicitly enable it, because AdapterConfig::new() defaults to false
+            adapter_config.detect_adapter_for_pe = true;
         }
-        // Otherwise keep the default (true, auto-detection enabled)
     }
 
     // Determine trim values for R2
