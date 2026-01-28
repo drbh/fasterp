@@ -24,6 +24,7 @@ native = [
   "dep:ureq",
   "dep:libdeflater",
   "dep:gzp",
+  "dep:zstd",
   "flate2/zlib-ng",
 ]
 wasm = ["dep:wasm-bindgen", "dep:js-sys", "flate2/rust_backend"]

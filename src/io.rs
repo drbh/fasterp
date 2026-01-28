@@ -19,6 +19,8 @@ use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
+use zstd::stream::read::Decoder as ZstdDecoder;
+use zstd::stream::write::Encoder as ZstdEncoder;
 
 use aws_sdk_s3::Client as S3Client;
 use aws_sdk_s3::primitives::ByteStream;
@@ -406,6 +408,7 @@ fn download_url(url: &str) -> Result<PathBuf> {
 pub(crate) enum CompressionFormat {
     None,
     Gzip,
+    Zstd,
 }
 
 impl CompressionFormat {
@@ -420,6 +423,8 @@ impl CompressionFormat {
         let path_lower = path.to_lowercase();
         if path_lower.ends_with(".gz") || path_lower.ends_with(".gzip") {
             CompressionFormat::Gzip
+        } else if path_lower.ends_with(".zst") || path_lower.ends_with(".zstd") {
+            CompressionFormat::Zstd
         } else {
             CompressionFormat::None
         }
@@ -455,6 +460,12 @@ pub(crate) fn open_input(path: &str) -> Result<Box<dyn BufRead + Send>> {
                 let reader = BufReader::with_capacity(32 * 1024 * 1024, decoder);
                 Ok(Box::new(reader))
             }
+            CompressionFormat::Zstd => {
+                let buffered = BufReader::with_capacity(64 * 1024 * 1024, s3_reader);
+                let decoder = ZstdDecoder::new(buffered)?;
+                let reader = BufReader::with_capacity(32 * 1024 * 1024, decoder);
+                Ok(Box::new(reader))
+            }
             CompressionFormat::None => {
                 let reader = BufReader::with_capacity(32 * 1024 * 1024, s3_reader);
                 Ok(Box::new(reader))
@@ -473,6 +484,12 @@ pub(crate) fn open_input(path: &str) -> Result<Box<dyn BufRead + Send>> {
             CompressionFormat::Gzip => {
                 let buffered_file = BufReader::with_capacity(64 * 1024 * 1024, file);
                 let decoder = GzDecoder::new(buffered_file);
+                let reader = BufReader::with_capacity(32 * 1024 * 1024, decoder);
+                Ok(Box::new(reader))
+            }
+            CompressionFormat::Zstd => {
+                let buffered_file = BufReader::with_capacity(64 * 1024 * 1024, file);
+                let decoder = ZstdDecoder::new(buffered_file)?;
                 let reader = BufReader::with_capacity(32 * 1024 * 1024, decoder);
                 Ok(Box::new(reader))
             }
@@ -495,6 +512,14 @@ pub(crate) fn open_input(path: &str) -> Result<Box<dyn BufRead + Send>> {
                 let reader = BufReader::with_capacity(32 * 1024 * 1024, decoder);
                 Ok(Box::new(reader))
             }
+            CompressionFormat::Zstd => {
+                // Use larger input buffer for compressed file (64MB) to reduce syscalls
+                let buffered_file = BufReader::with_capacity(64 * 1024 * 1024, file);
+                let decoder = ZstdDecoder::new(buffered_file)?;
+                // Use 32MB output buffer for decompressed data
+                let reader = BufReader::with_capacity(32 * 1024 * 1024, decoder);
+                Ok(Box::new(reader))
+            }
             CompressionFormat::None => {
                 let reader = BufReader::with_capacity(16 * 1024 * 1024, file);
                 Ok(Box::new(reader))
@@ -507,10 +532,12 @@ pub(crate) fn open_input(path: &str) -> Result<Box<dyn BufRead + Send>> {
 pub enum OutputWriter {
     Plain(BufWriter<File>),
     Gzip(BufWriter<GzEncoder<File>>),
+    Zstd(BufWriter<ZstdEncoder<'static, File>>),
     ParGzip(ParCompress<Gzip>),
     Stdout(BufWriter<std::io::Stdout>),
     S3Plain(S3Writer),
     S3Gzip(BufWriter<GzEncoder<S3Writer>>),
+    S3Zstd(BufWriter<ZstdEncoder<'static, S3Writer>>),
 }
 
 impl Write for OutputWriter {
@@ -518,10 +545,12 @@ impl Write for OutputWriter {
         match self {
             OutputWriter::Plain(w) => w.write(buf),
             OutputWriter::Gzip(w) => w.write(buf),
+            OutputWriter::Zstd(w) => w.write(buf),
             OutputWriter::ParGzip(w) => w.write(buf),
             OutputWriter::Stdout(w) => w.write(buf),
             OutputWriter::S3Plain(w) => w.write(buf),
             OutputWriter::S3Gzip(w) => w.write(buf),
+            OutputWriter::S3Zstd(w) => w.write(buf),
         }
     }
 
@@ -529,10 +558,12 @@ impl Write for OutputWriter {
         match self {
             OutputWriter::Plain(w) => w.flush(),
             OutputWriter::Gzip(w) => w.flush(),
+            OutputWriter::Zstd(w) => w.flush(),
             OutputWriter::ParGzip(w) => w.flush(),
             OutputWriter::Stdout(w) => w.flush(),
             OutputWriter::S3Plain(w) => w.flush(),
             OutputWriter::S3Gzip(w) => w.flush(),
+            OutputWriter::S3Zstd(w) => w.flush(),
         }
     }
 }
@@ -549,6 +580,12 @@ impl OutputWriter {
                 w.flush()?;
                 let encoder = w.into_inner().context("Failed to finish gzip writer")?;
                 encoder.finish().context("Failed to finish gzip encoding")?;
+                Ok(())
+            }
+            OutputWriter::Zstd(mut w) => {
+                w.flush()?;
+                let encoder = w.into_inner().map_err(|e| anyhow::anyhow!("{}", e))?;
+                encoder.finish()?;
                 Ok(())
             }
             OutputWriter::ParGzip(mut w) => {
@@ -574,6 +611,15 @@ impl OutputWriter {
                 let s3_writer = encoder
                     .finish()
                     .context("Failed to finish gzip encoding for S3")?;
+                s3_writer.finish().context("Failed to finish S3 upload")?;
+                Ok(())
+            }
+            OutputWriter::S3Zstd(mut w) => {
+                w.flush()?;
+                let encoder = w.into_inner().map_err(|e| {
+                    anyhow::anyhow!("Failed to finish zstd writer for S3: {}", e.error())
+                })?;
+                let s3_writer = encoder.finish()?;
                 s3_writer.finish().context("Failed to finish S3 upload")?;
                 Ok(())
             }
@@ -605,6 +651,13 @@ pub(crate) fn open_output(
                 let writer = BufWriter::with_capacity(16 * 1024 * 1024, encoder);
                 Ok(OutputWriter::S3Gzip(writer))
             }
+            CompressionFormat::Zstd => {
+                // This level can be changed
+                let level = compression_level.unwrap_or(3) as i32;
+                let encoder = ZstdEncoder::new(s3_writer, level)?;
+                let writer = BufWriter::with_capacity(16 * 1024 * 1024, encoder);
+                Ok(OutputWriter::S3Zstd(writer))
+            }
             CompressionFormat::None => Ok(OutputWriter::S3Plain(s3_writer)),
         }
     } else {
@@ -632,6 +685,13 @@ pub(crate) fn open_output(
                     let writer = BufWriter::with_capacity(16 * 1024 * 1024, encoder);
                     Ok(OutputWriter::Gzip(writer))
                 }
+            }
+            CompressionFormat::Zstd => {
+                // Map 1-9 level to Zstd level (Zstd goes up to 22, but 3 is default)
+                let level = compression_level.unwrap_or(3) as i32;
+                let encoder = ZstdEncoder::new(file, level)?;
+                let writer = BufWriter::with_capacity(16 * 1024 * 1024, encoder);
+                Ok(OutputWriter::Zstd(writer))
             }
             CompressionFormat::None => {
                 let writer = BufWriter::with_capacity(16 * 1024 * 1024, file);
