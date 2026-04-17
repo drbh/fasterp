@@ -10,9 +10,8 @@
 
         // Create playground button
         var playgroundBtn = document.createElement('a');
-        // Calculate path to playground from current page
-        var pathToRoot = window.location.pathname.split('/').filter(x => x).length - 1;
-        var prefix = pathToRoot > 0 ? '../'.repeat(pathToRoot) : './';
+        // Use mdBook's path_to_root global variable for correct relative paths
+        var prefix = (typeof path_to_root !== 'undefined' && path_to_root) ? path_to_root : '';
         playgroundBtn.href = prefix + 'playground/';
         playgroundBtn.className = 'playground-btn';
         playgroundBtn.title = 'Try in Browser';
