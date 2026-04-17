@@ -329,8 +329,10 @@ fn create_trimming_config(args: &Args) -> TrimmingConfig {
         // Disable auto-detection if flag is set
         if args.disable_adapter_detection {
             adapter_config.detect_adapter_for_pe = false;
+        } else {
+            // Explicitly enable it, because AdapterConfig::new() defaults to false
+            adapter_config.detect_adapter_for_pe = true;
         }
-        // Otherwise keep the default (true, auto-detection enabled)
     }
 
     // Determine trim values - prefer read-specific args, fall back to generic
@@ -382,8 +384,10 @@ fn create_trimming_config_r2(args: &Args) -> TrimmingConfig {
         // Disable auto-detection if flag is set
         if args.disable_adapter_detection {
             adapter_config.detect_adapter_for_pe = false;
+        } else {
+            // Explicitly enable it, because AdapterConfig::new() defaults to false
+            adapter_config.detect_adapter_for_pe = true;
         }
-        // Otherwise keep the default (true, auto-detection enabled)
     }
 
     // Determine trim values for R2
@@ -521,6 +525,8 @@ fn build_and_write_paired_end_report(
     pe_acc: &PairedEndAccumulator,
     start_time: std::time::Instant,
     dup_detector: Option<&std::sync::Arc<bloom::DuplicateDetector>>,
+    adapter_r1: Option<&[u8]>,
+    adapter_r2: Option<&[u8]>,
 ) -> Result<()> {
     let before_stats_r1 = pe_acc.before_r1.to_read_stats();
     let after_stats_r1 = pe_acc.after_r1.to_read_stats();
@@ -720,7 +726,7 @@ fn build_and_write_paired_end_report(
 
     // Print report to stdout (fastp-compatible format)
     let elapsed = start_time.elapsed();
-    print_report_to_stdout(&report, args, elapsed, true);
+    print_report_to_stdout(&report, args, elapsed, true, adapter_r1, adapter_r2);
 
     // Write JSON report
     match args.stats_format.as_str() {
@@ -847,17 +853,31 @@ fn print_report_to_stdout(
     args: &Args,
     elapsed: std::time::Duration,
     is_paired_end: bool,
+    adapter_r1: Option<&[u8]>,
+    adapter_r2: Option<&[u8]>,
 ) {
     // Adapter detection messages
     if is_paired_end {
         eprintln!("Detecting adapter sequence for read1...");
-        eprintln!("No adapter detected for read1");
+        if let Some(seq) = adapter_r1 {
+            eprintln!("Detected adapter for read1: {}", String::from_utf8_lossy(seq));
+        } else {
+            eprintln!("No adapter detected for read1");
+        }
         eprintln!();
         eprintln!("Detecting adapter sequence for read2...");
-        eprintln!("No adapter detected for read2");
+        if let Some(seq) = adapter_r2 {
+            eprintln!("Detected adapter for read2: {}", String::from_utf8_lossy(seq));
+        } else {
+            eprintln!("No adapter detected for read2");
+        }
     } else {
         eprintln!("Detecting adapter sequence for read1...");
-        eprintln!("No adapter detected for read1");
+        if let Some(seq) = adapter_r1 {
+            eprintln!("Detected adapter for read1: {}", String::from_utf8_lossy(seq));
+        } else {
+            eprintln!("No adapter detected for read1");
+        }
     }
     eprintln!();
 
@@ -1477,7 +1497,14 @@ fn main() -> Result<()> {
         };
 
         // Build paired-end report
-        build_and_write_paired_end_report(&args, &pe_acc, start_time, dup_detector.as_ref())?;
+        build_and_write_paired_end_report(
+            &args,
+            &pe_acc,
+            start_time,
+            dup_detector.as_ref(),
+            trimming_config_r1.adapter_config.adapter_seq.as_deref(),
+            trimming_config_r2.adapter_config.adapter_seq.as_deref(),
+        )?;
         return Ok(());
     }
 
@@ -1703,7 +1730,14 @@ fn main() -> Result<()> {
 
     // Print report to stdout (fastp-compatible format)
     let elapsed = start_time.elapsed();
-    print_report_to_stdout(&report, &args, elapsed, false);
+    print_report_to_stdout(
+        &report,
+        &args,
+        elapsed,
+        false,
+        se_trimming_config.adapter_config.adapter_seq.as_deref(),
+        None,
+    );
 
     // Write JSON report based on stats_format
     match args.stats_format.as_str() {

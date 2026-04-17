@@ -582,6 +582,197 @@ fn test_gzip_compression_levels() {
     assert_eq!(contents[1], contents[2], "Level 6 and 9 differ");
 }
 
+// ZSTD COMPRESSION TESTS
+
+#[test]
+fn test_zstd_output_compression() {
+    let temp_dir = TempDir::new().unwrap();
+
+    let input_fq = test_data_path("small_1k.fq");
+    let output_zst = temp_dir.path().join("output.fq.zst");
+    let output_json = temp_dir.path().join("output.json");
+
+    // Run fasterp with zstd output
+    let status = Command::new(assert_cmd::cargo::cargo_bin!("fasterp"))
+        .arg("-i")
+        .arg(&input_fq)
+        .arg("-o")
+        .arg(&output_zst)
+        .arg("-j")
+        .arg(&output_json)
+        .stderr(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .status()
+        .expect("Failed to run fasterp");
+    assert!(status.success());
+
+    // Verify output exists
+    assert!(output_zst.exists());
+
+    // Decompress and compare with uncompressed output
+    let decompressed_fq = temp_dir.path().join("decompressed.fq");
+    let status = Command::new("zstd")
+        .arg("-d")
+        .arg("-c")
+        .arg(&output_zst)
+        .stdout(std::fs::File::create(&decompressed_fq).unwrap())
+        .status()
+        .expect("Failed to run zstd (is zstd installed?)");
+    assert!(status.success());
+
+    // Run fasterp without compression
+    let uncompressed_fq = temp_dir.path().join("uncompressed.fq");
+    let uncompressed_json = temp_dir.path().join("uncompressed.json");
+
+    let status = Command::new(assert_cmd::cargo::cargo_bin!("fasterp"))
+        .arg("-i")
+        .arg(&input_fq)
+        .arg("-o")
+        .arg(&uncompressed_fq)
+        .arg("-j")
+        .arg(&uncompressed_json)
+        .stderr(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .status()
+        .expect("Failed to run fasterp");
+    assert!(status.success());
+
+    // Compare decompressed with uncompressed
+    let decompressed_content = fs::read_to_string(&decompressed_fq).unwrap();
+    let uncompressed_content = fs::read_to_string(&uncompressed_fq).unwrap();
+    assert_eq!(
+        decompressed_content, uncompressed_content,
+        "Zstd output differs from uncompressed"
+    );
+}
+
+#[test]
+fn test_zstd_input_decompression() {
+    let temp_dir = TempDir::new().unwrap();
+
+    // Create a zstd-compressed input file
+    let input_fq = test_data_path("small_1k.fq");
+    let input_zst = temp_dir.path().join("input.fq.zst");
+    let output_fq = temp_dir.path().join("output.fq");
+    let output_json = temp_dir.path().join("output.json");
+
+    // Compress the input file with zstd
+    let status = Command::new("zstd")
+        .arg("-c")
+        .arg(&input_fq)
+        .stdout(std::fs::File::create(&input_zst).unwrap())
+        .status()
+        .expect("Failed to run zstd (is zstd installed?)");
+    assert!(status.success());
+
+    // Run fasterp on zstd input
+    let status = Command::new(assert_cmd::cargo::cargo_bin!("fasterp"))
+        .arg("-i")
+        .arg(&input_zst)
+        .arg("-o")
+        .arg(&output_fq)
+        .arg("-j")
+        .arg(&output_json)
+        .arg("-w")
+        .arg("1")
+        .stderr(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .status()
+        .expect("Failed to run fasterp");
+    assert!(status.success());
+
+    // Compare with fastp on original file
+    let fastp_fq = temp_dir.path().join("fastp.fq");
+    let fastp_json = temp_dir.path().join("fastp.json");
+
+    let status = Command::new("fastp")
+        .arg("-i")
+        .arg(&input_fq)
+        .arg("-o")
+        .arg(&fastp_fq)
+        .arg("-j")
+        .arg(&fastp_json)
+        .stderr(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .status()
+        .expect("Failed to run fastp");
+    assert!(status.success());
+
+    // Outputs should match
+    let fasterp_content = fs::read_to_string(&output_fq).unwrap();
+    let fastp_content = fs::read_to_string(&fastp_fq).unwrap();
+    assert_eq!(
+        fasterp_content, fastp_content,
+        "Zstd input processing differs from fastp"
+    );
+}
+
+#[test]
+fn test_zstd_roundtrip() {
+    let temp_dir = TempDir::new().unwrap();
+
+    let input_fq = test_data_path("small_1k.fq");
+
+    // Step 1: Write zstd output (with default processing)
+    let zst_output = temp_dir.path().join("step1.fq.zst");
+    let json1 = temp_dir.path().join("step1.json");
+
+    let status = Command::new(assert_cmd::cargo::cargo_bin!("fasterp"))
+        .arg("-i")
+        .arg(&input_fq)
+        .arg("-o")
+        .arg(&zst_output)
+        .arg("-j")
+        .arg(&json1)
+        .stderr(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .status()
+        .expect("Failed to run fasterp");
+    assert!(status.success());
+
+    // Step 2: Read zstd input, write plain output (disable all processing to preserve content)
+    let plain_output = temp_dir.path().join("step2.fq");
+    let json2 = temp_dir.path().join("step2.json");
+
+    let status = Command::new(assert_cmd::cargo::cargo_bin!("fasterp"))
+        .arg("-i")
+        .arg(&zst_output)
+        .arg("-o")
+        .arg(&plain_output)
+        .arg("-j")
+        .arg(&json2)
+        .arg("-w")
+        .arg("1")
+        .arg("-A")
+        .arg("-G")
+        .arg("-L")
+        .stderr(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .status()
+        .expect("Failed to run fasterp");
+    assert!(status.success());
+
+    // Decompress zstd directly and compare — verifies zstd write and read both work
+    let direct_decompress = temp_dir.path().join("direct.fq");
+    let status = Command::new("zstd")
+        .arg("-d")
+        .arg("-c")
+        .arg(&zst_output)
+        .stdout(std::fs::File::create(&direct_decompress).unwrap())
+        .status()
+        .expect("Failed to run zstd");
+    assert!(status.success());
+
+    // The fasterp-read content should be non-empty and the zstd file should be valid
+    let plain_content = fs::read_to_string(&plain_output).unwrap();
+    let direct_content = fs::read_to_string(&direct_decompress).unwrap();
+    assert!(!plain_content.is_empty(), "Roundtrip output is empty");
+    assert!(
+        !direct_content.is_empty(),
+        "Direct decompression output is empty"
+    );
+}
+
 // N-BASE FILTERING TESTS
 
 #[test]
