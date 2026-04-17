@@ -8,13 +8,13 @@
 //!
 //! Note: This module requires the `native` feature (file I/O, S3, HTTP).
 
-use anyhow::{Context, Result, bail};
-use flate2::Compression;
+use anyhow::{bail, Context, Result};
 use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
-use gzp::ZWriter;
+use flate2::Compression;
 use gzp::deflate::Gzip;
 use gzp::par::compress::{ParCompress, ParCompressBuilder};
+use gzp::ZWriter;
 use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::path::PathBuf;
@@ -22,8 +22,8 @@ use std::sync::Arc;
 use zstd::stream::read::Decoder as ZstdDecoder;
 use zstd::stream::write::Encoder as ZstdEncoder;
 
-use aws_sdk_s3::Client as S3Client;
 use aws_sdk_s3::primitives::ByteStream;
+use aws_sdk_s3::Client as S3Client;
 use tokio::runtime::Runtime;
 
 /// Check if a path is a URL
@@ -652,8 +652,8 @@ pub(crate) fn open_output(
                 Ok(OutputWriter::S3Gzip(writer))
             }
             CompressionFormat::Zstd => {
-                // This level can be changed
-                let level = compression_level.unwrap_or(3) as i32;
+                // Zstd supports levels 1-22, default is 3
+                let level = compression_level.unwrap_or(3).clamp(1, 22) as i32;
                 let encoder = ZstdEncoder::new(s3_writer, level)?;
                 let writer = BufWriter::with_capacity(16 * 1024 * 1024, encoder);
                 Ok(OutputWriter::S3Zstd(writer))
@@ -687,8 +687,8 @@ pub(crate) fn open_output(
                 }
             }
             CompressionFormat::Zstd => {
-                // Map 1-9 level to Zstd level (Zstd goes up to 22, but 3 is default)
-                let level = compression_level.unwrap_or(3) as i32;
+                // Zstd supports levels 1-22, default is 3
+                let level = compression_level.unwrap_or(3).clamp(1, 22) as i32;
                 let encoder = ZstdEncoder::new(file, level)?;
                 let writer = BufWriter::with_capacity(16 * 1024 * 1024, encoder);
                 Ok(OutputWriter::Zstd(writer))
