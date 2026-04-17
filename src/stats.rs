@@ -76,7 +76,7 @@ pub(crate) struct DetailedReadStats {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct Summary {
-    pub fastp_version: String,
+    pub fasterp_version: String,
     pub sequencing: String,
     pub before_filtering: ReadStats,
     pub after_filtering: ReadStats,
