@@ -82,7 +82,7 @@ pub fn detect_adapters_from_pe_reads<'a>(
     sample_size: usize,
     min_frequency: f64,
 ) -> AdapterDetectionResult {
-    use crate::overlap::{OverlapConfig, detect_overlap, reverse_complement};
+    use crate::overlap::{detect_overlap, reverse_complement, OverlapConfig};
 
     let overlap_config = OverlapConfig {
         min_overlap_len: 10, // Lower threshold for detection

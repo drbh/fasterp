@@ -169,7 +169,12 @@ fn write_css(html: &mut String) {
 }
 
 #[allow(clippy::too_many_lines)]
-fn write_body(html: &mut String, report: &FasterpReport, args: &HtmlReportConfig, elapsed: Duration) {
+fn write_body(
+    html: &mut String,
+    report: &FasterpReport,
+    args: &HtmlReportConfig,
+    elapsed: Duration,
+) {
     // Header
     html.push_str("<h1>fasterp Quality Control Report</h1>\n");
 

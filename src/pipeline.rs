@@ -18,7 +18,7 @@ use crate::kmer::{base_idx, count_k5_2bit};
 use crate::processor::StreamAccumulator;
 use crate::simd;
 use crate::stats::{PositionStats, SimpleStats};
-use crate::trimming::{TrimmingConfig, TrimmingResult, trim_read};
+use crate::trimming::{trim_read, TrimmingConfig, TrimmingResult};
 
 /// Calculate sequence complexity as percentage of bases different from next base
 ///

@@ -282,7 +282,11 @@ impl PositionStats {
                 hist.insert(q as u8, count);
             }
         }
-        if hist.is_empty() { None } else { Some(hist) }
+        if hist.is_empty() {
+            None
+        } else {
+            Some(hist)
+        }
     }
 }
 

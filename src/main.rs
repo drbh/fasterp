@@ -35,8 +35,8 @@ mod umi;
 mod util;
 
 use io::open_input;
-use pipeline::{Batch, WorkerResult, merger_thread, producer_thread, worker_thread};
-use processor::{PairedEndAccumulator, process_fastq_stream, process_paired_fastq_stream};
+use pipeline::{merger_thread, producer_thread, worker_thread, Batch, WorkerResult};
+use processor::{process_fastq_stream, process_paired_fastq_stream, PairedEndAccumulator};
 use stats::{
     AdapterCuttingStats, DetailedReadStats, DuplicationStats, FasterpReport, FilteringResult,
     InsertSizeStats, ReadStats, Summary,
@@ -860,21 +860,30 @@ fn print_report_to_stdout(
     if is_paired_end {
         eprintln!("Detecting adapter sequence for read1...");
         if let Some(seq) = adapter_r1 {
-            eprintln!("Detected adapter for read1: {}", String::from_utf8_lossy(seq));
+            eprintln!(
+                "Detected adapter for read1: {}",
+                String::from_utf8_lossy(seq)
+            );
         } else {
             eprintln!("No adapter detected for read1");
         }
         eprintln!();
         eprintln!("Detecting adapter sequence for read2...");
         if let Some(seq) = adapter_r2 {
-            eprintln!("Detected adapter for read2: {}", String::from_utf8_lossy(seq));
+            eprintln!(
+                "Detected adapter for read2: {}",
+                String::from_utf8_lossy(seq)
+            );
         } else {
             eprintln!("No adapter detected for read2");
         }
     } else {
         eprintln!("Detecting adapter sequence for read1...");
         if let Some(seq) = adapter_r1 {
-            eprintln!("Detected adapter for read1: {}", String::from_utf8_lossy(seq));
+            eprintln!(
+                "Detected adapter for read1: {}",
+                String::from_utf8_lossy(seq)
+            );
         } else {
             eprintln!("No adapter detected for read1");
         }
@@ -1397,8 +1406,8 @@ fn main() -> Result<()> {
         } else {
             // MULTI-THREADED PAIRED-END MODE
             use crate::pipeline::{
-                PairedBatch, PairedWorkerResult, paired_merger_thread,
-                paired_producer_thread_with_paths, paired_worker_thread,
+                paired_merger_thread, paired_producer_thread_with_paths, paired_worker_thread,
+                PairedBatch, PairedWorkerResult,
             };
             use crossbeam_channel::bounded;
 

@@ -6,8 +6,8 @@
 //! Note: This is INDEPENDENT from UMI processing. fastp's --dedup uses sequence matching,
 //! not UMI-aware deduplication.
 
-use std::collections::HashSet;
 use std::collections::hash_map::DefaultHasher;
+use std::collections::HashSet;
 use std::hash::{Hash, Hasher};
 
 /// Configuration for deduplication

@@ -890,7 +890,7 @@ mod tests {
         r2_rc[20] = b'T'; // diff 2
         r2_rc[30] = b'T'; // diff 3
         r2_rc[40] = b'T'; // diff 4
-        // After position 50:
+                          // After position 50:
         r2_rc[51] = b'T'; // diff 5
         r2_rc[52] = b'T'; // diff 6
         r2_rc[53] = b'T'; // diff 7

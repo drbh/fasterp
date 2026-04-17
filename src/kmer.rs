@@ -99,7 +99,11 @@ pub(crate) fn base_to_2bit(b: u8) -> Option<u32> {
 #[inline(always)]
 pub(crate) fn base_idx(b: u8) -> Option<usize> {
     let idx = LUT_BASE_IDX[b as usize];
-    if idx == 255 { None } else { Some(idx as usize) }
+    if idx == 255 {
+        None
+    } else {
+        Some(idx as usize)
+    }
 }
 
 /// Count 5-mers using 2-bit rolling code

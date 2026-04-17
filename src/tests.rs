@@ -9,8 +9,8 @@
 
 use super::*;
 use crate::trimming::{
-    TrimmingResult, TrimmingStats, detect_poly_g_tail, detect_poly_x_tail,
-    trim_front_sliding_window, trim_read, trim_tail_sliding_window,
+    detect_poly_g_tail, detect_poly_x_tail, trim_front_sliding_window, trim_read,
+    trim_tail_sliding_window, TrimmingResult, TrimmingStats,
 };
 
 // Sliding Window Trimming Tests

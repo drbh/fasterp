@@ -215,7 +215,11 @@ pub(crate) fn detect_poly_g_tail(seq: &[u8], min_len: usize) -> usize {
         }
     }
 
-    if g_count >= min_len { g_count } else { 0 }
+    if g_count >= min_len {
+        g_count
+    } else {
+        0
+    }
 }
 
 /// Detect generic homopolymer tail (polyA, polyT, polyC, polyG, polyN)
@@ -246,7 +250,11 @@ pub(crate) fn detect_poly_x_tail(seq: &[u8], min_len: usize) -> usize {
         }
     }
 
-    if count >= min_len { count } else { 0 }
+    if count >= min_len {
+        count
+    } else {
+        0
+    }
 }
 
 /// Apply all trimming operations to a read

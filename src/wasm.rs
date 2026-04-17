@@ -3,8 +3,8 @@
 //! This module provides WASM-compatible functions for FASTQ processing.
 //! All I/O is done via byte arrays instead of files.
 
-use wasm_bindgen::prelude::*;
 use std::io::Cursor;
+use wasm_bindgen::prelude::*;
 
 use crate::adapter::AdapterConfig;
 use crate::processor::{process_fastq_stream, process_paired_fastq_stream};
@@ -201,15 +201,16 @@ impl Default for WasmConfig {
 #[wasm_bindgen]
 pub fn process_single_end(input: &[u8], config: &WasmConfig) -> Result<WasmProcessResult, JsValue> {
     // Detect if input is gzip compressed
-    let reader: Box<dyn std::io::BufRead> = if input.len() >= 2 && input[0] == 0x1f && input[1] == 0x8b {
-        // Gzip compressed
-        use flate2::read::GzDecoder;
-        let decoder = GzDecoder::new(Cursor::new(input));
-        Box::new(std::io::BufReader::new(decoder))
-    } else {
-        // Plain text
-        Box::new(std::io::BufReader::new(Cursor::new(input)))
-    };
+    let reader: Box<dyn std::io::BufRead> =
+        if input.len() >= 2 && input[0] == 0x1f && input[1] == 0x8b {
+            // Gzip compressed
+            use flate2::read::GzDecoder;
+            let decoder = GzDecoder::new(Cursor::new(input));
+            Box::new(std::io::BufReader::new(decoder))
+        } else {
+            // Plain text
+            Box::new(std::io::BufReader::new(Cursor::new(input)))
+        };
 
     let mut output = Vec::new();
 
@@ -282,8 +283,8 @@ pub fn process_single_end(input: &[u8], config: &WasmConfig) -> Result<WasmProce
         }
     });
 
-    let json_report = serde_json::to_string_pretty(&report)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
+    let json_report =
+        serde_json::to_string_pretty(&report).map_err(|e| JsValue::from_str(&e.to_string()))?;
 
     Ok(WasmProcessResult {
         output,
@@ -309,21 +310,23 @@ pub fn process_paired_end(
     config: &WasmConfig,
 ) -> Result<WasmPairedResult, JsValue> {
     // Detect if inputs are gzip compressed
-    let reader1: Box<dyn std::io::BufRead> = if input1.len() >= 2 && input1[0] == 0x1f && input1[1] == 0x8b {
-        use flate2::read::GzDecoder;
-        let decoder = GzDecoder::new(Cursor::new(input1));
-        Box::new(std::io::BufReader::new(decoder))
-    } else {
-        Box::new(std::io::BufReader::new(Cursor::new(input1)))
-    };
+    let reader1: Box<dyn std::io::BufRead> =
+        if input1.len() >= 2 && input1[0] == 0x1f && input1[1] == 0x8b {
+            use flate2::read::GzDecoder;
+            let decoder = GzDecoder::new(Cursor::new(input1));
+            Box::new(std::io::BufReader::new(decoder))
+        } else {
+            Box::new(std::io::BufReader::new(Cursor::new(input1)))
+        };
 
-    let reader2: Box<dyn std::io::BufRead> = if input2.len() >= 2 && input2[0] == 0x1f && input2[1] == 0x8b {
-        use flate2::read::GzDecoder;
-        let decoder = GzDecoder::new(Cursor::new(input2));
-        Box::new(std::io::BufReader::new(decoder))
-    } else {
-        Box::new(std::io::BufReader::new(Cursor::new(input2)))
-    };
+    let reader2: Box<dyn std::io::BufRead> =
+        if input2.len() >= 2 && input2[0] == 0x1f && input2[1] == 0x8b {
+            use flate2::read::GzDecoder;
+            let decoder = GzDecoder::new(Cursor::new(input2));
+            Box::new(std::io::BufReader::new(decoder))
+        } else {
+            Box::new(std::io::BufReader::new(Cursor::new(input2)))
+        };
 
     let mut output1 = Vec::new();
     let mut output2 = Vec::new();
@@ -411,8 +414,8 @@ pub fn process_paired_end(
         }
     });
 
-    let json_report = serde_json::to_string_pretty(&report)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
+    let json_report =
+        serde_json::to_string_pretty(&report).map_err(|e| JsValue::from_str(&e.to_string()))?;
 
     let total_before = before_stats_r1.total_reads + before_stats_r2.total_reads;
     let total_after = after_stats_r1.total_reads + after_stats_r2.total_reads;

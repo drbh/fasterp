@@ -13,7 +13,7 @@ use std::io::{BufRead, Write};
 use crate::kmer::{base_idx, count_k5_2bit};
 use crate::simd;
 use crate::stats::{PositionStats, SimpleStats};
-use crate::trimming::{TrimmingConfig, TrimmingResult, trim_read, trim_read_with_adapter};
+use crate::trimming::{trim_read, trim_read_with_adapter, TrimmingConfig, TrimmingResult};
 use crate::util;
 
 /// Calculate sequence complexity as percentage of bases different from next base
