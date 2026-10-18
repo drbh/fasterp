@@ -416,7 +416,10 @@ unsafe fn horizontal_sum_u8_to_u32(vec: __m256i) -> u32 {
 // ARM NEON Implementation (aarch64)
 
 #[cfg(target_arch = "aarch64")]
-#[inline]
+// This small hot kernel is shared by adapter and overlap searches. Keeping it
+// inline avoids per-candidate calls and lets constant limits simplify the loop.
+#[allow(clippy::inline_always)]
+#[inline(always)]
 unsafe fn count_mismatches_neon(
     seq1: &[u8],
     seq2: &[u8],
