@@ -24,6 +24,8 @@ pub mod util;
 
 // Native-only modules (require threading, file I/O, etc.)
 #[cfg(feature = "native")]
+pub mod gzip;
+#[cfg(feature = "native")]
 pub mod html;
 #[cfg(feature = "native")]
 pub mod io;
