@@ -8,16 +8,15 @@
 //!
 //! Note: This module requires the `native` feature (file I/O, S3, HTTP).
 
+use crate::gzip::Gzip;
 use anyhow::{bail, Context, Result};
-use flate2::read::GzDecoder;
+use flate2::bufread::MultiGzDecoder;
 use flate2::write::GzEncoder;
 use flate2::Compression;
-use gzp::deflate::Gzip;
 use gzp::par::compress::{ParCompress, ParCompressBuilder};
 use gzp::ZWriter;
 use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Read, Write};
-use std::path::PathBuf;
 use std::sync::Arc;
 use zstd::stream::read::Decoder as ZstdDecoder;
 use zstd::stream::write::Encoder as ZstdEncoder;
@@ -342,67 +341,6 @@ impl Write for S3Writer {
 // S3Writer is Send because it owns all its data
 unsafe impl Send for S3Writer {}
 
-/// Download a URL to a temporary file and return the path
-/// Uses cached file if it already exists
-fn download_url(url: &str) -> Result<PathBuf> {
-    // Get filename from URL or generate one
-    let filename = url
-        .split('/')
-        .next_back()
-        .unwrap_or("downloaded_file")
-        .split('?')
-        .next()
-        .unwrap_or("downloaded_file");
-
-    // Create temp directory if it doesn't exist
-    let temp_dir = std::env::temp_dir().join("fasterp_downloads");
-    std::fs::create_dir_all(&temp_dir).context("Failed to create temp directory for downloads")?;
-
-    let temp_path = temp_dir.join(filename);
-
-    // Check if file already exists (cached)
-    if temp_path.exists() {
-        let metadata =
-            std::fs::metadata(&temp_path).context("Failed to get cached file metadata")?;
-        eprintln!(
-            "Using cached {} ({} bytes)",
-            temp_path.display(),
-            metadata.len()
-        );
-        return Ok(temp_path);
-    }
-
-    eprintln!("Downloading {url}...");
-
-    let response = ureq::get(url)
-        .call()
-        .context(format!("Failed to download URL: {url}"))?;
-
-    // Download to file
-    let mut file =
-        File::create(&temp_path).context(format!("Failed to create temp file: {temp_path:?}"))?;
-
-    let mut reader = response.into_reader();
-    let mut buffer = vec![0u8; 8 * 1024 * 1024]; // 8MB buffer
-    let mut total_bytes = 0usize;
-
-    loop {
-        let bytes_read = reader
-            .read(&mut buffer)
-            .context("Failed to read from URL")?;
-        if bytes_read == 0 {
-            break;
-        }
-        file.write_all(&buffer[..bytes_read])
-            .context("Failed to write to temp file")?;
-        total_bytes += bytes_read;
-    }
-
-    eprintln!("Downloaded {total_bytes} bytes to {temp_path:?}");
-
-    Ok(temp_path)
-}
-
 /// Detect compression format from file extension or magic bytes
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) enum CompressionFormat {
@@ -421,7 +359,11 @@ impl CompressionFormat {
 
         // path_lower is already lowercased, so comparison is case-insensitive
         let path_lower = path.to_lowercase();
-        if path_lower.ends_with(".gz") || path_lower.ends_with(".gzip") {
+        if path_lower.ends_with(".gz")
+            || path_lower.ends_with(".gzip")
+            || path_lower.ends_with(".bgz")
+            || path_lower.ends_with(".bgzf")
+        {
             CompressionFormat::Gzip
         } else if path_lower.ends_with(".zst") || path_lower.ends_with(".zstd") {
             CompressionFormat::Zstd
@@ -435,95 +377,213 @@ impl CompressionFormat {
     pub(crate) fn from_magic_bytes(bytes: &[u8]) -> Option<Self> {
         if bytes.len() >= 2 && bytes[0] == 0x1f && bytes[1] == 0x8b {
             Some(CompressionFormat::Gzip)
+        } else if bytes.starts_with(&[0x28, 0xb5, 0x2f, 0xfd]) {
+            Some(CompressionFormat::Zstd)
         } else {
             None
         }
     }
 }
 
-/// Open input file, URL, S3, or stdin with automatic decompression
+/// Bounded decompression for regular local files. Paired inputs can decode concurrently.
+struct PrefetchInput {
+    receiver: Option<crossbeam_channel::Receiver<std::io::Result<Vec<u8>>>>,
+    recycle: crossbeam_channel::Sender<Vec<u8>>,
+    worker: Option<std::thread::JoinHandle<()>>,
+    buffer: Vec<u8>,
+    position: usize,
+    finished: bool,
+}
+
+impl PrefetchInput {
+    fn new(mut input: impl Read + Send + 'static) -> Self {
+        let (sender, receiver) = crossbeam_channel::bounded(2);
+        let (recycle, reused) = crossbeam_channel::bounded::<Vec<u8>>(2);
+        let worker = std::thread::spawn(move || loop {
+            let mut buffer = reused.try_recv().unwrap_or_default();
+            buffer.resize(1024 * 1024, 0);
+            let mut filled = 0;
+            while filled < buffer.len() {
+                match input.read(&mut buffer[filled..]) {
+                    Ok(0) => break,
+                    Ok(n) => filled += n,
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(e) => {
+                        let _ = sender.send(Err(e));
+                        return;
+                    }
+                }
+            }
+            buffer.truncate(filled);
+            if sender.send(Ok(buffer)).is_err() || filled == 0 {
+                break;
+            }
+        });
+        Self {
+            receiver: Some(receiver),
+            recycle,
+            worker: Some(worker),
+            buffer: Vec::new(),
+            position: 0,
+            finished: false,
+        }
+    }
+}
+
+impl BufRead for PrefetchInput {
+    fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+        if self.position == self.buffer.len() && !self.finished {
+            let next = self.receiver.as_ref().unwrap().recv().map_err(|_| {
+                std::io::Error::other("Decompression worker stopped before end of stream")
+            })??;
+            let old = std::mem::replace(&mut self.buffer, next);
+            let _ = self.recycle.try_send(old);
+            self.position = 0;
+            self.finished = self.buffer.is_empty();
+        }
+        Ok(&self.buffer[self.position..])
+    }
+
+    fn consume(&mut self, amount: usize) {
+        self.position = (self.position + amount).min(self.buffer.len());
+    }
+}
+
+impl Read for PrefetchInput {
+    fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
+        if output.is_empty() {
+            return Ok(0);
+        }
+        let available = self.fill_buf()?;
+        let count = output.len().min(available.len());
+        output[..count].copy_from_slice(&available[..count]);
+        self.consume(count);
+        Ok(count)
+    }
+}
+
+impl Drop for PrefetchInput {
+    fn drop(&mut self) {
+        // Disconnect first: a reader stopped by --reads_to_process or an output
+        // failure must not wait on a decompressor blocked in send(). Only regular
+        // local files use this wrapper, so the underlying read can finish.
+        drop(self.receiver.take());
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
+/// Open input file, URL, S3, or stdin with automatic decompression.
 pub(crate) fn open_input(path: &str) -> Result<Box<dyn BufRead + Send>> {
-    if path == "-" {
-        // Read from stdin
-        let stdin = std::io::stdin();
-        let reader = BufReader::with_capacity(16 * 1024 * 1024, stdin);
-        Ok(Box::new(reader))
+    let raw: Box<dyn Read + Send> = if path == "-" || path == "/dev/stdin" {
+        Box::new(std::io::stdin())
     } else if is_s3_path(path) {
-        // Stream from S3
-        let s3_reader = S3Reader::new(path)?;
-        let format = CompressionFormat::from_path(path);
-
-        match format {
-            CompressionFormat::Gzip => {
-                let buffered = BufReader::with_capacity(64 * 1024 * 1024, s3_reader);
-                let decoder = GzDecoder::new(buffered);
-                let reader = BufReader::with_capacity(32 * 1024 * 1024, decoder);
-                Ok(Box::new(reader))
-            }
-            CompressionFormat::Zstd => {
-                let buffered = BufReader::with_capacity(64 * 1024 * 1024, s3_reader);
-                let decoder = ZstdDecoder::new(buffered)?;
-                let reader = BufReader::with_capacity(32 * 1024 * 1024, decoder);
-                Ok(Box::new(reader))
-            }
-            CompressionFormat::None => {
-                let reader = BufReader::with_capacity(32 * 1024 * 1024, s3_reader);
-                Ok(Box::new(reader))
-            }
-        }
+        Box::new(S3Reader::new(path)?)
     } else if is_url(path) {
-        // Download URL to temp file, then open
-        let temp_path = download_url(path)?;
-        let temp_path_str = temp_path.to_string_lossy();
-
-        let file = File::open(&temp_path)
-            .context(format!("Failed to open downloaded file: {temp_path:?}"))?;
-        let format = CompressionFormat::from_path(&temp_path_str);
-
-        match format {
-            CompressionFormat::Gzip => {
-                let buffered_file = BufReader::with_capacity(64 * 1024 * 1024, file);
-                let decoder = GzDecoder::new(buffered_file);
-                let reader = BufReader::with_capacity(32 * 1024 * 1024, decoder);
-                Ok(Box::new(reader))
-            }
-            CompressionFormat::Zstd => {
-                let buffered_file = BufReader::with_capacity(64 * 1024 * 1024, file);
-                let decoder = ZstdDecoder::new(buffered_file)?;
-                let reader = BufReader::with_capacity(32 * 1024 * 1024, decoder);
-                Ok(Box::new(reader))
-            }
-            CompressionFormat::None => {
-                let reader = BufReader::with_capacity(16 * 1024 * 1024, file);
-                Ok(Box::new(reader))
+        Box::new(
+            ureq::get(path)
+                .call()
+                .with_context(|| format!("Failed to open URL: {path}"))?
+                .into_reader(),
+        )
+    } else {
+        Box::new(File::open(path).with_context(|| format!("Failed to open input file: {path}"))?)
+    };
+    let mut buffered = buffer_input(raw)?;
+    let format = CompressionFormat::from_magic_bytes(buffered.fill_buf()?)
+        .unwrap_or_else(|| CompressionFormat::from_path(path));
+    match format {
+        CompressionFormat::Gzip => {
+            // Reuse the compressed-input buffer instead of adding the read
+            // decoder's smaller internal buffer and an extra copy.
+            let decoder = MultiGzDecoder::new(buffered);
+            if std::fs::metadata(path).is_ok_and(|m| m.is_file()) {
+                Ok(Box::new(PrefetchInput::new(decoder)))
+            } else {
+                Ok(Box::new(BufReader::with_capacity(1024 * 1024, decoder)))
             }
         }
-    } else {
-        // Open file and detect compression
-        let file = File::open(path).context(format!("Failed to open input file: {path}"))?;
-        let format = CompressionFormat::from_path(path);
+        CompressionFormat::Zstd => Ok(Box::new(BufReader::with_capacity(
+            1024 * 1024,
+            ZstdDecoder::new(buffered)?,
+        ))),
+        CompressionFormat::None => Ok(Box::new(buffered)),
+    }
+}
 
-        match format {
-            CompressionFormat::Gzip => {
-                // Use larger input buffer for compressed file (64MB) to reduce syscalls
-                let buffered_file = BufReader::with_capacity(64 * 1024 * 1024, file);
-                let decoder = GzDecoder::new(buffered_file);
-                // Use 32MB output buffer for decompressed data
-                let reader = BufReader::with_capacity(32 * 1024 * 1024, decoder);
-                Ok(Box::new(reader))
+fn buffer_input(raw: Box<dyn Read + Send>) -> std::io::Result<BufReader<Box<dyn Read + Send>>> {
+    let mut buffered = BufReader::with_capacity(1024 * 1024, raw);
+    let available = buffered.fill_buf()?.len();
+    if available > 0 && available < 4 {
+        // A pipe may return only part of the compression magic. Preserve that
+        // prefix and obtain enough bytes to detect gzip/zstd before parsing it.
+        // Ordinary file reads keep the existing buffer without this wrapper.
+        let mut prefix = Vec::with_capacity(4);
+        Read::by_ref(&mut buffered)
+            .take(4)
+            .read_to_end(&mut prefix)?;
+        buffered = BufReader::with_capacity(
+            1024 * 1024,
+            Box::new(std::io::Cursor::new(prefix).chain(buffered)),
+        );
+    }
+    Ok(buffered)
+}
+
+#[cfg(test)]
+mod input_tests {
+    use super::*;
+
+    struct Fragmented(std::io::Cursor<Vec<u8>>);
+    impl Read for Fragmented {
+        fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+            let count = bytes.len().min(1);
+            self.0.read(&mut bytes[..count])
+        }
+    }
+
+    #[test]
+    fn compression_magic_survives_one_byte_reads() {
+        let data = b"@read\nACGT\n+\nIIII\n";
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(data).unwrap();
+        let gzip = encoder.finish().unwrap();
+        let zstd = zstd::stream::encode_all(&data[..], 1).unwrap();
+        for (encoded, expected) in [
+            (gzip, CompressionFormat::Gzip),
+            (zstd, CompressionFormat::Zstd),
+        ] {
+            let mut input =
+                buffer_input(Box::new(Fragmented(std::io::Cursor::new(encoded)))).unwrap();
+            assert_eq!(
+                CompressionFormat::from_magic_bytes(input.fill_buf().unwrap()),
+                Some(expected)
+            );
+            let mut decoded = Vec::new();
+            if expected == CompressionFormat::Gzip {
+                MultiGzDecoder::new(input)
+                    .read_to_end(&mut decoded)
+                    .unwrap();
+            } else {
+                ZstdDecoder::new(input)
+                    .unwrap()
+                    .read_to_end(&mut decoded)
+                    .unwrap();
             }
-            CompressionFormat::Zstd => {
-                // Use larger input buffer for compressed file (64MB) to reduce syscalls
-                let buffered_file = BufReader::with_capacity(64 * 1024 * 1024, file);
-                let decoder = ZstdDecoder::new(buffered_file)?;
-                // Use 32MB output buffer for decompressed data
-                let reader = BufReader::with_capacity(32 * 1024 * 1024, decoder);
-                Ok(Box::new(reader))
-            }
-            CompressionFormat::None => {
-                let reader = BufReader::with_capacity(16 * 1024 * 1024, file);
-                Ok(Box::new(reader))
-            }
+            assert_eq!(decoded, data);
+        }
+    }
+
+    #[test]
+    fn short_uncompressed_inputs_are_not_lost() {
+        for len in 0..=4 {
+            let data = b"@abc"[..len].to_vec();
+            let mut input =
+                buffer_input(Box::new(Fragmented(std::io::Cursor::new(data.clone())))).unwrap();
+            let mut actual = Vec::new();
+            input.read_to_end(&mut actual).unwrap();
+            assert_eq!(actual, data);
         }
     }
 }
@@ -633,10 +693,26 @@ pub(crate) fn open_output(
     compression_level: Option<u32>,
     parallel: bool,
 ) -> Result<OutputWriter> {
+    open_output_with_threads(
+        path,
+        compression_level,
+        parallel,
+        crate::gzip::threads_per_output(1),
+    )
+}
+
+pub(crate) fn open_output_with_threads(
+    path: &str,
+    compression_level: Option<u32>,
+    parallel: bool,
+    compression_threads: usize,
+) -> Result<OutputWriter> {
     if path == "-" {
         // Write to stdout
         let stdout = std::io::stdout();
-        let writer = BufWriter::with_capacity(16 * 1024 * 1024, stdout);
+        // Bound pipeline latency and detect a closed consumer promptly. Packed
+        // worker output still writes large contiguous slices through this buffer.
+        let writer = BufWriter::with_capacity(256 * 1024, stdout);
         Ok(OutputWriter::Stdout(writer))
     } else if is_s3_path(path) {
         // Stream to S3
@@ -670,11 +746,9 @@ pub(crate) fn open_output(
                 let level = compression_level.unwrap_or(6); // Default to level 6
 
                 if parallel {
-                    // Use parallel compression (4-8 threads)
-                    let num_threads = (num_cpus::get() / 2).clamp(4, 8);
                     let compressor = ParCompressBuilder::<Gzip>::new()
                         .compression_level(gzp::Compression::new(level))
-                        .num_threads(num_threads)
+                        .num_threads(compression_threads)
                         .context("Failed to set number of threads for parallel compression")?
                         .from_writer(file);
                     Ok(OutputWriter::ParGzip(compressor))

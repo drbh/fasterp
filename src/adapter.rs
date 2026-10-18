@@ -1,3 +1,4 @@
+//! Matching semantics updated against OpenGene/fastp v1.4.0; see LICENSE.fastp.
 //! Adapter trimming functionality
 //!
 //! This module provides adapter detection and trimming for FASTQ preprocessing:
@@ -7,16 +8,7 @@
 //! - Auto-detection using PE overlap analysis
 //! - Mismatch-tolerant matching
 
-#[cfg(feature = "native")]
-use rayon::prelude::*;
-use std::cell::RefCell;
-use std::cmp::min;
 use std::collections::BTreeMap;
-
-// Thread-local scratch buffers for adapter matching to avoid per-call heap allocations
-thread_local! {
-    static INSERTION_SCRATCH: RefCell<(Vec<u16>, Vec<u16>)> = const { RefCell::new((Vec::new(), Vec::new())) };
-}
 
 /// Configuration for adapter trimming
 #[derive(Debug, Clone)]
@@ -39,7 +31,7 @@ impl AdapterConfig {
             adapter_seq: None,
             adapter_seq_r2: None,
             detect_adapter_for_pe: false, // fastp does NOT auto-detect for PE reads, only uses overlap-based trimming
-            min_overlap: 5,               // fastp's default for adapter trimming
+            min_overlap: 4,               // fastp's default for adapter trimming
             max_mismatches: 2,
         }
     }
@@ -1105,499 +1097,20 @@ pub struct AdapterMatch {
     pub is_atailing: bool,
 }
 
-/// Try exact matching with allowed mismatches (Stage 1)
-/// Supports negative `start_pos` for A-tailing (Illumina adapter dimer handling)
-fn try_exact_match(
-    seq: &[u8],
-    adapter: &[u8],
-    start_pos: isize,
-    min_overlap: usize,
-) -> Option<AdapterMatch> {
-    let (seq_offset, adapter_offset, compare_len) = if start_pos < 0 {
-        // Negative position: skip first abs(start_pos) bytes of adapter
-        let skip = (-start_pos) as usize;
-        if skip >= adapter.len() {
-            return None;
-        }
-        let remaining_adapter = adapter.len() - skip;
-        let compare_len = min(seq.len(), remaining_adapter);
-        (0, skip, compare_len)
-    } else {
-        // Positive position: normal matching
-        let start = start_pos as usize;
-        if start >= seq.len() {
-            return None;
-        }
-        let remaining = seq.len() - start;
-        let compare_len = min(remaining, adapter.len());
-        (start, 0, compare_len)
-    };
-
-    if compare_len < min_overlap {
-        return None;
-    }
-
-    // Use fastp's cmplen formula for allowed mismatches calculation
-    // Fastp uses min(seq_len - pos, adapter_len) even for negative positions
-    let cmplen = if start_pos < 0 {
-        min((seq.len() as isize - start_pos) as usize, adapter.len())
-    } else {
-        compare_len
-    };
-    let allowed_mismatches = cmplen / 8;
-    let mut matches = 0;
-    let mut mismatches = 0;
-
-    for i in 0..compare_len {
-        let seq_base = seq[seq_offset + i].to_ascii_uppercase();
-        let adapter_base = adapter[adapter_offset + i].to_ascii_uppercase();
-
-        if seq_base == adapter_base {
-            matches += 1;
-        } else {
-            mismatches += 1;
-            if mismatches > allowed_mismatches {
-                return None;
-            }
-        }
-    }
-
-    if mismatches <= allowed_mismatches && matches + mismatches >= min_overlap {
-        Some(AdapterMatch {
-            position: start_pos.max(0) as usize,
-            mismatches,
-            match_type: MatchType::Exact,
-            overlap_len: compare_len,
-            is_atailing: start_pos < 0,
-        })
-    } else {
-        None
-    }
-}
-
-/// Try matching with single insertion (Stage 2)
-/// Implements fastp's `Matcher::matchWithOneInsertion` algorithm exactly
-///
-/// `ins_data`: sequence with suspected insertion (longer, e.g., read)
-/// `normal_data`: reference sequence (baseline, e.g., adapter)
-/// cmplen: comparison length (calculated by caller based on insertion/deletion case)
-///
-/// OPTIMIZED: Uses thread-local scratch buffers to avoid per-call heap allocations
-fn try_insertion_match_new(
-    ins_data: &[u8],    // Sequence with insertion
-    normal_data: &[u8], // Reference sequence (adapter)
-    cmplen: usize,      // Length to compare
-    min_overlap: usize,
-) -> Option<AdapterMatch> {
-    // Early validation
-    if ins_data.len() < cmplen + 1 || cmplen < min_overlap || cmplen < 8 {
-        return None;
-    }
-
-    let diff_limit: u16 = ((cmplen / 8).saturating_sub(1)) as u16;
-    let init = diff_limit.saturating_add(1);
-
-    INSERTION_SCRATCH.with(|cell| {
-        let (left_buf, right_buf) = &mut *cell.borrow_mut();
-
-        // Resize buffers if needed (rare, only happens once per thread typically)
-        if left_buf.len() < cmplen {
-            left_buf.resize(cmplen, init);
-        }
-        if right_buf.len() < cmplen {
-            right_buf.resize(cmplen, init);
-        }
-
-        let left = &mut left_buf[..cmplen];
-        let right = &mut right_buf[..cmplen];
-
-        // Initialize arrays
-        left.fill(init);
-        right.fill(init);
-
-        // Initialize first and last elements
-        left[0] = u16::from(!ins_data[0].eq_ignore_ascii_case(&normal_data[0]));
-
-        if cmplen >= ins_data.len() {
-            return None;
-        }
-
-        right[cmplen - 1] =
-            u16::from(!ins_data[cmplen].eq_ignore_ascii_case(&normal_data[cmplen - 1]));
-
-        // Build left array with early termination
-        for i in 1..cmplen {
-            if i >= ins_data.len() {
-                return None;
-            }
-            left[i] = left[i - 1] + u16::from(!ins_data[i].eq_ignore_ascii_case(&normal_data[i]));
-            if left[i] + right[cmplen - 1] > diff_limit {
-                break;
-            }
-        }
-
-        // Build right array with early termination
-        for i in (0..cmplen - 1).rev() {
-            if i + 1 >= ins_data.len() {
-                continue;
-            }
-            right[i] =
-                right[i + 1] + u16::from(!ins_data[i + 1].eq_ignore_ascii_case(&normal_data[i]));
-            if right[i] + left[0] > diff_limit {
-                right[..i].fill(init);
-                break;
-            }
-        }
-
-        // Check each potential skip position
-        for i in 1..cmplen {
-            if left[i - 1] + right[cmplen - 1] > diff_limit {
-                return None;
-            }
-            let diff = left[i - 1] + right[i];
-            if diff <= diff_limit {
-                return Some(AdapterMatch {
-                    position: 0,
-                    mismatches: diff as usize,
-                    match_type: MatchType::Insertion,
-                    overlap_len: cmplen,
-                    is_atailing: false,
-                });
-            }
-        }
-
-        None
-    })
-}
-
-#[inline(always)]
-fn mismatch_ci(a: u8, b: u8) -> u16 {
-    // ASCII-fold to uppercase: 'a'..'z' -> 'A'..'Z'
-    let ua = a & 0xDF;
-    let ub = b & 0xDF;
-    u16::from(ua != ub)
-}
-
-/// Quick prefilter: if even a no-insertion match is far over the limit, skip insertion logic
-#[inline(always)]
-fn quick_hamming_over_limit(
-    ins_data: &[u8],
-    normal_data: &[u8],
-    cmplen: usize,
-    limit: u16,
-) -> bool {
-    let mut diff = 0u16;
-    for i in 0..cmplen {
-        diff += mismatch_ci(ins_data[i], normal_data[i]);
-        if diff > limit {
-            return true;
-        }
-    }
-    false
-}
-
-/// Entry point for insertion matching with prefilter
-fn try_insertion_match_entry(
-    ins_data: &[u8],
-    normal_data: &[u8],
-    cmplen: usize,
-    min_overlap: usize,
-) -> Option<AdapterMatch> {
-    if ins_data.len() < cmplen + 1
-        || normal_data.len() < cmplen
-        || cmplen < min_overlap
-        || cmplen < 8
-    {
-        return None;
-    }
-
-    let diff_limit: u16 = ((cmplen / 8).saturating_sub(1)) as u16;
-
-    // If even a no-insertion match is *far* over the limit, skip insertion logic.
-    // Tune the "+ K" based on data; start conservative (e.g. +4 or +6)
-    if quick_hamming_over_limit(ins_data, normal_data, cmplen, diff_limit + 4) {
-        return None;
-    }
-
-    try_insertion_match(ins_data, normal_data, cmplen, min_overlap)
-}
-
-/// Try matching with single insertion (Stage 2)
-/// Stack-based implementation for common case, falls back to TLS for large cmplen.
-fn try_insertion_match(
-    ins_data: &[u8],
-    normal_data: &[u8],
-    cmplen: usize,
-    min_overlap: usize,
-) -> Option<AdapterMatch> {
-    // Same basic guards as before
-    if ins_data.len() < cmplen + 1
-        || normal_data.len() < cmplen
-        || cmplen < min_overlap
-        || cmplen < 8
-    {
-        return None;
-    }
-
-    // IMPORTANT: if you ever see bigger overlaps, just raise this and recompile.
-    const MAX_STACK_CMPLEN: usize = 64;
-
-    if cmplen <= MAX_STACK_CMPLEN {
-        return try_insertion_match_stack::<MAX_STACK_CMPLEN>(ins_data, normal_data, cmplen);
-    }
-
-    // Rare path: use the old TLS-based implementation here
-    try_insertion_match_slow(ins_data, normal_data, cmplen, min_overlap)
-}
-
-#[inline(always)]
-fn try_insertion_match_stack<const MAX: usize>(
-    ins_data: &[u8],
-    normal_data: &[u8],
-    cmplen: usize,
-) -> Option<AdapterMatch> {
-    debug_assert!(cmplen <= MAX);
-    debug_assert!(ins_data.len() >= cmplen + 1);
-    debug_assert!(normal_data.len() >= cmplen);
-
-    let diff_limit: u16 = ((cmplen / 8).saturating_sub(1)) as u16;
-    let init: u16 = diff_limit.saturating_add(1);
-
-    // Everything stays on the stack
-    let mut left: [u16; MAX] = [init; MAX];
-    let mut right: [u16; MAX] = [init; MAX];
-
-    let last = cmplen - 1;
-
-    // left[0] = mismatches in ins[0] vs norm[0]
-    left[0] = mismatch_ci(ins_data[0], normal_data[0]);
-
-    // right[last] = mismatches in ins[cmplen] vs norm[cmplen-1]
-    right[last] = mismatch_ci(ins_data[cmplen], normal_data[last]);
-    let right_last = right[last];
-
-    // Build left cumulative mismatches with early termination
-    for i in 1..cmplen {
-        let diff = mismatch_ci(ins_data[i], normal_data[i]);
-        let v = left[i - 1] + diff;
-        left[i] = v;
-
-        // original-style shortcut: even if right side is perfect, too many mismatches
-        if v + right_last > diff_limit {
-            // later entries remain at init
-            break;
-        }
-    }
-
-    // Build right cumulative mismatches (reverse) with early termination
-    for i in (0..last).rev() {
-        // right[i] = right[i+1] + mismatch(ins[i+1], norm[i])
-        let diff = mismatch_ci(ins_data[i + 1], normal_data[i]);
-        let v = right[i + 1] + diff;
-        right[i] = v;
-
-        if v + left[0] > diff_limit {
-            // everything before i is conceptually init
-            for k in 0..i {
-                right[k] = init;
-            }
-            break;
-        }
-    }
-
-    // Check each potential skip position
-    for i in 1..cmplen {
-        // fastp shortcut: if even best right-side (at last) can't save it, bail
-        if left[i - 1] + right_last > diff_limit {
-            return None;
-        }
-
-        let diff = left[i - 1] + right[i];
-        if diff <= diff_limit {
-            return Some(AdapterMatch {
-                position: 0,
-                mismatches: diff as usize,
-                match_type: MatchType::Insertion,
-                overlap_len: cmplen,
-                is_atailing: false,
-            });
-        }
-    }
-
-    None
-}
-
-fn try_insertion_match_slow(
-    ins_data: &[u8],    // sequence with insertion (longer)
-    normal_data: &[u8], // reference (adapter)
-    cmplen: usize,
-    min_overlap: usize,
-) -> Option<AdapterMatch> {
-    // Same guards as your original
-    if ins_data.len() < cmplen + 1 || cmplen < min_overlap || cmplen < 8 {
-        return None;
-    }
-
-    // Original extra check you preserved
-    if cmplen >= ins_data.len() {
-        return None;
-    }
-
-    let diff_limit: u16 = ((cmplen / 8).saturating_sub(1)) as u16;
-    let init: u16 = diff_limit.saturating_add(1);
-
-    INSERTION_SCRATCH.with(|cell| {
-        let (left_buf, right_buf) = &mut *cell.borrow_mut();
-
-        // Ensure buffer capacity (rare, amortized)
-        if left_buf.len() < cmplen {
-            left_buf.resize(cmplen, init);
-        }
-        if right_buf.len() < cmplen {
-            right_buf.resize(cmplen, init);
-        }
-
-        let left = &mut left_buf[..cmplen];
-        let right = &mut right_buf[..cmplen];
-
-        // Initialize arrays to "infinite" diff (same semantics as original)
-        left.fill(init);
-        right.fill(init);
-
-        // left[0]
-        left[0] = mismatch_ci(ins_data[0], normal_data[0]);
-
-        // right[cmplen - 1]
-        let last = cmplen - 1;
-        right[last] = mismatch_ci(ins_data[cmplen], normal_data[last]);
-
-        let right_last = right[last];
-
-        // Build left[] with early termination
-        // left[i] = left[i-1] + mismatch(ins[i], normal[i])
-        for i in 1..cmplen {
-            // original had: if i >= ins.len { return None; }
-            // but precondition ins.len >= cmplen + 1 makes this impossible
-            left[i] = left[i - 1] + mismatch_ci(ins_data[i], normal_data[i]);
-
-            // early stop as in your original code
-            if left[i] + right_last > diff_limit {
-                // later i’s stay at init
-                break;
-            }
-        }
-
-        // Build right[] with early termination
-        // right[i] = right[i+1] + mismatch(ins[i+1], normal[i])
-        //
-        // original loop:
-        // for i in (0..cmplen-1).rev() { ... }
-        for i in (0..last).rev() {
-            // original had: if i + 1 >= ins.len { continue; }
-            // but i+1 <= cmplen-1 < ins.len (from precondition), so we can drop that
-            right[i] = right[i + 1] + mismatch_ci(ins_data[i + 1], normal_data[i]);
-
-            if right[i] + left[0] > diff_limit {
-                // same semantics as:
-                // right[..i].fill(init);
-                for k in 0..i {
-                    right[k] = init;
-                }
-                break;
-            }
-        }
-
-        // Check each potential skip position
-        for i in 1..cmplen {
-            // Original early exit:
-            // if left[i - 1] + right[cmplen - 1] > diff_limit { return None; }
-            if left[i - 1] + right_last > diff_limit {
-                return None;
-            }
-
-            let diff = left[i - 1] + right[i];
-            if diff <= diff_limit {
-                return Some(AdapterMatch {
-                    position: 0,
-                    mismatches: diff as usize,
-                    match_type: MatchType::Insertion,
-                    overlap_len: cmplen,
-                    is_atailing: false,
-                });
-            }
-        }
-
-        None
-    })
-}
-
-/// Try matching with single deletion from adapter (Stage 3)
-/// Fastp handles deletion by swapping arguments to matchWithOneInsertion:
-/// A deletion in adapter = insertion in adapter sequence relative to read
-fn try_deletion_match(
-    seq: &[u8],
-    adapter: &[u8],
-    cmplen: usize,
-    min_overlap: usize,
-) -> Option<AdapterMatch> {
-    if cmplen < min_overlap {
-        return None;
-    }
-
-    // Swap arguments: treat adapter as having "insertion" relative to seq
-    // Fastp always compares from index 0
-    if let Some(mut result) = try_insertion_match(adapter, seq, cmplen, min_overlap) {
-        result.match_type = MatchType::Deletion;
-        Some(result)
-    } else {
-        None
-    }
-}
-
-/// Check if new match is better than current best
-fn is_better_match(new_match: &AdapterMatch, current_best: Option<&AdapterMatch>) -> bool {
-    use MatchType::{Deletion, Exact, Insertion};
-
-    match current_best {
-        None => true,
-        Some(best) => {
-            // Prefer earlier position
-            if new_match.position < best.position {
-                return true;
-            }
-            if new_match.position > best.position {
-                return false;
-            }
-
-            // Same position: prefer exact > deletion > insertion
-            match (&new_match.match_type, &best.match_type) {
-                (Exact, Insertion | Deletion) | (Deletion, Insertion) => true,
-                (Insertion | Deletion, Exact) | (Insertion, Deletion) => false,
-                _ => new_match.mismatches < best.mismatches,
-            }
-        }
-    }
-}
-
 /// Find adapter sequence in read allowing mismatches
 ///
 /// Uses a three-stage matching approach (exact, insertion, deletion).
-/// Returns the best match (earliest position with fewest mismatches).
+/// Returns the first accepted match in upstream's stage and position order.
 pub fn find_adapter(
     seq: &[u8],
     adapter: &[u8],
     min_overlap: usize,
     _max_mismatches: usize,
 ) -> Option<AdapterMatch> {
-    if adapter.is_empty() || seq.len() < min_overlap {
+    if adapter.len() < min_overlap || seq.len() <= min_overlap {
         return None;
     }
-
-    let mut best_match: Option<AdapterMatch> = None;
-
-    // Calculate start position for A-tailing support
-    // Fastp starts from negative positions to handle Illumina adapter dimers
-    let start: isize = if adapter.len() >= 16 {
+    let start = if adapter.len() >= 16 {
         -4
     } else if adapter.len() >= 12 {
         -3
@@ -1606,70 +1119,328 @@ pub fn find_adapter(
     } else {
         0
     };
-
-    // Minimum required match length (matchReq in fastp)
-    // Fastp uses 5 as the minimum match length
-    let match_req = 5;
-
-    let end = (seq.len() as isize) - (match_req as isize);
-
-    // STAGE 1: Try exact matching at all positions with A-tailing support
-    // Fastp tries negative positions for adapters >= 16bp
-    for pos in start..=end {
-        if let Some(match_result) = try_exact_match(seq, adapter, pos, min_overlap) {
-            if is_better_match(&match_result, best_match.as_ref()) {
-                best_match = Some(match_result);
+    for pos in start..(seq.len() - min_overlap) as isize {
+        let len = ((seq.len() as isize - pos) as usize).min(adapter.len());
+        let skip = (-pos).max(0) as usize;
+        let begin = (pos + skip as isize) as usize;
+        let (diff, _) = crate::simd::count_mismatches(
+            &seq[begin..begin + len - skip],
+            &adapter[skip..len],
+            len / 8,
+            len - skip,
+        );
+        if diff <= len / 8 {
+            return Some(AdapterMatch {
+                position: pos.max(0) as usize,
+                mismatches: diff,
+                match_type: MatchType::Exact,
+                overlap_len: if pos < 0 {
+                    (adapter.len() as isize + pos) as usize
+                } else {
+                    len
+                },
+                is_atailing: pos < 0,
+            });
+        }
+    }
+    for insertion in [true, false] {
+        let bound = seq
+            .len()
+            .saturating_sub(min_overlap + usize::from(insertion));
+        let mut previous_len = None;
+        for pos in 0..bound {
+            let len = if insertion {
+                (seq.len() - pos - 1).min(adapter.len())
+            } else {
+                (seq.len() - pos).min(adapter.len().saturating_sub(1))
+            };
+            if len < 8 {
+                continue;
+            }
+            // fastp 1.4.0 passes the original read/adapter pointers to its gap
+            // matcher, without adding `pos`. Until the overlap length changes,
+            // these calls would repeat the same failed comparison.
+            if previous_len == Some(len) {
+                continue;
+            }
+            previous_len = Some(len);
+            let diff = if insertion {
+                one_gap_match(seq, adapter, len, len / 8 - 1, true)
+            } else {
+                one_gap_match(adapter, seq, len, len / 8 - 1, true)
+            };
+            if let Some(diff) = diff {
+                return Some(AdapterMatch {
+                    position: pos,
+                    mismatches: diff,
+                    match_type: if insertion {
+                        MatchType::Insertion
+                    } else {
+                        MatchType::Deletion
+                    },
+                    overlap_len: len,
+                    is_atailing: false,
+                });
             }
         }
     }
+    None
+}
 
-    // If exact match found, return it
-    if best_match.is_some() {
-        return best_match;
+/// Hamming distance with one internal insertion in `ins`, matching fastp's
+/// Matcher. The gap itself is not counted as a mismatching base.
+pub(crate) fn one_gap_diff(ins: &[u8], normal: &[u8], len: usize, limit: usize) -> Option<usize> {
+    one_gap_match(ins, normal, len, limit, false)
+}
+
+fn one_gap_match(
+    ins: &[u8],
+    normal: &[u8],
+    len: usize,
+    limit: usize,
+    first: bool,
+) -> Option<usize> {
+    if len < 2 || ins.len() <= len || normal.len() < len {
+        return None;
     }
-
-    // STAGE 2: Try insertion matching with different comparison lengths
-    // Fastp loops through positions but always compares from START of sequences
-    // The loop varies cmplen based on remaining length, not the actual comparison position
-    for pos in 0..=(seq.len() - match_req) {
-        let remaining = seq.len() - pos;
-        if remaining < min_overlap {
-            break;
-        }
-
-        let cmplen = min(remaining.saturating_sub(1), adapter.len());
-        // Match fastp: always compare from position 0, passing only cmplen
-        if let Some(match_result) = try_insertion_match(seq, adapter, cmplen, min_overlap) {
-            if is_better_match(&match_result, best_match.as_ref()) {
-                // Adjust position to match loop variable (fastp returns pos from loop)
-                let mut adjusted_match = match_result;
-                adjusted_match.position = pos;
-                best_match = Some(adjusted_match);
-                return best_match; // Fastp breaks immediately
-            }
-        }
+    // Keep fastp's prefix/tail rejection rule, including for the minimum-diff
+    // overlap mode. Reject impossible first positions before counting a suffix.
+    let tail = usize::from(ins[len] != normal[len - 1]);
+    if usize::from(ins[0] != normal[0]) + tail > limit {
+        return None;
     }
-
-    // STAGE 3: Try deletion matching with different comparison lengths
-    // Same logic as insertion - always compare from position 0
-    for pos in 0..=(seq.len() - match_req) {
-        let cmplen = min(seq.len() - pos, adapter.len().saturating_sub(1));
-        if let Some(match_result) = try_deletion_match(seq, adapter, cmplen, min_overlap) {
-            if is_better_match(&match_result, best_match.as_ref()) {
-                let mut adjusted_match = match_result;
-                adjusted_match.position = pos;
-                best_match = Some(adjusted_match);
-                return best_match; // Fastp breaks immediately
-            }
+    let (mut suffix, _) =
+        crate::simd::count_mismatches(&ins[1..=len], &normal[..len], usize::MAX, 0);
+    let mut prefix = 0;
+    let mut best = usize::MAX;
+    for i in 1..len {
+        prefix += usize::from(ins[i - 1] != normal[i - 1]);
+        suffix -= usize::from(ins[i] != normal[i - 1]);
+        if prefix + tail > limit {
+            return None;
         }
+        let diff = prefix + suffix;
+        if first && diff <= limit {
+            return Some(diff);
+        }
+        best = best.min(diff);
     }
-
-    best_match
+    (best <= limit).then_some(best)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Keep the original scalar matcher as an independent test reference.
+    fn reference_find_adapter(
+        seq: &[u8],
+        adapter: &[u8],
+        min_overlap: usize,
+        _max_mismatches: usize,
+    ) -> Option<AdapterMatch> {
+        if adapter.len() < min_overlap || seq.len() <= min_overlap {
+            return None;
+        }
+        let start = if adapter.len() >= 16 {
+            -4
+        } else if adapter.len() >= 12 {
+            -3
+        } else if adapter.len() >= 8 {
+            -2
+        } else {
+            0
+        };
+        for pos in start..(seq.len() - min_overlap) as isize {
+            let len = ((seq.len() as isize - pos) as usize).min(adapter.len());
+            let skip = (-pos).max(0) as usize;
+            let begin = (pos + skip as isize) as usize;
+            let diff = seq[begin..begin + len - skip]
+                .iter()
+                .zip(&adapter[skip..len])
+                .filter(|(a, b)| a != b)
+                .count();
+            if diff <= len / 8 {
+                return Some(AdapterMatch {
+                    position: pos.max(0) as usize,
+                    mismatches: diff,
+                    match_type: MatchType::Exact,
+                    overlap_len: if pos < 0 {
+                        (adapter.len() as isize + pos) as usize
+                    } else {
+                        len
+                    },
+                    is_atailing: pos < 0,
+                });
+            }
+        }
+        for insertion in [true, false] {
+            let bound = seq
+                .len()
+                .saturating_sub(min_overlap + usize::from(insertion));
+            for pos in 0..bound {
+                let len = if insertion {
+                    (seq.len() - pos - 1).min(adapter.len())
+                } else {
+                    (seq.len() - pos).min(adapter.len().saturating_sub(1))
+                };
+                if len < 8 {
+                    continue;
+                }
+                let diff = if insertion {
+                    reference_one_gap_match(seq, adapter, len, len / 8 - 1, true)
+                } else {
+                    reference_one_gap_match(adapter, seq, len, len / 8 - 1, true)
+                };
+                if let Some(diff) = diff {
+                    return Some(AdapterMatch {
+                        position: pos,
+                        mismatches: diff,
+                        match_type: if insertion {
+                            MatchType::Insertion
+                        } else {
+                            MatchType::Deletion
+                        },
+                        overlap_len: len,
+                        is_atailing: false,
+                    });
+                }
+            }
+        }
+        None
+    }
+
+    fn reference_one_gap_match(
+        ins: &[u8],
+        normal: &[u8],
+        len: usize,
+        limit: usize,
+        first: bool,
+    ) -> Option<usize> {
+        if len < 2 || ins.len() <= len || normal.len() < len {
+            return None;
+        }
+        let mut suffix = vec![0usize; len + 1];
+        for i in (0..len).rev() {
+            suffix[i] = suffix[i + 1] + usize::from(ins[i + 1] != normal[i]);
+        }
+        let mut prefix = 0;
+        let mut best = usize::MAX;
+        for i in 1..len {
+            prefix += usize::from(ins[i - 1] != normal[i - 1]);
+            if prefix + suffix[len - 1] > limit {
+                return None;
+            }
+            let diff = prefix + suffix[i];
+            if first && diff <= limit {
+                return Some(diff);
+            }
+            best = best.min(diff);
+        }
+        (best <= limit).then_some(best)
+    }
+
+    fn match_fields(value: Option<AdapterMatch>) -> Option<(usize, usize, MatchType, usize, bool)> {
+        value.map(|m| {
+            (
+                m.position,
+                m.mismatches,
+                m.match_type,
+                m.overlap_len,
+                m.is_atailing,
+            )
+        })
+    }
+
+    #[test]
+    fn gap_match_matches_scalar_oracle() {
+        // Exhaust every binary sequence pair, gap position, mismatch budget and
+        // selection mode at short lengths, including the late rejection rule.
+        for len in 2..=6 {
+            for bits in 0..(1usize << (2 * len + 1)) {
+                let ins: Vec<u8> = (0..=len).map(|i| b'A' + ((bits >> i) & 1) as u8).collect();
+                let normal: Vec<u8> = (0..len)
+                    .map(|i| b'A' + ((bits >> (len + 1 + i)) & 1) as u8)
+                    .collect();
+                for limit in 0..=len {
+                    for first in [true, false] {
+                        assert_eq!(
+                            one_gap_match(&ins, &normal, len, limit, first),
+                            reference_one_gap_match(&ins, &normal, len, limit, first),
+                            "len={len} bits={bits} limit={limit} first={first}"
+                        );
+                    }
+                }
+            }
+        }
+        // Longer inputs exercise the SIMD paths and realistic adapter lengths.
+        let mut state = 0x3b9d_81a2_f605_c74eu64;
+        let mut random = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state as usize
+        };
+        for _ in 0..4000 {
+            let len = 8 + random() % 249;
+            let normal: Vec<u8> = (0..len).map(|_| b"ACGTN"[random() % 5]).collect();
+            let mut ins = normal.clone();
+            ins.insert(1 + random() % (len - 1), b"ACGTN"[random() % 5]);
+            for _ in 0..random() % (len / 4 + 1) {
+                ins[random() % (len + 1)] = b"ACGTN"[random() % 5];
+            }
+            for first in [true, false] {
+                let limit = random() % (len / 4 + 1);
+                assert_eq!(
+                    one_gap_match(&ins, &normal, len, limit, first),
+                    reference_one_gap_match(&ins, &normal, len, limit, first)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn adapter_search_matches_scalar_oracle() {
+        let mut state = 0xf3c6_705a_92b1_e84du64;
+        let mut random = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state as usize
+        };
+        for case in 0..6000 {
+            let len = 8 + random() % 193;
+            let adapter: Vec<u8> = (0..len).map(|_| b"ACGTN"[random() % 5]).collect();
+            let mut seq: Vec<u8> = (0..random() % 200)
+                .map(|_| b"ACGTN"[random() % 5])
+                .collect();
+            match case % 5 {
+                0 => seq.extend_from_slice(&adapter),
+                1 => {
+                    seq = adapter.clone();
+                    seq.insert(1 + random() % (len - 1), b'N');
+                }
+                2 => {
+                    seq = adapter.clone();
+                    seq.remove(1 + random() % (len - 1));
+                }
+                3 => seq = adapter[random() % 5..].to_vec(),
+                _ => (),
+            }
+            for _ in 0..random() % 8 {
+                if !seq.is_empty() {
+                    let pos = random() % seq.len();
+                    seq[pos] = b"ACGTN"[random() % 5];
+                }
+            }
+            let min_overlap = 1 + random() % 15;
+            assert_eq!(
+                match_fields(find_adapter(&seq, &adapter, min_overlap, 0)),
+                match_fields(reference_find_adapter(&seq, &adapter, min_overlap, 0)),
+                "case={case} min_overlap={min_overlap}"
+            );
+        }
+    }
 
     #[test]
     fn test_exact_adapter_match() {
@@ -1732,15 +1503,13 @@ mod tests {
     }
 
     #[test]
-    fn test_case_insensitive_matching() {
+    fn test_matching_preserves_fastp_case_sensitivity() {
         let seq = b"ACGTACGTACGTagatcggaagagc"; // lowercase adapter
         let adapter = b"AGATCGGAAGAGC"; // uppercase
 
         let result = find_adapter(seq, adapter, 10, 2);
-        assert!(result.is_some());
-
-        let m = result.unwrap();
-        assert_eq!(m.mismatches, 0);
+        // fastp compares original sequence bytes against the adapter.
+        assert!(result.is_none());
     }
 
     #[test]
@@ -1873,79 +1642,5 @@ mod tests {
 
         // Should return None when no adapter meets threshold
         assert!(result.is_none());
-    }
-
-    #[test]
-    fn test_insertion_match_parity() {
-        // Test cases: (ins_data, normal_data, cmplen, min_overlap)
-        // These test cases verify that try_insertion_match_new produces identical
-        // results to try_insertion_match.
-        let test_cases: Vec<(&[u8], &[u8], usize, usize)> = vec![
-            // Basic insertion case - single clear insertion in middle
-            (b"AGATCGGXAAGAGC", b"AGATCGGAAGAGC", 13, 8),
-            // Insertion at beginning (old returns None, should match)
-            (b"XAGATCGGAAGAGC", b"AGATCGGAAGAGC", 13, 8),
-            // Insertion near end
-            (b"AGATCGGAAGAGXC", b"AGATCGGAAGAGC", 13, 8),
-            // No match case (too many mismatches)
-            (b"XXXXXXXXAAGAGC", b"AGATCGGAAGAGC", 13, 8),
-            // Exact match (should return None - no insertion)
-            (b"AGATCGGAAGAGC", b"AGATCGGAAGAGC", 12, 8),
-            // Case insensitive
-            (b"agatcggXaagagc", b"AGATCGGAAGAGC", 13, 8),
-            // Short sequences (below min requirements)
-            (b"AGATX", b"AGAT", 4, 8),
-            // Edge case: cmplen at minimum
-            (b"AGATCGGXAAGAGCTT", b"AGATCGGAAGAGCTT", 8, 8),
-            // Longer sequences
-            (
-                b"AGATCGGAAGAGCACACGTCTGAACTCCAGTCACXNNNNNNATCTCGTATGCCGTCTTCTGCTTG",
-                b"AGATCGGAAGAGCACACGTCTGAACTCCAGTCACNNNNNNATCTCGTATGCCGTCTTCTGCTTG",
-                30,
-                10,
-            ),
-            // Multiple potential insertion points
-            (b"ACGTXACGTACGT", b"ACGTACGTACGT", 12, 8),
-        ];
-
-        for (i, (ins_data, normal_data, cmplen, min_overlap)) in test_cases.iter().enumerate() {
-            let result_old = try_insertion_match(ins_data, normal_data, *cmplen, *min_overlap);
-            let result_new = try_insertion_match_new(ins_data, normal_data, *cmplen, *min_overlap);
-
-            match (&result_old, &result_new) {
-                (None, None) => {
-                    // Both return None - parity achieved
-                }
-                (Some(old), Some(new)) => {
-                    assert_eq!(
-                        old.mismatches, new.mismatches,
-                        "Test case {}: mismatches differ. Old: {}, New: {}",
-                        i, old.mismatches, new.mismatches
-                    );
-                    assert_eq!(
-                        old.overlap_len, new.overlap_len,
-                        "Test case {}: overlap_len differ. Old: {}, New: {}",
-                        i, old.overlap_len, new.overlap_len
-                    );
-                    assert_eq!(
-                        old.match_type, new.match_type,
-                        "Test case {}: match_type differ",
-                        i
-                    );
-                }
-                _ => {
-                    panic!(
-                        "Test case {}: Results differ. Old: {:?}, New: {:?}\nInput: ins={:?}, normal={:?}, cmplen={}, min_overlap={}",
-                        i,
-                        result_old,
-                        result_new,
-                        String::from_utf8_lossy(ins_data),
-                        String::from_utf8_lossy(normal_data),
-                        cmplen,
-                        min_overlap
-                    );
-                }
-            }
-        }
     }
 }
