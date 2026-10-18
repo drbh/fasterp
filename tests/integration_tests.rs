@@ -1826,7 +1826,8 @@ fn test_json_report_structure() {
 
     // Check summary fields
     let summary = &json["summary"];
-    assert!(summary.get("fastp_version").is_some());
+    assert!(summary.get("fasterp_version").is_some());
+    assert_eq!(summary["fastp_compatibility_version"], "1.4.0");
     assert!(summary.get("before_filtering").is_some());
     assert!(summary.get("after_filtering").is_some());
 
@@ -2938,7 +2939,7 @@ fn test_adapter_5base_perfect_match() {
 
     // Create test data with 5-base partial adapter at the end
     let test_input = temp_dir.path().join("test_input.fq");
-    fs::write(&test_input, "@read1\nACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTAGATC\n+\n?????????????????????????????????????????????????????????????\n").unwrap();
+    fs::write(&test_input, "@read1\nACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTAGATC\n+\n?????????????????????????????????????????????????????????????????\n").unwrap();
 
     let fastp_out = temp_dir.path().join("fastp_out.fq");
     let fasterp_out = temp_dir.path().join("fasterp_out.fq");
@@ -3040,7 +3041,7 @@ fn test_adapter_5base_with_mismatch_not_trimmed() {
     // Create test data with 5-base adapter (1 mismatch) at the end
     // AGATX has 1 mismatch vs AGATC
     let test_input = temp_dir.path().join("test_input.fq");
-    fs::write(&test_input, "@read1\nACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTAGATX\n+\n?????????????????????????????????????????????????????????????\n").unwrap();
+    fs::write(&test_input, "@read1\nACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTAGATX\n+\n?????????????????????????????????????????????????????????????????\n").unwrap();
 
     let fastp_out = temp_dir.path().join("fastp_out.fq");
     let fasterp_out = temp_dir.path().join("fasterp_out.fq");
@@ -4627,6 +4628,7 @@ fn test_umi_extraction_read1_paired_end() {
         .arg("-O")
         .arg(&r2_output)
         .arg("--umi")
+        .args(["--umi-prefix", "UMI"])
         .arg("--umi-len")
         .arg("8")
         .arg("--umi-loc")
@@ -4688,11 +4690,10 @@ fn test_umi_extraction_read2_paired_end() {
     let r1_output = temp_dir.path().join("out_R1.fq");
     let r2_output = temp_dir.path().join("out_R2.fq");
 
-    // NOTE: Using 31bp sequences because there's a bug in fasterp that trims 1bp from all reads
-    // After the trim, we get 30bp which is what we want to test
+    // Only explicit trimming or UMI extraction should change read length.
     let r1_content =
         "@read1\nGGCCAATTGGGGGGGGGGGGGGGGGGGGGGG\n+\nIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII\n";
-    // Read2 has 6bp UMI at start: ACGTAC (6bp UMI + 25bp sequence = 31bp total, becomes 30bp after bug trim)
+    // Read2 has a six-base UMI at the front.
     let r2_content =
         "@read1\nACGTACAAAAAAAAAAAAAAAAAAAAAAAAAA\n+\nIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII\n";
 
@@ -4710,6 +4711,7 @@ fn test_umi_extraction_read2_paired_end() {
         .arg("-O")
         .arg(&r2_output)
         .arg("--umi")
+        .args(["--umi-prefix", "UMI"])
         .arg("--umi-len")
         .arg("6")
         .arg("--umi-loc")
@@ -4739,16 +4741,10 @@ fn test_umi_extraction_read2_paired_end() {
         "R2 header should contain UMI"
     );
 
-    // R1 should be unchanged except for 1bp trim bug (UMI from R2) - 29bp due to bug
-    assert!(
-        r1_out.contains("GGCCAATTGGGGGGGGGGGGGGGGGGGGG"),
-        "R1 sequence (29bp due to trim bug)"
-    );
-
-    // R2 should have UMI removed (6bp) and 1bp trim bug: 31bp -> 30bp (trim) -> 24bp (UMI) -> 23bp (bug)
-    assert!(
-        r2_out.contains("AAAAAAAAAAAAAAAAAAAAAAA"),
-        "R2 sequence should have UMI removed (23bp due to trim bug)"
+    assert_eq!(r1_out.lines().nth(1), r1_content.lines().nth(1));
+    assert_eq!(
+        r2_out.lines().nth(1),
+        Some(&r2_content.lines().nth(1).unwrap()[6..])
     );
 }
 
@@ -4782,6 +4778,7 @@ fn test_umi_multithreaded_consistency() {
         .arg("-O")
         .arg(&r2_single)
         .arg("--umi")
+        .args(["--umi-prefix", "UMI"])
         .arg("--umi-len")
         .arg("8")
         .arg("--umi-loc")
@@ -4806,6 +4803,7 @@ fn test_umi_multithreaded_consistency() {
         .arg("-O")
         .arg(&r2_multi)
         .arg("--umi")
+        .args(["--umi-prefix", "UMI"])
         .arg("--umi-len")
         .arg("8")
         .arg("--umi-loc")
@@ -4868,6 +4866,7 @@ fn test_umi_with_trimming_and_filtering() {
         .arg("-O")
         .arg(&r2_output)
         .arg("--umi")
+        .args(["--umi-prefix", "UMI"])
         .arg("--umi-len")
         .arg("8")
         .arg("--umi-loc")
@@ -5799,11 +5798,23 @@ fn test_adapter_auto_detection_se() {
         "Adapter trimming should reduce total bases. With detection: {total_bases_with} bp, without: {total_bases_without} bp"
     );
 
-    // Expect at least 200,000 bases to be trimmed (7000 reads * ~30bp adapter each)
-    let bases_trimmed = total_bases_without - total_bases_with;
-    assert!(
-        bases_trimmed > 200_000,
-        "Expected significant adapter trimming (>200k bases), got {bases_trimmed} bases trimmed"
+    // The current upstream evaluator may select a shorter known Nextera
+    // adapter. Compare actual output instead of assuming the adapter length.
+    let reference = temp_dir.path().join("reference.fq");
+    let status = Command::new("fastp")
+        .arg("-i")
+        .arg(&test_input)
+        .arg("-o")
+        .arg(&reference)
+        .args(["-w", "1"])
+        .stderr(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .status()
+        .expect("Failed to run reference fastp");
+    assert!(status.success());
+    assert_eq!(
+        content_with_detection,
+        fs::read_to_string(reference).unwrap()
     );
 
     // Read JSON to verify adapter was reported
@@ -8471,7 +8482,7 @@ AAAAAEE<EEEEAAEE/EA/E/A/E/AAE//////A/<EEA/E/EE/E/A/E//<E/A///////A/////E//<
 @SRR22472290.62665 NB502048:545:HN3F3AFX2:4:11508:25760:15681/2
 GACTAAAACCAAGCGAGAATCTGAGATGGTTTTCTGTGGGGAAGTATATAAGGTCAGCATTGTAACCCCTGACT
 +
-/A6AAEEE6EE/E//AA//E<EAEE/A///E///<EEA6E/EEEEAA//A/////EAEE////EE//</E///E<
+/A6AAEEE6EE/E//AA//E<EAEE/A///E///<EEA6E/EEEEAA//A/////EAEE////EE//</E///E
 ";
 
     let temp_dir = tempfile::tempdir().unwrap();
@@ -8567,7 +8578,7 @@ fn test_short_insert_heavy_overlap() {
 @read1/1
 ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACAAAAAAAAAAAAAAAAAAAAAAAAAA
 +
-IIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII
+IIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII
 @read2/1
 GCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTGGGGGGGGGGGGGGGGGGGGGGGG
 +
@@ -8579,7 +8590,7 @@ IIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII
 @read1/2
 TTTTTTTTTTTTTTTTTTTTTTTTTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTA
 +
-IIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII
+IIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII
 @read2/2
 CCCCCCCCCCCCCCCCCCCCCCCCAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGC
 +
@@ -8637,7 +8648,7 @@ fn test_minimal_overlap_detection() {
 @read1/1
 ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGT
 +
-IIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII
+IIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII
 ";
 
     // R2: reverse complement will have 30bp overlap with R1's last 30bp
@@ -8763,7 +8774,7 @@ fn test_overlap_with_quality_filtering() {
 @read1/1
 ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTTTTTTTTTTTTTTT
 +
-IIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII!!!!!!!!!!!!!!
+IIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII!!!!!!!!!!!!!!!
 ";
 
     // R2 overlaps, should trim off the low quality region
@@ -8828,7 +8839,7 @@ fn test_negative_offset_trimming() {
 @read1/1
 ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGT
 +
-IIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII
+IIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII
 @read2/1
 GCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTA
 +
@@ -8840,7 +8851,7 @@ IIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII
 @read1/2
 AAAAAAAAAAAAAAAAAAAAAACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGT
 +
-IIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII
+IIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII
 @read2/2
 TTTTTTTTTTTTTTTTTTTTTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTAGCTA
 +
@@ -8899,14 +8910,14 @@ fn test_positive_offset_no_overlap_trimming() {
 @read1/1
 AAAAAAAAAAAAAAAAAAAAAACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGT
 +
-IIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII
+IIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII
 ";
 
     let r2_data = "\
 @read1/2
 ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGT
 +
-IIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII
+IIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII
 ";
 
     let r1_path = temp_dir.path().join("pos_offset_r1.fq");
@@ -8938,19 +8949,9 @@ IIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII
 
     assert!(status.success(), "fasterp should succeed");
 
-    // Read output to verify lengths weren't changed by overlap trimming
+    // The fixture contains 69 bases.
     let out1_content = std::fs::read_to_string(&out1).unwrap();
-    let lines1: Vec<&str> = out1_content.lines().collect();
-
-    // Check R1 length (should be original 70bp, not trimmed)
-    if lines1.len() >= 2 {
-        let seq = lines1[1];
-        assert_eq!(
-            seq.len(),
-            70,
-            "R1 should not be trimmed for positive offset"
-        );
-    }
+    assert_eq!(out1_content.lines().nth(1), r1_data.lines().nth(1));
 }
 
 #[test]
@@ -8964,10 +8965,10 @@ fn test_multithreaded_overlap_consistency() {
 
     for i in 0..100 {
         r1_data.push_str(&format!(
-            "@read{i}/1\nACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTAAAAAAAAAAAAAAAA\n+\nIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII\n"
+            "@read{i}/1\nACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTAAAAAAAAAAAAAAAA\n+\nIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII\n"
         ));
         r2_data.push_str(&format!(
-            "@read{i}/2\nTTTTTTTTTTTTTTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGT\n+\nIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII\n"
+            "@read{i}/2\nTTTTTTTTTTTTTTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGT\n+\nIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII\n"
         ));
     }
 
@@ -9060,7 +9061,7 @@ fn test_lenient_mode_integration() {
 @read1/1
 ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGT
 +
-IIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII
+IIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII
 ";
 
     // R2_rc with 7 differences spread after position 50
@@ -9068,7 +9069,7 @@ IIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII
 @read1/2
 ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACCTACCTACCT
 +
-IIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII
+IIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII
 ";
 
     let r1_path = temp_dir.path().join("lenient_r1.fq");
@@ -9313,7 +9314,7 @@ fn test_very_long_overlap_lenient_mode() {
 @read1/1
 ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGT
 +
-IIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII
+IIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII
 ";
 
     // R2_rc with 15 differences spread across the 120bp overlap
@@ -9321,7 +9322,7 @@ IIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII
 @read1/2
 ACGTTCGTTCGTTCGTTCGTTCGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGT
 +
-IIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII
+IIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII
 ";
 
     let r1_path = temp_dir.path().join("long_overlap_r1.fq");
@@ -9386,7 +9387,7 @@ fn test_mixed_overlapping_and_non_overlapping() {
             "@overlap_read{i}/2\n\
             TTTTTTTTTTTTTTTTTTTTTTGTGTGTGTGTGTGTGTGTGTGTGTGTGTGTGTGTGTGTGTGTGTGTGTACGT\n\
             +\n\
-            IIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII\n"
+            IIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII\n"
         ));
     }
 
@@ -9455,14 +9456,14 @@ fn test_overlap_with_polyg_trimming() {
 @read1/1
 ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGGGGGGGGGGGGGGGGGGGGGGGGGGGG
 +
-IIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII
+IIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII
 ";
 
     let r2_data = "\
 @read1/2
 TTTTTTTTTTTTTTTTTTTTTTGTGTGTGTGTGTGTGTGTGTGTGTGTGTGTGTGTGTGTGTGTGTGTGTACGTGGGG
 +
-IIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII
+IIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII
 ";
 
     let r1_path = temp_dir.path().join("polyg_r1.fq");
@@ -9526,7 +9527,7 @@ IIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII
 @read1/2
 TTTTTTTTTTTTTTTTTTTTTTGTGTGTGTGTGTGTGTGTGTGTGTGTGTGTGTGTGTGTGTGTGTGTGTACGT
 +
-IIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII
+IIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII
 ";
 
     let r1_path = temp_dir.path().join("length_filter_r1.fq");

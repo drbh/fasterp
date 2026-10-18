@@ -37,9 +37,9 @@ create_test_file() {
 echo ""
 echo "Downloading R1.fq from fastp repository for compatibility..."
 if command -v wget &> /dev/null; then
-    wget -q https://raw.githubusercontent.com/OpenGene/fastp/refs/heads/master/testdata/R1.fq
+    wget -q https://raw.githubusercontent.com/OpenGene/fastp/ee125a52fddae9d8189e13cd8a33ad04988a1351/testdata/R1.fq
 elif command -v curl &> /dev/null; then
-    curl -sL https://raw.githubusercontent.com/OpenGene/fastp/refs/heads/master/testdata/R1.fq -o R1.fq
+    curl -fsSL https://raw.githubusercontent.com/OpenGene/fastp/ee125a52fddae9d8189e13cd8a33ad04988a1351/testdata/R1.fq -o R1.fq
 else
     echo "Warning: Neither wget nor curl found. Skipping R1.fq download."
 fi

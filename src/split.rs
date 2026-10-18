@@ -52,6 +52,8 @@ pub struct SplitWriter {
     compression_level: u32,
     /// Use parallel compression
     parallel_compression: bool,
+    compression_threads: usize,
+    reads_per_file: Option<usize>,
 }
 
 impl SplitWriter {
@@ -62,6 +64,22 @@ impl SplitWriter {
         compression_level: u32,
         parallel_compression: bool,
     ) -> Result<Self> {
+        Self::new_with_compression_threads(
+            output_path,
+            config,
+            compression_level,
+            parallel_compression,
+            crate::gzip::threads_per_output(1),
+        )
+    }
+
+    pub(crate) fn new_with_compression_threads(
+        output_path: impl AsRef<Path>,
+        config: SplitConfig,
+        compression_level: u32,
+        parallel_compression: bool,
+        compression_threads: usize,
+    ) -> Result<Self> {
         let mut writer = Self {
             base_path: output_path.as_ref().to_path_buf(),
             current_file_num: 0,
@@ -70,6 +88,8 @@ impl SplitWriter {
             config,
             compression_level,
             parallel_compression,
+            compression_threads,
+            reads_per_file: None,
         };
 
         // For non-split mode or split-by-lines, open the first file immediately
@@ -78,6 +98,17 @@ impl SplitWriter {
         }
 
         Ok(writer)
+    }
+
+    /// Supply the input read count before writing in split-by-file-count mode.
+    pub fn set_total_reads(&mut self, total: usize) -> Result<()> {
+        if let SplitMode::ByFiles(n) = self.config.mode {
+            self.reads_per_file = Some((total / n).max(1));
+            if self.current_writer.is_none() {
+                self.open_next_file()?;
+            }
+        }
+        Ok(())
     }
 
     /// Generate the filename for a given file number
@@ -124,10 +155,11 @@ impl SplitWriter {
         let filename_str = filename
             .to_str()
             .ok_or_else(|| anyhow::anyhow!("Invalid filename path"))?;
-        let writer = crate::io::open_output(
+        let writer = crate::io::open_output_with_threads(
             filename_str,
             Some(self.compression_level),
             self.parallel_compression,
+            self.compression_threads,
         )?;
         self.current_writer = Some(writer);
 
@@ -138,9 +170,11 @@ impl SplitWriter {
     fn should_open_new_file(&self) -> bool {
         match &self.config.mode {
             SplitMode::None => false,
-            SplitMode::ByFiles(_num_files) => {
-                // TODO: Implement ByFiles mode (requires knowing total reads)
-                false
+            SplitMode::ByFiles(num_files) => {
+                self.current_file_num < *num_files
+                    && self
+                        .reads_per_file
+                        .is_some_and(|n| self.lines_in_current_file >= n.saturating_mul(4))
             }
             SplitMode::ByLines(max_lines) => {
                 // Open new file if we've reached the line limit
@@ -159,6 +193,11 @@ impl SplitWriter {
             }
             return Ok(());
         }
+
+        anyhow::ensure!(
+            !matches!(self.config.mode, SplitMode::ByFiles(_)) || self.reads_per_file.is_some(),
+            "Split by file count requires set_total_reads before writing"
+        );
 
         // Slow path: splitting enabled
         // Check if we need to open a new file
