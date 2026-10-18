@@ -1,6 +1,8 @@
 # fasterp
 
-High-performance FASTQ preprocessing in Rust. A drop-in replacement for [fastp](https://github.com/OpenGene/fastp) with blazing fast performance.
+fasterp is a Rust FASTQ preprocessor targeting the command-line interface and read-processing behavior of [fastp v1.4.0](https://github.com/OpenGene/fastp/releases/tag/v1.4.0).
+
+See the repository's [compatibility notes](https://github.com/drbh/fasterp/blob/main/COMPATIBILITY.md), [measured benchmarks](https://github.com/drbh/fasterp/blob/main/BENCHMARKS.md), and [contribution guide](https://github.com/drbh/fasterp/blob/main/CONTRIBUTING.md) for validation, reporting differences and reproduction commands.
 
 ## Installation
 
@@ -49,11 +51,11 @@ Copy-paste commands for common tasks:
 | **Paired-end + merge**      | `fasterp -i R1.fq -I R2.fq -o o1.fq -O o2.fq -m --merged-out merged.fq`   |
 | **Paired-end + correction** | `fasterp -i R1.fq -I R2.fq -o o1.fq -O o2.fq -c`                          |
 | **Fast (16 threads)**       | `fasterp -i in.fq -o out.fq -w 16`                                        |
-| **Memory-limited (4GB)**    | `fasterp -i in.fq -o out.fq --max-memory 4096`                            |
+| **Batch memory budget (4GB)**    | `fasterp -i in.fq -o out.fq --max-memory 4096`                            |
 | **Compressed in/out**       | `fasterp -i in.fq.gz -o out.fq.gz`                                        |
 | **Split into 10 files**     | `fasterp -i in.fq -o out.fq -s 10`                                        |
 | **Skip all filtering**      | `fasterp -i in.fq -o out.fq -A -G -Q -L`                                  |
-| **With UMI extraction**     | `fasterp -i in.fq -o out.fq --umi --umi-len 8`                            |
+| **With UMI extraction**     | `fasterp -i in.fq -o out.fq --umi --umi-loc read1 --umi-len 8`                            |
 | **Deduplicate**             | `fasterp -i in.fq -o out.fq -D`                                           |
 | **Custom report name**      | `fasterp -i in.fq -o out.fq -j report.json --html report.html`            |
 
@@ -101,12 +103,12 @@ FASTQ files contain sequence data as text. Each "read" is a short string of lett
 
 ### Length Filtering
 
-Reads that are too short often come from errors or failed sequencing. Think of it like filtering out incomplete sentences - if a read is shorter than your minimum threshold, it's probably not useful data and gets discarded.
+Discard reads shorter than `--length-required`. Use `--max-len1` and `--max-len2` to trim longer reads to a fixed length.
 
 | Flag | Long                      | Default | Description                                              |
 | ---- | ------------------------- | ------- | -------------------------------------------------------- |
 | `-l` | `--length-required`       | 15      | Minimum length required                                  |
-| `-L` | `--disable-length-filter` |         | Disable length filtering (fastp compatibility)           |
+| `-L` | `--disable-length-filtering` |         | Disable length filtering (fastp compatibility)           |
 | `-b` | `--max-len1`              | 0       | Maximum length for read1 - trim if longer (0 = disabled) |
 | `-B` | `--max-len2`              | 0       | Maximum length for read2 - trim if longer (0 = disabled) |
 
@@ -215,11 +217,11 @@ Sometimes the beginning or end of reads contain known bad data (like primer sequ
 
 ### Trimming - Quality Based
 
-Instead of cutting a fixed amount, this looks at actual quality scores and trims where the data gets bad. A sliding window moves along the read, checking average quality. When it drops below your threshold, everything past that point is cut off. It's like editing a document and stopping where the text becomes unreadable.
+Quality trimming uses a sliding window. Front and tail modes remove low-quality ends; right cutting removes the suffix from the first failing window.
 
 | Flag | Long                         | Default | Description                                               |
 | ---- | ---------------------------- | ------- | --------------------------------------------------------- |
-|      | `--cut-mean-quality`         | 0       | Quality cutoff for sliding-window trimming (0 = disabled) |
+|      | `--cut-mean-quality`         | 20      | Quality cutoff used when a quality-cutting mode is enabled |
 |      | `--cut-window-size`          | 4       | Sliding window size for quality trimming                  |
 |      | `--cut-front`                |         | Enable quality trimming at 5' end (front)                 |
 |      | `--cut-tail`                 |         | Enable quality trimming at 3' end (tail)                  |
@@ -253,7 +255,7 @@ Some sequencing machines produce false runs of the same letter (like "GGGGGGGG")
 |      | `--trim-poly-g`         |         | Enable polyG tail trimming                           |
 | `-G` | `--disable-trim-poly-g` |         | Disable polyG tail trimming                          |
 |      | `--trim-poly-x`         |         | Enable generic polyX tail trimming (any homopolymer) |
-|      | `--poly-g-min-len`      | 10      | Minimum length for polyG/polyX detection             |
+|      | `--poly-g-min-len`      | 10      | Minimum length for polyG detection             |
 
 <svg viewBox="0 0 500 130" xmlns="http://www.w3.org/2000/svg" style="display:block;margin:1em auto;max-width:500px;font-family:system-ui,sans-serif;font-size:14px">
   <!-- Before -->
@@ -305,7 +307,7 @@ Adapters are short synthetic sequences added during sample preparation - they're
 
 ### Paired-End Options
 
-Paired-end sequencing reads the same fragment from both ends, giving you two reads that overlap in the middle. When they overlap, you can compare them: if one says "A" with high confidence and the other says "T" with low confidence, you trust the "A". You can also merge overlapping pairs into a single, longer read. It's like having two people transcribe the same audio and combining their best parts.
+Overlapping mates can be corrected using their quality scores or merged into a single read.
 
 | Flag | Long                           | Default | Description                                          |
 | ---- | ------------------------------ | ------- | ---------------------------------------------------- |
@@ -345,15 +347,15 @@ Paired-end sequencing reads the same fragment from both ends, giving you two rea
 
 ### UMI Processing
 
-A UMI (Unique Molecular Identifier) is a short random tag added to each original molecule before copying. Since copies of the same molecule have the same UMI, you can later identify and remove duplicates that came from the same original. Think of it like adding a unique serial number to each document before photocopying - you can then tell which copies came from which original.
+A UMI tags the original molecule before amplification. These options extract it and add it to the read name for downstream analysis.
 
 | Flag | Long           | Default | Description                                                |
 | ---- | -------------- | ------- | ---------------------------------------------------------- |
 |      | `--umi`        |         | Enable UMI preprocessing                                   |
-|      | `--umi-loc`    | read1   | UMI location: read1/read2/index1/index2/per_read/per_index |
-|      | `--umi-len`    | 0       | UMI length (required when --umi is enabled)                |
-|      | `--umi-prefix` | UMI     | Prefix in read name for UMI                                |
-|      | `--umi-skip`   | 0       | Skip N bases before UMI                                    |
+|      | `--umi-loc`    | required | UMI location: read1/read2/index1/index2/per_read/per_index |
+|      | `--umi-len`    | 0       | UMI length (required for read locations)                |
+|      | `--umi-prefix` | none    | Prefix in read name for UMI                                |
+|      | `--umi-skip`   | 0       | Skip N bases following UMI                                    |
 
 <svg viewBox="0 0 500 130" xmlns="http://www.w3.org/2000/svg" style="display:block;margin:1em auto;max-width:500px;font-family:system-ui,sans-serif;font-size:14px">
   <!-- Before -->
@@ -374,7 +376,7 @@ A UMI (Unique Molecular Identifier) is a short random tag added to each original
 
 ### Deduplication
 
-During sample preparation, molecules get copied many times. Identical reads are likely copies of the same original, which can skew your analysis (like counting the same vote multiple times). Deduplication detects and removes these duplicates using a memory-efficient probabilistic filter. It estimates duplication rates without needing to store every read in memory.
+Deduplication uses a Bloom filter to detect repeated reads. Enable `--dedup` to discard them or leave duplication evaluation enabled to report their frequency.
 
 | Flag | Long                      | Default | Description                                         |
 | ---- | ------------------------- | ------- | --------------------------------------------------- |
@@ -458,21 +460,21 @@ fasterp generates detailed statistics about your data before and after processin
 
 ### Performance
 
-Control how fasterp uses your system resources. More threads = faster processing but more CPU/memory usage. The batch size affects memory consumption - larger batches are more efficient but use more RAM. Use `--max-memory` to set a limit and let fasterp auto-tune the other settings.
+Set the processing worker count, gzip compression and batch size below. `--max-memory` budgets processing batches; reports, adapter samples and profiling use additional memory.
 
 | Flag | Long                     | Default   | Description                              |
 | ---- | ------------------------ | --------- | ---------------------------------------- |
-| `-w` | `--thread`               | auto      | Number of worker threads                 |
-| `-z` | `--compression`          | 6         | Compression level for gzip output (0-9)  |
+| `-w` | `--thread`               | 3         | Number of worker threads                 |
+| `-z` | `--compression`          | 4         | Compression level for gzip output (1-9)  |
 |      | `--parallel-compression` | true      | Use parallel compression for gzip output |
 |      | `--batch-bytes`          | 33554432  | Batch size in bytes (32 MiB)             |
 |      | `--max-backlog`          | threads+1 | Maximum backlog of batches               |
-|      | `--max-memory`           |           | Maximum memory usage in MB               |
+|      | `--max-memory`           |           | Processing batch memory budget in MB (excludes profiling)               |
 |      | `--skip-kmer-counting`   |           | Skip k-mer counting for performance      |
 
 ## Architecture
 
-fasterp processes data in a pipeline with three stages running in parallel. The Producer reads chunks from disk. Multiple Workers process those chunks simultaneously (filtering, trimming, counting). The Merger collects results in order and writes output. This design keeps all CPU cores busy while maintaining correct output order.
+Input, processing and output overlap while results stay in input order. The native compatibility path also has an ordered duplication stage.
 
 <svg viewBox="0 0 650 160" xmlns="http://www.w3.org/2000/svg" style="display:block;margin:1em auto;max-width:650px;font-family:system-ui,sans-serif;font-size:12px">
   <defs>
@@ -484,7 +486,7 @@ fasterp processes data in a pipeline with three stages running in parallel. The 
   <rect x="20" y="35" width="120" height="80" rx="8" fill="#dbeafe" stroke="#2563eb" stroke-width="2"/>
   <text x="80" y="60" text-anchor="middle" font-weight="700" fill="#1e40af">Producer</text>
   <text x="80" y="80" text-anchor="middle" font-size="10" fill="#1e40af">Read &amp; Parse</text>
-  <text x="80" y="95" text-anchor="middle" font-size="10" fill="#1e40af">32MB batches</text>
+  <text x="80" y="95" text-anchor="middle" font-size="10" fill="#1e40af">Bounded batches</text>
   <!-- Arrows to workers -->
   <line x1="140" y1="55" x2="190" y2="35" stroke="#333" stroke-width="2" marker-end="url(#a6)"/>
   <line x1="140" y1="75" x2="190" y2="75" stroke="#333" stroke-width="2" marker-end="url(#a6)"/>
@@ -516,7 +518,7 @@ fasterp processes data in a pipeline with three stages running in parallel. The 
 
 fasterp uses a 3-stage pipeline for multi-threaded processing:
 
-1. **Producer**: Reads input in 32MB batches, parses FASTQ records
+1. **Producer**: Reads input in Bounded batches, parses FASTQ records
 2. **Workers**: Process batches in parallel (filtering, trimming, stats)
 3. **Merger**: Writes output in order, aggregates statistics
 
@@ -565,7 +567,7 @@ fasterp -i input.fq -o output.fq \
 
 ## Comparison with fastp
 
-fasterp produces byte-exact output for standard parameters:
+The native CLI targets fastp v1.4.0. Read output and report metrics are checked against that pinned release using deterministic fixtures. For example:
 
 ```bash
 fastp -i input.fq -o fastp_out.fq
