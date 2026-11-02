@@ -1826,7 +1826,7 @@ fn test_json_report_structure() {
 
     // Check summary fields
     let summary = &json["summary"];
-    assert!(summary.get("fastp_version").is_some());
+    assert!(summary.get("fasterp_version").is_some());
     assert!(summary.get("before_filtering").is_some());
     assert!(summary.get("after_filtering").is_some());
 
