@@ -291,7 +291,7 @@ impl PositionStats {
 }
 
 /// Simple stats accumulator
-#[derive(Clone, Default)]
+#[derive(Default)]
 pub(crate) struct SimpleStats {
     pub total_reads: usize,
     pub total_bases: usize,
