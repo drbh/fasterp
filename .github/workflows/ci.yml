@@ -11,6 +11,12 @@ jobs:
   test-and-build:
     runs-on: ubuntu-24.04
 
+    env:
+      # .cargo/config.toml sets target-cpu=native for local builds. target/ is
+      # cached across runners with different cpus, so build portable code here
+      # (same as the release binaries, simd.rs picks avx2 at runtime)
+      RUSTFLAGS: ''
+
     permissions:
       contents: read
       pages: write
@@ -38,7 +44,7 @@ jobs:
           ~/.cargo/git/db/
           target/
           ~/.rustup/toolchains/*/lib/rustlib/wasm32-unknown-unknown/
-        key: ${{ runner.os }}-cargo-wasm-${{ hashFiles('**/Cargo.lock') }}-v2
+        key: ${{ runner.os }}-cargo-wasm-${{ hashFiles('**/Cargo.lock') }}-v3
 
     - name: Cache test data
       uses: actions/cache@v4
