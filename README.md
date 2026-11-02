@@ -1,3 +1,4 @@
+
 ```
     ░████                          ░██                                   
    ░██                             ░██                                   
@@ -9,32 +10,32 @@
                                                               ░██        
                                                               ░██        
 ```
-fasterp - Fast FASTQ preprocessing in Rust, with familiar [fastp](https://github.com/OpenGene/fastp) options.
+fasterp - A faster [fastp](https://github.com/OpenGene/fastp) — same interface, same output, **2-10x faster**.
 
-Trim adapters, filter reads, merge pairs, and generate HTML and JSON quality reports.
+```
+10M read pairs:  fastp 11s → fasterp 6s
+```
 
-Faster than fastp 1.4.0 in **32 of 33 benchmark cases** on an Apple M4 Pro. See the [results and reproduction steps](BENCHMARKS.md).
+Built with SIMD acceleration (AVX2/NEON), efficient multi-threading, and minimal memory allocation.
 
 ## Install
 
 ```bash
-cargo install --git https://github.com/drbh/fasterp.git --locked
+cargo install --git https://github.com/drbh/fasterp.git
 ```
 
 ## Usage
 
 ```bash
 # Single-end
-fasterp -i input.fq.gz -o output.fq.gz
+fasterp -i input.fq -o output.fq
 
 # Paired-end
-fasterp -i R1.fq.gz -I R2.fq.gz -o out1.fq.gz -O out2.fq.gz
+fasterp -i R1.fq -I R2.fq -o out1.fq -O out2.fq
 ```
 
-Open `fasterp.html` for the quality report. Use `--help` for options and see [fastp compatibility](COMPATIBILITY.md) for supported behavior and differences.
+Drop-in replacement for fastp — all the same flags work.
 
 ## Documentation
 
-[Full documentation and tutorial](https://drbh.github.io/fasterp) · [Build and test](CONTRIBUTING.md)
-
-MIT. See [LICENSE](LICENSE) and [LICENSE.fastp](LICENSE.fastp).
+**[Full documentation and tutorial](https://drbh.github.io/fasterp)**

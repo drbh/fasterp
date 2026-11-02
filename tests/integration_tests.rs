@@ -3351,7 +3351,6 @@ fn test_extreme_quality_filter_with_adapters() {
 }
 
 #[test]
-#[ignore = "single-end adapter trimming differs from fastp 1.4.0 until the compat engine in #8"]
 fn test_extreme_quality_filter_with_adapters_med() {
     // Stress test: very strict quality filter + adapter trimming
     let temp_dir = TempDir::new().unwrap();
