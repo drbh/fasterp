@@ -1,2 +1,0 @@
-# Keep machine-generated benchmark evidence available without obscuring code review.
-benchmarks/*.json linguist-generated=true

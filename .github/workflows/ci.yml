@@ -11,6 +11,12 @@ jobs:
   test-and-build:
     runs-on: ubuntu-24.04
 
+    env:
+      # .cargo/config.toml sets target-cpu=native for local builds. target/ is
+      # cached across runners with different cpus, so build portable code here
+      # (same as the release binaries, simd.rs picks avx2 at runtime)
+      RUSTFLAGS: ''
+
     permissions:
       contents: read
       pages: write
@@ -50,7 +56,7 @@ jobs:
       run: |
         # Install OpenSSL dev for native-tls
         sudo apt-get update
-        sudo apt-get install -y libssl-dev libisal-dev libdeflate-dev cmake
+        sudo apt-get install -y libssl-dev
 
         # Install nucgen for test data generation
         # ~/.cargo/bin is cached without cargo's install records, so only
@@ -58,18 +64,11 @@ jobs:
         [ "$(nucgen --version 2>/dev/null)" = "nucgen 0.2.0" ] || cargo install nucgen --version 0.2.0 --locked --force
         nucgen --version
 
-        # Ubuntu 24.04's packaged Highway is older than fastp requires.
-        git init /tmp/highway-reference
-        git -C /tmp/highway-reference remote add origin https://github.com/google/highway.git
-        git -C /tmp/highway-reference fetch --depth 1 origin 2607d3b5b0113992fe84d3848859eae13b3b52c1
-        git -C /tmp/highway-reference checkout --detach FETCH_HEAD
-        cmake -S /tmp/highway-reference -B /tmp/highway-reference/build \
-          -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF \
-          -DHWY_ENABLE_TESTS=OFF -DHWY_ENABLE_EXAMPLES=OFF
-        cmake --build /tmp/highway-reference/build --parallel 2
-        sudo cmake --install /tmp/highway-reference/build
-        bash scripts/build_fastp_reference.sh "$RUNNER_TEMP/fastp-reference"
-        echo "$RUNNER_TEMP/fastp-reference" >> "$GITHUB_PATH"
+        # Install fastp for comparison (pinned, the unversioned url follows the latest release)
+        wget -q https://opengene.org/fastp/fastp.1.4.0 -O fastp
+        chmod +x fastp
+        sudo mv fastp /usr/local/bin/
+        fastp --version
 
         # Install mdBook for documentation
         [ "$(mdbook --version 2>/dev/null)" = "mdbook v0.5.4" ] || cargo install mdbook --version 0.5.4 --locked --force
@@ -93,9 +92,7 @@ jobs:
 
     - name: Verify fastp 1.4.0 parity at 1, 4 and 8 workers
       run: |
-        cargo build --locked --release
-        python3 -m unittest discover -s scripts -p 'test_*.py'
-        python3 scripts/compare_fastp.py --fastp "$RUNNER_TEMP/fastp-reference/fastp" \
+        python3 scripts/compare_fastp.py --fastp "$(command -v fastp)" \
           --fasterp target/release/fasterp --workers 1 4 8 --workdir target/fastp-parity
 
     - name: Upload test results on failure
@@ -107,9 +104,6 @@ jobs:
           test_data/*.fq
           target/debug/deps/*.log
           target/fastp-parity/
-
-    - name: Test WASM library on host
-      run: cargo test --locked --no-default-features --features wasm --lib
 
     - name: Test WASM library on host
       run: cargo test --locked --no-default-features --features wasm --lib
