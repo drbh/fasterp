@@ -12,6 +12,11 @@ readme = "README.md"
 repository = "https://github.com/drbh/fasterp"
 version = "0.2.1"
 
+[[bin]]
+name = "fasterp"
+path = "src/main.rs"
+required-features = ["native"]
+
 [features]
 default = ["native"]
 native = [
