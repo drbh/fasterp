@@ -447,7 +447,11 @@ fn write_summary(html: &mut String, report: &FasterpReport, elapsed: Duration) {
     html.push_str("<h2>Summary</h2>\n");
     html.push_str("<table>\n");
 
-    add_row(html, "fasterp version", &report.summary.fasterp_version);
+    add_row(
+        html,
+        "fasterp version",
+        &report.summary.fasterp_version,
+    );
     add_row(html, "sequencing", &report.summary.sequencing);
 
     // Format runtime
