@@ -53,7 +53,9 @@ jobs:
         sudo apt-get install -y libssl-dev
 
         # Install nucgen for test data generation
-        cargo install nucgen --version 0.2.0 --locked
+        # ~/.cargo/bin is cached without cargo's install records, so only
+        # install (with --force) when the cached binary is not the pinned version
+        [ "$(nucgen --version 2>/dev/null)" = "nucgen 0.2.0" ] || cargo install nucgen --version 0.2.0 --locked --force
         nucgen --version
 
         # Install fastp for comparison (pinned, the unversioned url follows the latest release)
@@ -63,7 +65,7 @@ jobs:
         fastp --version
 
         # Install mdBook for documentation
-        cargo install mdbook --version 0.5.4 --locked
+        [ "$(mdbook --version 2>/dev/null)" = "mdbook v0.5.4" ] || cargo install mdbook --version 0.5.4 --locked --force
         mdbook --version
 
     - name: Generate test data
@@ -97,7 +99,7 @@ jobs:
     - name: Build WASM for playground
       run: |
         # Install wasm-bindgen-cli (matching version in Cargo.toml)
-        cargo install wasm-bindgen-cli --version 0.2.92 --force
+        [ "$(wasm-bindgen --version 2>/dev/null)" = "wasm-bindgen 0.2.92" ] || cargo install wasm-bindgen-cli --version 0.2.92 --force
 
         # Build WASM
         RUSTFLAGS='' cargo build --locked --target wasm32-unknown-unknown --no-default-features --features wasm --lib --release
