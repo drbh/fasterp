@@ -23,6 +23,10 @@ jobs:
       uses: dtolnay/rust-toolchain@stable
       with:
         targets: wasm32-unknown-unknown
+        components: rustfmt
+
+    - name: Check formatting
+      run: cargo fmt --check
 
     - name: Cache cargo dependencies
       uses: actions/cache@v4
@@ -49,17 +53,17 @@ jobs:
         sudo apt-get install -y libssl-dev
 
         # Install nucgen for test data generation
-        cargo install nucgen --force
+        cargo install nucgen --version 0.2.0 --locked
         nucgen --version
 
-        # Install fastp for comparison
-        wget http://opengene.org/fastp/fastp
+        # Install fastp for comparison (pinned, the unversioned url follows the latest release)
+        wget -q https://opengene.org/fastp/fastp.1.4.0 -O fastp
         chmod +x fastp
         sudo mv fastp /usr/local/bin/
         fastp --version
 
         # Install mdBook for documentation
-        cargo install mdbook --force
+        cargo install mdbook --version 0.5.4 --locked
         mdbook --version
 
     - name: Generate test data
