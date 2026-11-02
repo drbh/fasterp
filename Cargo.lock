@@ -1089,6 +1089,7 @@ dependencies = [
  "assert_cmd",
  "aws-config",
  "aws-sdk-s3",
+ "bytes",
  "clap",
  "criterion",
  "crossbeam-channel",

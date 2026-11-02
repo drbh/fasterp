@@ -204,8 +204,8 @@ pub fn process_single_end(input: &[u8], config: &WasmConfig) -> Result<WasmProce
     let reader: Box<dyn std::io::BufRead> =
         if input.len() >= 2 && input[0] == 0x1f && input[1] == 0x8b {
             // Gzip compressed
-            use flate2::read::GzDecoder;
-            let decoder = GzDecoder::new(Cursor::new(input));
+            use flate2::read::MultiGzDecoder;
+            let decoder = MultiGzDecoder::new(Cursor::new(input));
             Box::new(std::io::BufReader::new(decoder))
         } else {
             // Plain text
@@ -312,8 +312,8 @@ pub fn process_paired_end(
     // Detect if inputs are gzip compressed
     let reader1: Box<dyn std::io::BufRead> =
         if input1.len() >= 2 && input1[0] == 0x1f && input1[1] == 0x8b {
-            use flate2::read::GzDecoder;
-            let decoder = GzDecoder::new(Cursor::new(input1));
+            use flate2::read::MultiGzDecoder;
+            let decoder = MultiGzDecoder::new(Cursor::new(input1));
             Box::new(std::io::BufReader::new(decoder))
         } else {
             Box::new(std::io::BufReader::new(Cursor::new(input1)))
@@ -321,8 +321,8 @@ pub fn process_paired_end(
 
     let reader2: Box<dyn std::io::BufRead> =
         if input2.len() >= 2 && input2[0] == 0x1f && input2[1] == 0x8b {
-            use flate2::read::GzDecoder;
-            let decoder = GzDecoder::new(Cursor::new(input2));
+            use flate2::read::MultiGzDecoder;
+            let decoder = MultiGzDecoder::new(Cursor::new(input2));
             Box::new(std::io::BufReader::new(decoder))
         } else {
             Box::new(std::io::BufReader::new(Cursor::new(input2)))
@@ -476,4 +476,89 @@ impl WasmPairedResult {
 #[wasm_bindgen]
 pub fn version() -> String {
     env!("CARGO_PKG_VERSION").to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use flate2::{write::GzEncoder, Compression};
+    use std::io::Write;
+
+    const READ1: &[u8] = b"@read1\nACGTACGTACGTACGTACGT\n+\nIIIIIIIIIIIIIIIIIIII\n";
+    const READ2: &[u8] = b"@read2\nTGCATGCATGCATGCATGCA\n+\nIIIIIIIIIIIIIIIIIIII\n";
+
+    fn gzip_members(parts: &[&[u8]]) -> Vec<u8> {
+        let mut compressed = Vec::new();
+        for part in parts {
+            let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+            encoder.write_all(part).unwrap();
+            compressed.extend(encoder.finish().unwrap());
+        }
+        compressed
+    }
+
+    #[test]
+    fn single_end_plain_and_single_member_gzip() {
+        let expected = [READ1, READ2].concat();
+        for input in [expected.clone(), gzip_members(&[&expected])] {
+            let result = process_single_end(&input, &WasmConfig::new()).unwrap();
+            assert_eq!(result.passed_reads(), 2);
+            assert_eq!(result.failed_reads(), 0);
+            assert_eq!(result.output(), expected);
+        }
+    }
+
+    #[test]
+    fn single_end_concatenated_gzip_members() {
+        let input = gzip_members(&[READ1, b"", READ2]);
+        let result = process_single_end(&input, &WasmConfig::new()).unwrap();
+        assert_eq!(result.passed_reads(), 2);
+        assert_eq!(result.failed_reads(), 0);
+        assert_eq!(result.output(), [READ1, READ2].concat());
+    }
+
+    #[test]
+    fn gzip_member_boundaries_can_split_fastq_records() {
+        let expected = [READ1, READ2].concat();
+        for split in 1..expected.len() {
+            let input = gzip_members(&[&expected[..split], b"", &expected[split..]]);
+            let result = process_single_end(&input, &WasmConfig::new()).unwrap();
+            assert_eq!(result.passed_reads(), 2, "split={split}");
+            assert_eq!(result.output(), expected, "split={split}");
+        }
+    }
+
+    #[test]
+    fn single_end_empty_first_gzip_member() {
+        let input = gzip_members(&[b"", READ1, READ2]);
+        let result = process_single_end(&input, &WasmConfig::new()).unwrap();
+        assert_eq!(result.passed_reads(), 2);
+        assert_eq!(result.failed_reads(), 0);
+        assert_eq!(result.output(), [READ1, READ2].concat());
+    }
+
+    #[test]
+    fn paired_end_plain_single_and_concatenated_gzip_members() {
+        let expected1 = [READ1, READ2].concat();
+        let expected2 = [READ2, READ1].concat();
+        let inputs1 = [
+            gzip_members(&[READ1, b"", READ2]),
+            expected1.clone(),
+            gzip_members(&[&expected1]),
+        ];
+        let inputs2 = [
+            gzip_members(&[READ2, b"", READ1]),
+            expected2.clone(),
+            gzip_members(&[&expected2]),
+        ];
+        for input1 in &inputs1 {
+            for input2 in &inputs2 {
+                let result = process_paired_end(input1, input2, &WasmConfig::new()).unwrap();
+                assert_eq!(result.passed_reads(), 4);
+                assert_eq!(result.failed_reads(), 0);
+                assert_eq!(result.output1(), expected1);
+                assert_eq!(result.output2(), expected2);
+            }
+        }
+    }
 }

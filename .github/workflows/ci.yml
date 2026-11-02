@@ -91,6 +91,9 @@ jobs:
           test_data/*.fq
           target/debug/deps/*.log
 
+    - name: Test WASM library on host
+      run: cargo test --locked --no-default-features --features wasm --lib
+
     - name: Build WASM for playground
       run: |
         # Install wasm-bindgen-cli (matching version in Cargo.toml)

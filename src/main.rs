@@ -21,6 +21,7 @@ use std::thread;
 mod adapter;
 mod bloom;
 mod dedup;
+mod gzip;
 mod html;
 mod io;
 mod kmer;
