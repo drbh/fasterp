@@ -1,3 +1,4 @@
+//! Matching semantics updated against OpenGene/fastp v1.4.0; see LICENSE.fastp.
 //! Base correction using paired-end overlap analysis
 //!
 //! This module implements overlap detection and base correction for paired-end reads.
@@ -6,51 +7,8 @@
 //! which base is correct.
 
 /// Quality score thresholds for base correction
-const GOOD_QUAL: u8 = 30; // Q30 - high confidence base
-const BAD_QUAL: u8 = 14; // Q14 - low confidence base
-
-/// Quick inline SIMD check of first 16 bytes - returns mismatch count
-/// This avoids function call overhead for obviously bad offsets
-#[cfg(target_arch = "aarch64")]
-#[inline(always)]
-unsafe fn quick_mismatch_check_16(ptr1: *const u8, ptr2: *const u8) -> usize {
-    use std::arch::aarch64::{vaddlvq_u8, vceqq_u8, vld1q_u8, vshrq_n_u8};
-    unsafe {
-        let v1 = vld1q_u8(ptr1);
-        let v2 = vld1q_u8(ptr2);
-        let eq = vceqq_u8(v1, v2);
-        let shifted = vshrq_n_u8(eq, 7);
-        let equals = vaddlvq_u8(shifted) as usize;
-        16 - equals
-    }
-}
-
-#[cfg(target_arch = "x86_64")]
-#[inline(always)]
-unsafe fn quick_mismatch_check_16(ptr1: *const u8, ptr2: *const u8) -> usize {
-    use std::arch::x86_64::{_mm_cmpeq_epi8, _mm_loadu_si128, _mm_movemask_epi8};
-    unsafe {
-        let v1 = _mm_loadu_si128(ptr1 as *const _);
-        let v2 = _mm_loadu_si128(ptr2 as *const _);
-        let eq = _mm_cmpeq_epi8(v1, v2);
-        let mask = _mm_movemask_epi8(eq) as u32;
-        16 - mask.count_ones() as usize
-    }
-}
-
-#[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
-#[inline(always)]
-unsafe fn quick_mismatch_check_16(ptr1: *const u8, ptr2: *const u8) -> usize {
-    unsafe {
-        let mut mismatches = 0;
-        for i in 0..16 {
-            if *ptr1.add(i) != *ptr2.add(i) {
-                mismatches += 1;
-            }
-        }
-        mismatches
-    }
-}
+const GOOD_QUAL: u8 = 33 + 30; // Q30 - high confidence base
+const BAD_QUAL: u8 = 33 + 14; // Q14 - low confidence base
 
 /// Result of overlap analysis between paired-end reads
 #[derive(Debug, Clone)]
@@ -116,25 +74,6 @@ pub fn reverse_complement(seq: &[u8]) -> Vec<u8> {
     seq.iter().rev().map(|&b| complement_base(b)).collect()
 }
 
-// LUT is faster than match - no branch misprediction
-static RC_LUT: [u8; 256] = {
-    let mut lut = [0u8; 256];
-    let mut i = 0;
-    while i < 256 {
-        lut[i] = i as u8;
-        i += 1;
-    }
-    lut[b'A' as usize] = b'T';
-    lut[b'T' as usize] = b'A';
-    lut[b'C' as usize] = b'G';
-    lut[b'G' as usize] = b'C';
-    lut[b'N' as usize] = b'N';
-    lut
-};
-
-// Max read length we support on stack. 512bp covers all standard Illumina reads.
-const MAX_READ_LEN: usize = 512;
-
 /// Detect overlap between R1 and reverse-complement of R2
 ///
 /// This function tries different offset positions to find where R1 and `R2_rc`
@@ -144,151 +83,49 @@ pub fn detect_overlap(
     r2_seq: &[u8],
     config: &OverlapConfig,
 ) -> Option<OverlapResult> {
+    detect_overlap_reusing(r1_seq, r2_seq, config, &mut Vec::new())
+}
+
+/// Same overlap search with worker-owned reverse-complement storage.
+/// Reusing capacity avoids an allocation for every input pair.
+pub(crate) fn detect_overlap_reusing(
+    r1_seq: &[u8],
+    r2_seq: &[u8],
+    config: &OverlapConfig,
+    rc: &mut Vec<u8>,
+) -> Option<OverlapResult> {
     if r1_seq.is_empty() || r2_seq.is_empty() {
         return None;
     }
-
-    const COMPLETE_COMPARE_REQUIRE: usize = 50;
-
-    // Stack-allocated buffer - no heap, no TLS overhead
-    let r2_len = r2_seq.len();
-    let r1_len = r1_seq.len();
-
-    // Use stack for normal reads, Vec for unusually long ones
-    let mut stack_buf = [0u8; MAX_READ_LEN];
-    let heap_buf: Vec<u8>;
-
-    let r2_rc: &[u8] = if r2_len <= MAX_READ_LEN {
-        for (i, &b) in r2_seq.iter().rev().enumerate() {
-            stack_buf[i] = RC_LUT[b as usize];
-        }
-        &stack_buf[..r2_len]
-    } else {
-        heap_buf = r2_seq.iter().rev().map(|&b| RC_LUT[b as usize]).collect();
-        &heap_buf
-    };
-
-    // Try different offset positions
-    // IMPORTANT: Fastp returns the FIRST valid overlap it finds, not the best one.
-    // This means it searches forward offsets first (0, 1, 2, ...) and returns immediately
-    // when a valid overlap is found, without checking if there might be a better one later.
-
-    // Try offsets where R1 starts before R2_rc (R1 extends past R2) - FORWARD SCAN
-    // We must check these FIRST and return immediately to match fastp's behavior
-    for offset in 0..r1_len {
-        let overlap_len = std::cmp::min(r1_len - offset, r2_len);
-
-        // INTENTIONALLY match fastp's off-by-one bug (overlapanalysis.cpp:32)
-        // Fastp uses `while (offset < len1-overlapRequire)` which excludes the boundary case
-        // where overlap_len would equal exactly min_overlap_len.
-        // This causes fastp to miss overlaps at offset = (read_length - min_overlap_length).
-        // See fastp_offset_bug_analysis.md for detailed explanation.
-        if overlap_len <= config.min_overlap_len {
+    rc.clear();
+    rc.extend(r2_seq.iter().rev().map(|&b| complement_base(b)));
+    let forward = (0..r1_seq.len().saturating_sub(config.min_overlap_len)).map(|n| n as isize);
+    let reverse = (0..r2_seq.len().saturating_sub(config.min_overlap_len)).map(|n| -(n as isize));
+    for offset in forward.chain(reverse) {
+        let start1 = offset.max(0) as usize;
+        let start2 = (-offset).max(0) as usize;
+        let len = (r1_seq.len() - start1).min(rc.len() - start2);
+        let a = &r1_seq[start1..start1 + len];
+        let b = &rc[start2..start2 + len];
+        let limit = config.max_diff.min(len * config.max_diff_percent / 100);
+        let protected = len.min(50);
+        // fastp 1.3.x protects the first 50 bases, then counts every remaining
+        // mismatch for correction/reporting, even when the total exceeds limit.
+        let (prefix, _) =
+            crate::simd::count_mismatches(&a[..protected], &b[..protected], limit, protected);
+        if prefix > limit {
             continue;
         }
-
-        // Count differences with early termination (fastp's logic)
-        let overlap_diff_limit = std::cmp::min(
-            config.max_diff,
-            (overlap_len * config.max_diff_percent) / 100,
-        );
-
-        // Quick prefix filter: check first 16 bytes inline to skip obviously bad offsets
-        // This avoids function call overhead for ~80-90% of offsets
-        if overlap_len >= 16 {
-            let first_mismatches =
-                unsafe { quick_mismatch_check_16(r1_seq[offset..].as_ptr(), r2_rc.as_ptr()) };
-            // If first 16 bytes already exceed limit, skip this offset
-            // (early termination would reject it anyway)
-            if first_mismatches > overlap_diff_limit {
-                continue;
-            }
-        }
-
-        // Use SIMD-accelerated mismatch counting
-        let (differences, i) = crate::simd::count_mismatches(
-            &r1_seq[offset..offset + overlap_len],
-            &r2_rc[..overlap_len],
-            overlap_diff_limit,
-            COMPLETE_COMPARE_REQUIRE,
-        );
-
-        // Check if overlap meets criteria
-        // Fastp's logic: accept if either:
-        // 1. Within calculated overlap-specific limits
-        // 2. OR we compared all bases in a long overlap (i > 50)
-        let within_strict_limits = differences <= overlap_diff_limit;
-        let completed_long_overlap = i > COMPLETE_COMPARE_REQUIRE;
-
-        if within_strict_limits || completed_long_overlap {
-            // MATCH FASTP: Return the FIRST valid overlap immediately
-            // Do NOT continue searching for better overlaps
-            return Some(OverlapResult {
-                overlapped: true,
-                offset: offset as isize,
-                overlap_len,
-                diff: differences,
-            });
-        }
+        let (tail, _) =
+            crate::simd::count_mismatches(&a[protected..], &b[protected..], usize::MAX, 0);
+        let diff = prefix + tail;
+        return Some(OverlapResult {
+            overlapped: true,
+            offset,
+            overlap_len: len,
+            diff,
+        });
     }
-
-    // Try offsets where R2_rc starts before R1 (R2 extends past R1)
-    for offset in 1..r2_len {
-        let overlap_len = std::cmp::min(r2_len - offset, r1_len);
-
-        // INTENTIONALLY match fastp's off-by-one bug (overlapanalysis.cpp:67)
-        // Fastp uses `while (offset > -(len2-overlapRequire))` which excludes the boundary case
-        // where overlap_len would equal exactly min_overlap_len.
-        // This causes fastp to miss overlaps at offset = -(read_length - min_overlap_length).
-        // See fastp_offset_bug_analysis.md for detailed explanation.
-        if overlap_len <= config.min_overlap_len {
-            continue;
-        }
-
-        // Count differences with early termination (fastp's logic)
-        let overlap_diff_limit = std::cmp::min(
-            config.max_diff,
-            (overlap_len * config.max_diff_percent) / 100,
-        );
-
-        // Quick prefix filter: check first 16 bytes inline to skip obviously bad offsets
-        // This avoids function call overhead for ~80-90% of offsets
-        if overlap_len >= 16 {
-            let first_mismatches =
-                unsafe { quick_mismatch_check_16(r1_seq.as_ptr(), r2_rc[offset..].as_ptr()) };
-            // If first 16 bytes already exceed limit, skip this offset
-            // (early termination would reject it anyway)
-            if first_mismatches > overlap_diff_limit {
-                continue;
-            }
-        }
-
-        // Use SIMD-accelerated mismatch counting
-        let (differences, i) = crate::simd::count_mismatches(
-            &r1_seq[..overlap_len],
-            &r2_rc[offset..offset + overlap_len],
-            overlap_diff_limit,
-            COMPLETE_COMPARE_REQUIRE,
-        );
-
-        // Check if overlap meets criteria
-        // Same lenient logic for long overlaps
-        let within_strict_limits = differences <= overlap_diff_limit;
-        let completed_long_overlap = i > COMPLETE_COMPARE_REQUIRE;
-
-        if within_strict_limits || completed_long_overlap {
-            // MATCH FASTP: Return the FIRST valid overlap immediately
-            // Do NOT continue searching for better overlaps
-            return Some(OverlapResult {
-                overlapped: true,
-                offset: -(offset as isize),
-                overlap_len,
-                diff: differences,
-            });
-        }
-    }
-
-    // No valid overlap found
     None
 }
 
@@ -408,71 +245,93 @@ pub fn merge_reads(
     r2_qual: &[u8],
     overlap: &OverlapResult,
 ) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
-    // Reverse complement R2
-    let r2_rc = reverse_complement(r2_seq);
-    let r2_qual_rc: Vec<u8> = r2_qual.iter().rev().copied().collect();
-
-    let (merged_seq, merged_qual, len1, len2) = if overlap.offset >= 0 {
-        // R1 extends past R2
-        // merged = R1[0..len1] + R2_rc[overlap_len..]
-        let len1 = (overlap.offset as usize) + overlap.overlap_len;
-        let len2 = r2_rc.len().saturating_sub(overlap.overlap_len);
-
-        let mut seq = r1_seq[..len1].to_vec();
-        if len2 > 0 {
-            seq.extend_from_slice(&r2_rc[overlap.overlap_len..]);
-        }
-
-        let mut qual = r1_qual[..len1].to_vec();
-        if len2 > 0 {
-            qual.extend_from_slice(&r2_qual_rc[overlap.overlap_len..]);
-        }
-
-        (seq, qual, len1, len2)
+    let len1 = overlap.overlap_len + overlap.offset.max(0) as usize;
+    let len2 = if overlap.offset > 0 {
+        r2_seq.len() - overlap.overlap_len
     } else {
-        // R2 extends past R1
-        // merged = R2_rc[0..-offset] + R1[0..]
-        let offset_abs = (-overlap.offset) as usize;
-        let len2 = offset_abs;
-        let len1 = r1_seq.len();
-
-        let mut seq = r2_rc[..offset_abs].to_vec();
-        seq.extend_from_slice(r1_seq);
-
-        let mut qual = r2_qual_rc[..offset_abs].to_vec();
-        qual.extend_from_slice(r1_qual);
-
-        (seq, qual, len1, len2)
+        0
     };
-
-    // Build header: @READNAME merged_150_15 rest
-    let mut merged_header = Vec::with_capacity(r1_header.len() + 32);
-
-    // Copy until first space or end
-    let space_pos = r1_header
-        .iter()
-        .position(|&b| b == b' ')
-        .unwrap_or(r1_header.len());
-    merged_header.extend_from_slice(&r1_header[..space_pos]);
-
-    // Add merge tag
-    merged_header.extend_from_slice(b" merged_");
-    merged_header.extend_from_slice(len1.to_string().as_bytes());
-    merged_header.push(b'_');
-    merged_header.extend_from_slice(len2.to_string().as_bytes());
-
-    // Add rest of header if any
-    if space_pos < r1_header.len() {
-        merged_header.push(b' ');
-        merged_header.extend_from_slice(&r1_header[space_pos + 1..]);
+    let mut seq = r1_seq[..len1].to_vec();
+    let mut qual = r1_qual[..len1].to_vec();
+    if overlap.offset > 0 {
+        let rc = reverse_complement(r2_seq);
+        seq.extend_from_slice(&rc[overlap.overlap_len..]);
+        qual.extend(r2_qual.iter().rev().skip(overlap.overlap_len).copied());
     }
-
-    (merged_header, merged_seq, merged_qual)
+    let mut name = r1_header.to_vec();
+    name.extend_from_slice(format!(" merged_{len1}_{len2}").as_bytes());
+    (name, seq, qual)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bounded_overlap_matches_scalar_reference() {
+        use rand::{rngs::StdRng, Rng, SeedableRng};
+
+        fn scalar(r1: &[u8], r2: &[u8], config: &OverlapConfig) -> Option<(isize, usize, usize)> {
+            let rc = reverse_complement(r2);
+            let offsets = (0..r1.len().saturating_sub(config.min_overlap_len))
+                .map(|n| n as isize)
+                .chain((0..r2.len().saturating_sub(config.min_overlap_len)).map(|n| -(n as isize)));
+            for offset in offsets {
+                let a = &r1[offset.max(0) as usize..];
+                let b = &rc[(-offset).max(0) as usize..];
+                let len = a.len().min(b.len());
+                let limit = config.max_diff.min(len * config.max_diff_percent / 100);
+                let protected = len.min(50);
+                let prefix = a[..protected]
+                    .iter()
+                    .zip(&b[..protected])
+                    .filter(|(x, y)| x != y)
+                    .count();
+                if prefix <= limit {
+                    let diff = a.iter().zip(b).filter(|(x, y)| x != y).count();
+                    return Some((offset, len, diff));
+                }
+            }
+            None
+        }
+
+        let mut rng = StdRng::seed_from_u64(140);
+        for case in 0..2000 {
+            let dna: Vec<u8> = (0..600).map(|_| b"ACGT"[rng.gen_range(0..4)]).collect();
+            let len1 = rng.gen_range(1..=300);
+            let len2 = rng.gen_range(1..=300);
+            let start2 = rng.gen_range(20..=180);
+            let r1 = &dna[100..100 + len1];
+            let mut rc = dna[start2..start2 + len2].to_vec();
+            // Exercise SIMD chunk edges and fastp's protected 50-base boundary.
+            for position in [0, 15, 16, 31, 32, 48, 49, 50, 51, len2 - 1] {
+                if position < len2 && rng.gen_bool(0.5) {
+                    rc[position] = b'N';
+                }
+            }
+            if case % 3 == 0 {
+                rc.iter_mut()
+                    .for_each(|b| *b = b"ACGT"[rng.gen_range(0..4)]);
+            }
+            let r2 = reverse_complement(&rc);
+            for (min_overlap_len, max_diff, max_diff_percent) in
+                [(1, 0, 0), (30, 5, 20), (50, 10, 50)]
+            {
+                let config = OverlapConfig {
+                    min_overlap_len,
+                    max_diff,
+                    max_diff_percent,
+                };
+                let actual =
+                    detect_overlap(r1, &r2, &config).map(|r| (r.offset, r.overlap_len, r.diff));
+                assert_eq!(
+                    actual,
+                    scalar(r1, &r2, &config),
+                    "case {case}, config {config:?}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn test_complement_base() {
