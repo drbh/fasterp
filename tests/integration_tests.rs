@@ -9801,3 +9801,60 @@ D@@D@FHHHHH?HEHIE11FHHEHHII?HHHIIFEDCEHCHHC1FHFHCGE
     println!("  - Fasterp intentionally replicates this bug for exact compatibility");
     println!("  - See fastp_offset_bug_analysis.md for detailed analysis");
 }
+
+#[test]
+fn test_base_correction_after_overlap_trimming_multithreaded() {
+    // A real pair (SRR5808766.2) with a 47bp insert in 51bp reads. Overlap
+    // trimming shortens both reads to 47bp before correction. The
+    // multi-threaded pipeline used to reuse the untrimmed overlap offsets
+    // and index past the end of the trimmed reads.
+    let temp_dir = TempDir::new().unwrap();
+    let input_r1 = temp_dir.path().join("R1.fq");
+    let input_r2 = temp_dir.path().join("R2.fq");
+    fs::write(
+        &input_r1,
+        "@SRR5808766.2/1\nATAAAGAATAACGCGAATGGGCCGGCTGCGTATTCTACGTTAAACCCCTGT\n+\nDDDDDIIIIIIIIIIIIIHIIIIHIIFHIIIHHHIIIIHHIIIIIIHIIIG\n",
+    )
+    .unwrap();
+    fs::write(
+        &input_r2,
+        "@SRR5808766.2/2\nGGGTTTAACGTAGAATACGCAGCCGGCCCATTCGCGTTATTCTTTATCTGT\n+\nDDDDDHIIIIIIHIIIIIIIIFIIHIIIIIIIIIIIIIIHIIIIIIIIIIH\n",
+    )
+    .unwrap();
+    let output_r1 = temp_dir.path().join("out_R1.fq");
+    let output_r2 = temp_dir.path().join("out_R2.fq");
+
+    let status = Command::new(assert_cmd::cargo::cargo_bin!("fasterp"))
+        .arg("-i")
+        .arg(&input_r1)
+        .arg("-I")
+        .arg(&input_r2)
+        .arg("-o")
+        .arg(&output_r1)
+        .arg("-O")
+        .arg(&output_r2)
+        .arg("-j")
+        .arg(temp_dir.path().join("out.json"))
+        .arg("--html")
+        .arg(temp_dir.path().join("out.html"))
+        .arg("-c")
+        .arg("-w")
+        .arg("2")
+        .stderr(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .status()
+        .expect("Failed to run fasterp with correction");
+    assert!(status.success());
+
+    // Same result as fastp 1.4.0 for this pair
+    let r1 = fs::read_to_string(&output_r1).unwrap();
+    let r2 = fs::read_to_string(&output_r2).unwrap();
+    assert_eq!(
+        r1.lines().nth(1),
+        Some("ATAAAGAATAACGCGAATGGGCCGGCTGCGTATTCTACGTTAAACCC")
+    );
+    assert_eq!(
+        r2.lines().nth(1),
+        Some("GGGTTTAACGTAGAATACGCAGCCGGCCCATTCGCGTTATTCTTTAT")
+    );
+}

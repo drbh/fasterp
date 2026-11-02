@@ -1388,21 +1388,27 @@ pub(crate) fn paired_worker_thread(
             let mut qual2_corrected;
 
             // Only create mutable copies if correction is enabled AND there's an overlap to correct
-            if overlap_config.is_some() && overlap_result.is_some() {
+            if let (Some(config), Some(_)) = (overlap_config.as_ref(), overlap_result.as_ref()) {
                 // Create mutable copies for correction
                 seq1_corrected = trimmed_seq1.to_vec();
                 qual1_corrected = trimmed_qual1.to_vec();
                 seq2_corrected = trimmed_seq2.to_vec();
                 qual2_corrected = trimmed_qual2.to_vec();
 
-                // Apply correction using cached overlap result
-                let _correction_stats = crate::overlap::correct_by_overlap(
-                    &mut seq1_corrected,
-                    &mut qual1_corrected,
-                    &mut seq2_corrected,
-                    &mut qual2_corrected,
-                    overlap_result.as_ref().unwrap(),
-                );
+                // The cached overlap was detected before trimming, so its offsets
+                // do not index the trimmed reads. Detect again on the trimmed
+                // reads, as processor.rs does.
+                if let Some(overlap) =
+                    crate::overlap::detect_overlap(&seq1_corrected, &seq2_corrected, config)
+                {
+                    let _correction_stats = crate::overlap::correct_by_overlap(
+                        &mut seq1_corrected,
+                        &mut qual1_corrected,
+                        &mut seq2_corrected,
+                        &mut qual2_corrected,
+                        &overlap,
+                    );
+                }
                 // TODO: Track correction statistics
 
                 final_seq1 = &seq1_corrected[..];
