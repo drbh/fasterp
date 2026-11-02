@@ -134,8 +134,8 @@ struct Args {
     #[arg(long, default_value = "true", action = clap::ArgAction::Set, alias = "parallel-compression")]
     parallel_compression: bool,
 
-    /// Number of worker threads (default: 3)
-    #[arg(short = 'w', long = "thread", alias = "threads", default_value = "3")]
+    /// Number of worker threads (default: number of CPUs, up to 16)
+    #[arg(short = 'w', long = "thread", alias = "threads")]
     threads: Option<usize>,
 
     /// Batch size in bytes (default: 32 MiB)
