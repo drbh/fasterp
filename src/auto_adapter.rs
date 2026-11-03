@@ -88,28 +88,45 @@ impl KnownSeeds {
 }
 
 fn known(reads: &[&[u8]]) -> Option<Vec<u8>> {
-    let mut seeds = KnownSeeds::new(KNOWN);
+    // Whether a read matches an adapter does not depend on the other reads, so
+    // find every match in parallel, then replay fastp's ordered loop (which
+    // skips adapters that fall behind and stops early) over those results.
+    let matches: Vec<Vec<(usize, usize)>> = reads[..reads.len().min(100000)]
+        .par_iter()
+        .map_init(
+            || KnownSeeds::new(KNOWN),
+            |seeds, r| {
+                seeds.collect(r);
+                KNOWN
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, adapter)| adapter.len() < r.len())
+                    .filter_map(|(i, adapter)| seeds.first_match(i, r, adapter).map(|d| (i, d)))
+                    .collect()
+            },
+        )
+        .collect();
     let mut counts = vec![0usize; KNOWN.len()];
     let mut mismatches = vec![0usize; KNOWN.len()];
     let mut checked = 0;
     let mut bases = 0;
     let mut max = 0;
-    for r in reads {
+    for (r, found) in reads
+        .iter()
+        .zip(matches.iter().map(Some).chain(std::iter::repeat(None)))
+    {
         checked += 1;
         bases += r.len();
         if checked > 100000 || bases > 100000000 || max > 1000 {
             break;
         }
-        seeds.collect(r);
-        for (i, adapter) in KNOWN.iter().enumerate() {
-            if adapter.len() >= r.len() || (max > 20 && counts[i] < max / 10) {
+        for &(i, diff) in found.into_iter().flatten() {
+            if max > 20 && counts[i] < max / 10 {
                 continue;
             }
-            if let Some(diff) = seeds.first_match(i, r, adapter) {
-                counts[i] += 1;
-                max = max.max(counts[i]);
-                mismatches[i] += diff;
-            }
+            counts[i] += 1;
+            max = max.max(counts[i]);
+            mismatches[i] += diff;
         }
     }
     let mut best = 0;
@@ -328,6 +345,82 @@ pub fn detect(reads: &[&[u8]], tail: usize) -> Option<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
+
+    /// fastp's ordered loop, run sequentially, as it was before the parallel scan.
+    fn known_sequential(reads: &[&[u8]]) -> Option<Vec<u8>> {
+        let mut seeds = KnownSeeds::new(KNOWN);
+        let mut counts = vec![0usize; KNOWN.len()];
+        let mut mismatches = vec![0usize; KNOWN.len()];
+        let mut checked = 0;
+        let mut bases = 0;
+        let mut max = 0;
+        for r in reads {
+            checked += 1;
+            bases += r.len();
+            if checked > 100000 || bases > 100000000 || max > 1000 {
+                break;
+            }
+            seeds.collect(r);
+            for (i, adapter) in KNOWN.iter().enumerate() {
+                if adapter.len() >= r.len() || (max > 20 && counts[i] < max / 10) {
+                    continue;
+                }
+                if let Some(diff) = seeds.first_match(i, r, adapter) {
+                    counts[i] += 1;
+                    max = max.max(counts[i]);
+                    mismatches[i] += diff;
+                }
+            }
+        }
+        let mut best = 0;
+        for i in 1..counts.len() {
+            if counts[i] > counts[best] {
+                best = i;
+            }
+        }
+        (counts[best] > checked / 50
+            || (counts[best] > checked / 200 && mismatches[best] < checked))
+            .then(|| KNOWN[best].to_vec())
+    }
+
+    #[test]
+    fn parallel_known_scan_matches_sequential_loop() {
+        let mut state = 7u64;
+        let mut next = |n: usize| {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            (state >> 33) as usize % n
+        };
+        let mut detected = 0;
+        for trial in 0..12 {
+            // A few adapters at different rates, so the skip heuristic and the
+            // early stop at 1000 matches both come into play.
+            let picks: Vec<usize> = (0..3).map(|_| next(KNOWN.len())).collect();
+            let rates = [[0, 0, 0], [40, 5, 1], [3, 2, 1], [200, 1, 0]][trial % 4];
+            let reads: Vec<Vec<u8>> = (0..12000)
+                .map(|_| {
+                    let mut r: Vec<u8> = (0..20 + next(130)).map(|_| b"ACGTN"[next(5)]).collect();
+                    for (&a, &rate) in picks.iter().zip(&rates) {
+                        if rate > 0 && next(1000) < rate {
+                            let adapter = KNOWN[a];
+                            let at = next(r.len());
+                            r.truncate(at);
+                            r.extend_from_slice(&adapter[..adapter.len().min(150 - at.min(149))]);
+                            if next(3) == 0 && !r.is_empty() {
+                                let i = next(r.len());
+                                r[i] = b"ACGT"[next(4)];
+                            }
+                        }
+                    }
+                    r
+                })
+                .collect();
+            let reads: Vec<&[u8]> = reads.iter().map(|r| r.as_slice()).collect();
+            let found = known(&reads);
+            assert_eq!(found, known_sequential(&reads), "trial {trial}");
+            detected += usize::from(found.is_some());
+        }
+        assert!(detected >= 3, "only {detected} trials detected an adapter");
+    }
     use super::*;
 
     #[test]
