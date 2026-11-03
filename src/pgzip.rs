@@ -26,7 +26,7 @@ const REGION: usize = 4 << 20;
 /// Bytes read past a region for the block that crosses its end.
 const MARGIN: usize = 1 << 20;
 
-// ---------------------------------------------------------------- bits
+// bits
 
 struct Bits<'a> {
     data: &'a [u8],
@@ -95,7 +95,7 @@ impl<'a> Bits<'a> {
     }
 }
 
-// ---------------------------------------------------------------- huffman
+// huffman
 
 const PRIMARY: u32 = 10;
 
@@ -274,7 +274,7 @@ fn dynamic_tables(bits: &mut Bits) -> Option<(Huffman, Huffman)> {
     ))
 }
 
-// ---------------------------------------------------------------- inflate
+// inflate
 
 /// Output symbols: bytes, or (in `u16`) placeholders for the unknown window.
 trait Symbol: Copy {
@@ -561,7 +561,7 @@ fn find_block(data: &[u8], from: usize, to: usize) -> Option<usize> {
     None
 }
 
-// ---------------------------------------------------------------- driver
+// driver
 
 #[cfg(unix)]
 fn read_at(file: &File, buf: &mut [u8], offset: u64) -> io::Result<()> {

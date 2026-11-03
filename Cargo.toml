@@ -29,7 +29,6 @@ native = [
   "dep:gzp",
   "dep:bytes",
   "dep:zstd",
-  "flate2/zlib-ng",
 ]
 wasm = ["dep:wasm-bindgen", "dep:js-sys", "flate2/rust_backend"]
 
@@ -63,6 +62,15 @@ wasm-bindgen = {version = "=0.2.92", optional = true}
 
 # Optional features
 zstd = {version = "0.13", optional = true}
+
+# Streaming gzip decoding: macOS's system zlib inflates about 1.5x faster than
+# zlib-ng on Apple Silicon, other native targets use zlib-ng, and wasm uses
+# the pure Rust backend selected by the wasm feature.
+[target.'cfg(target_os = "macos")'.dependencies]
+flate2 = {version = "1.0", default-features = false, features = ["zlib"]}
+
+[target.'cfg(not(any(target_os = "macos", target_arch = "wasm32")))'.dependencies]
+flate2 = {version = "1.0", default-features = false, features = ["zlib-ng"]}
 
 [lib]
 crate-type = ["cdylib", "rlib"]
