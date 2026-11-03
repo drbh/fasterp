@@ -430,6 +430,217 @@ impl PrefetchInput {
     }
 }
 
+/// The total size of the gzip member starting at `data`, from a size subfield
+/// in its extra field (fasterp's `FP`, or BGZF's `BC`), or `None` when it has
+/// none. Needs the member's first 12 bytes plus its extra field.
+fn indexed_member_size(data: &[u8]) -> Option<usize> {
+    if data.len() < 12 || data[..3] != [0x1f, 0x8b, 8] || data[3] & 4 == 0 {
+        return None;
+    }
+    let xlen = usize::from(u16::from_le_bytes([data[10], data[11]]));
+    let mut extra = data.get(12..12 + xlen)?;
+    while extra.len() >= 4 {
+        let len = usize::from(u16::from_le_bytes([extra[2], extra[3]]));
+        let field = extra.get(4..4 + len)?;
+        match (&extra[..2], len) {
+            (id, 4) if id == crate::gzip::MEMBER_SIZE_ID => {
+                return Some(u32::from_le_bytes(field.try_into().unwrap()) as usize)
+            }
+            (b"BC", 2) => return Some(usize::from(u16::from_le_bytes([field[0], field[1]])) + 1),
+            _ => extra = &extra[4 + len..],
+        }
+    }
+    None
+}
+
+enum MemberJob {
+    /// Whole gzip members, back to back, and their total decompressed size.
+    Members(Vec<u8>, usize),
+    /// Bytes already decompressed by the sequential fallback.
+    Plain(Vec<u8>),
+    /// A read or decode error, delivered in order.
+    Failed(std::io::Error),
+}
+
+/// Decompress a gzip file whose members record their sizes on `threads`
+/// threads with libdeflate, sending output in order on `sender`. From the
+/// first member without a size it falls back to the sequential decoder.
+fn decompress_members(
+    mut file: File,
+    threads: usize,
+    sender: crossbeam_channel::Sender<std::io::Result<Vec<u8>>>,
+) {
+    use std::collections::BTreeMap;
+    const JOB_BYTES: usize = 1024 * 1024;
+    let (jobs, queue) = crossbeam_channel::bounded::<(usize, MemberJob)>(threads * 2);
+    let (done, results) =
+        crossbeam_channel::bounded::<(usize, std::io::Result<Vec<u8>>)>(threads * 2);
+    std::thread::scope(|scope| {
+        for _ in 0..threads {
+            let (queue, done) = (queue.clone(), done.clone());
+            scope.spawn(move || {
+                let mut decompressor = libdeflater::Decompressor::new();
+                for (seq, job) in queue {
+                    let result = match job {
+                        MemberJob::Plain(bytes) => Ok(bytes),
+                        MemberJob::Failed(error) => Err(error),
+                        MemberJob::Members(bytes, size) => {
+                            let mut out = vec![0; size];
+                            let mut at = 0;
+                            let mut written = 0;
+                            let mut result = Ok(());
+                            while at < bytes.len() {
+                                let total = indexed_member_size(&bytes[at..]).unwrap();
+                                let member = &bytes[at..at + total];
+                                let isize =
+                                    u32::from_le_bytes(member[total - 4..].try_into().unwrap())
+                                        as usize;
+                                match decompressor
+                                    .gzip_decompress(member, &mut out[written..written + isize])
+                                {
+                                    Ok(n) if n == isize => written += n,
+                                    other => {
+                                        result = Err(std::io::Error::new(
+                                            std::io::ErrorKind::InvalidData,
+                                            format!("Corrupt gzip member: {other:?}"),
+                                        ));
+                                        break;
+                                    }
+                                }
+                                at += total;
+                            }
+                            result.map(|()| out)
+                        }
+                    };
+                    if done.send((seq, result)).is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+        drop((queue, done));
+        // Split the file into jobs of whole members.
+        scope.spawn(move || {
+            let mut buffer: Vec<u8> = Vec::new();
+            let mut start = 0;
+            let mut eof = false;
+            let mut seq = 0;
+            let mut fill =
+                |buffer: &mut Vec<u8>, start: &mut usize, need: usize| -> std::io::Result<bool> {
+                    while buffer.len() - *start < need {
+                        if *start > 0 {
+                            buffer.drain(..*start);
+                            *start = 0;
+                        }
+                        let old = buffer.len();
+                        buffer.resize(old + (8 << 20).max(need), 0);
+                        let n = loop {
+                            match file.read(&mut buffer[old..]) {
+                                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                                other => break other?,
+                            }
+                        };
+                        buffer.truncate(old + n);
+                        if n == 0 {
+                            return Ok(false);
+                        }
+                    }
+                    Ok(true)
+                };
+            loop {
+                let mut job = Vec::new();
+                let mut size = 0;
+                let mut fallback = false;
+                while size < JOB_BYTES {
+                    // Header, extra field and trailer of the next member.
+                    match fill(&mut buffer, &mut start, 12) {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            eof = buffer.len() == start;
+                            fallback = !eof;
+                            break;
+                        }
+                        Err(e) => {
+                            let _ = jobs.send((seq, MemberJob::Failed(e)));
+                            return;
+                        }
+                    }
+                    let xlen =
+                        usize::from(u16::from_le_bytes([buffer[start + 10], buffer[start + 11]]));
+                    if !matches!(fill(&mut buffer, &mut start, 12 + xlen), Ok(true)) {
+                        fallback = true;
+                        break;
+                    }
+                    let Some(total) =
+                        indexed_member_size(&buffer[start..]).filter(|&t| t >= 18 + 10)
+                    else {
+                        fallback = true;
+                        break;
+                    };
+                    if !matches!(fill(&mut buffer, &mut start, total), Ok(true)) {
+                        fallback = true;
+                        break;
+                    }
+                    let isize = u32::from_le_bytes(
+                        buffer[start + total - 4..start + total].try_into().unwrap(),
+                    );
+                    job.extend_from_slice(&buffer[start..start + total]);
+                    size += isize as usize;
+                    start += total;
+                }
+                if !job.is_empty() {
+                    if jobs.send((seq, MemberJob::Members(job, size))).is_err() {
+                        return;
+                    }
+                    seq += 1;
+                }
+                if fallback {
+                    // Decode the rest sequentially, exactly as MultiGzDecoder would.
+                    let rest = std::io::Cursor::new(buffer.split_off(start)).chain(file);
+                    let mut decoder = MultiGzDecoder::new(BufReader::with_capacity(1 << 20, rest));
+                    loop {
+                        let mut chunk = vec![0; JOB_BYTES];
+                        let mut filled = 0;
+                        while filled < chunk.len() {
+                            match decoder.read(&mut chunk[filled..]) {
+                                Ok(0) => break,
+                                Ok(n) => filled += n,
+                                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                                Err(e) => {
+                                    let _ = jobs.send((seq, MemberJob::Failed(e)));
+                                    return;
+                                }
+                            }
+                        }
+                        chunk.truncate(filled);
+                        if filled == 0 || jobs.send((seq, MemberJob::Plain(chunk))).is_err() {
+                            return;
+                        }
+                        seq += 1;
+                    }
+                }
+                if eof {
+                    return;
+                }
+            }
+        });
+        // Deliver in order.
+        let mut pending = BTreeMap::new();
+        let mut next = 0;
+        for (seq, result) in results {
+            pending.insert(seq, result);
+            while let Some(result) = pending.remove(&next) {
+                let failed = result.is_err();
+                if sender.send(result).is_err() || failed {
+                    return;
+                }
+                next += 1;
+            }
+        }
+        let _ = sender.send(Ok(Vec::new()));
+    });
+}
+
 impl BufRead for PrefetchInput {
     fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
         if self.position == self.buffer.len() && !self.finished {
@@ -497,8 +708,26 @@ pub(crate) fn open_input(path: &str) -> Result<Box<dyn BufRead + Send>> {
         CompressionFormat::Gzip => {
             // Reuse the compressed-input buffer instead of adding the read
             // decoder's smaller internal buffer and an extra copy.
+            let local = std::fs::metadata(path).is_ok_and(|m| m.is_file());
+            if local && indexed_member_size(buffered.fill_buf()?).is_some() {
+                // Members record their sizes: decompress them in parallel.
+                drop(buffered);
+                let file = File::open(path)?;
+                let threads = num_cpus::get().div_ceil(4).clamp(1, 4);
+                let (sender, receiver) = crossbeam_channel::bounded(2);
+                let (recycle, _) = crossbeam_channel::bounded::<Vec<u8>>(1);
+                let worker = std::thread::spawn(move || decompress_members(file, threads, sender));
+                return Ok(Box::new(PrefetchInput {
+                    receiver: Some(receiver),
+                    recycle,
+                    worker: Some(worker),
+                    buffer: Vec::new(),
+                    position: 0,
+                    finished: false,
+                }));
+            }
             let decoder = MultiGzDecoder::new(buffered);
-            if std::fs::metadata(path).is_ok_and(|m| m.is_file()) {
+            if local {
                 Ok(Box::new(PrefetchInput::new(decoder)))
             } else {
                 Ok(Box::new(BufReader::with_capacity(1024 * 1024, decoder)))
@@ -534,6 +763,88 @@ fn buffer_input(raw: Box<dyn Read + Send>) -> std::io::Result<BufReader<Box<dyn 
 #[cfg(test)]
 mod input_tests {
     use super::*;
+
+    fn read_all(path: &std::path::Path) -> std::io::Result<Vec<u8>> {
+        let mut out = Vec::new();
+        open_input(path.to_str().unwrap())
+            .map_err(std::io::Error::other)?
+            .read_to_end(&mut out)?;
+        Ok(out)
+    }
+
+    /// fasterp's own gzip output, written with the parallel compressor.
+    fn fasterp_gzip(data: &[u8]) -> Vec<u8> {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let mut writer = ParCompressBuilder::<Gzip>::new()
+            .num_threads(3)
+            .unwrap()
+            .from_writer(file.reopen().unwrap());
+        writer.write_all(data).unwrap();
+        writer.finish().unwrap();
+        std::fs::read(file.path()).unwrap()
+    }
+
+    fn plain_gzip(data: &[u8]) -> Vec<u8> {
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::new(6));
+        encoder.write_all(data).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    /// A BGZF member: `BC` subfield holding the member size minus one.
+    fn bgzf_member(data: &[u8]) -> Vec<u8> {
+        let plain = plain_gzip(data);
+        let total = plain.len() + 8;
+        let mut out = plain[..3].to_vec();
+        out.push(plain[3] | 4);
+        out.extend_from_slice(&plain[4..10]);
+        out.extend_from_slice(&6u16.to_le_bytes());
+        out.extend_from_slice(b"BC");
+        out.extend_from_slice(&2u16.to_le_bytes());
+        out.extend_from_slice(&((total - 1) as u16).to_le_bytes());
+        out.extend_from_slice(&plain[10..]);
+        out
+    }
+
+    #[test]
+    fn sized_members_decompress_in_parallel_and_in_order() {
+        let data: Vec<u8> = (0..5_000_000u32)
+            .map(|i| b"ACGTN\n@+"[(i.wrapping_mul(2654435761) >> 29) as usize])
+            .collect();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("in.fq.gz");
+        let ours = fasterp_gzip(&data);
+        assert!(
+            indexed_member_size(&ours).is_some(),
+            "output records member sizes"
+        );
+        for (name, bytes, expected) in [
+            ("fasterp", ours.clone(), data.clone()),
+            // Sized members, then a member without a size: the rest is read
+            // sequentially.
+            (
+                "mixed",
+                [ours.clone(), plain_gzip(b"tail\n"), fasterp_gzip(b"more\n")].concat(),
+                [&data[..], b"tail\n", b"more\n"].concat(),
+            ),
+            (
+                "bgzf",
+                data.chunks(60_000).flat_map(bgzf_member).collect(),
+                data.clone(),
+            ),
+            ("empty", fasterp_gzip(b""), Vec::new()),
+        ] {
+            std::fs::write(&path, &bytes).unwrap();
+            assert_eq!(read_all(&path).unwrap(), expected, "{name}");
+        }
+        // A corrupt member and a truncated file are errors, not short output.
+        let mut corrupt = ours.clone();
+        let middle = corrupt.len() / 2;
+        corrupt[middle] ^= 0xff;
+        std::fs::write(&path, &corrupt).unwrap();
+        assert!(read_all(&path).is_err(), "corrupt member");
+        std::fs::write(&path, &ours[..ours.len() - 100]).unwrap();
+        assert!(read_all(&path).is_err(), "truncated file");
+    }
 
     struct Fragmented(std::io::Cursor<Vec<u8>>);
     impl Read for Fragmented {

@@ -3,7 +3,7 @@
 //! Batches are processed in bounded waves. Results are emitted in input order;
 //! an arbitrarily slow first batch cannot accumulate an unbounded reorder queue.
 use crate::util::Instant;
-use crate::{adapter, auto_adapter, html, io, kmer, overlap, simd, split, stats, Args};
+use crate::{adapter, auto_adapter, html, io, overlap, simd, split, stats, Args};
 use anyhow::{ensure, Context, Result};
 use rayon::prelude::*;
 use rustc_hash::FxHashMap;
@@ -382,7 +382,7 @@ impl Sample {
             cycle.total_sum += q as u64;
             cycle.total_cnt += 1;
             self.qual_hist[index & 3][q] += 1;
-            if let Some(base) = kmer::base_idx(b) {
+            if let Some(base) = crate::kmer::base_idx(b) {
                 cycle.base_sum[base] += q as u64;
                 cycle.base_cnt[base] += 1;
                 if !no_kmer {
@@ -3437,7 +3437,7 @@ mod tests {
                 metrics.q40,
                 metrics.gc,
             );
-            kmer::count_k5_2bit(&read.seq, &mut kmers);
+            crate::kmer::count_k5_2bit(&read.seq, &mut kmers);
             for &q in read.qual.iter() {
                 qualities[usize::from(q - 33)] += 1;
             }
