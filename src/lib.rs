@@ -11,6 +11,8 @@ use pyo3::prelude::*;
 
 // Core modules - always available
 pub mod adapter;
+mod args;
+pub mod auto_adapter;
 pub mod bloom;
 pub mod dedup;
 pub mod kmer;
@@ -22,17 +24,25 @@ pub mod trimming;
 pub mod umi;
 pub mod util;
 
+// The fastp 1.4.0 compatible engine, shared by the CLI and WebAssembly.
+pub mod compat;
+pub mod html;
+pub mod split;
+
+// File, URL and S3 I/O natively; an in-memory file system otherwise.
+#[cfg(feature = "native")]
+pub mod io;
+#[cfg(not(feature = "native"))]
+#[path = "memio.rs"]
+pub mod io;
+
 // Native-only modules (require threading, file I/O, etc.)
 #[cfg(feature = "native")]
 pub mod gzip;
 #[cfg(feature = "native")]
-pub mod html;
-#[cfg(feature = "native")]
-pub mod io;
-#[cfg(feature = "native")]
 pub mod pipeline;
-#[cfg(feature = "native")]
-pub mod split;
+
+pub use args::Args;
 
 // WASM module
 #[cfg(feature = "wasm")]

@@ -688,6 +688,20 @@ impl OutputWriter {
 }
 
 /// Open output file, S3, or stdout with optional compression
+pub(crate) use crate::gzip::threads_per_output;
+
+pub(crate) fn create_file(path: &str) -> Result<Box<dyn Write>> {
+    Ok(Box::new(File::create(path)?))
+}
+
+pub(crate) fn read_to_string(path: &str) -> Result<String> {
+    Ok(std::fs::read_to_string(path)?)
+}
+
+pub(crate) fn write_file(path: &str, data: &[u8]) -> Result<()> {
+    Ok(std::fs::write(path, data)?)
+}
+
 pub(crate) fn open_output(
     path: &str,
     compression_level: Option<u32>,

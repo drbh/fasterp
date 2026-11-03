@@ -2,6 +2,7 @@
 //!
 //! Batches are processed in bounded waves. Results are emitted in input order;
 //! an arbitrarily slow first batch cannot accumulate an unbounded reorder queue.
+use crate::util::Instant;
 use crate::{adapter, auto_adapter, html, io, kmer, overlap, simd, split, stats, Args};
 use anyhow::{ensure, Context, Result};
 use rayon::prelude::*;
@@ -11,7 +12,6 @@ use std::borrow::Cow;
 use std::collections::{BTreeMap, VecDeque};
 use std::io::{BufRead, BufWriter, Write};
 use std::path::{Path, PathBuf};
-use std::time::Instant;
 
 mod block;
 
@@ -1940,7 +1940,7 @@ impl Output {
         Self {
             writers: BTreeMap::new(),
             scratch: Vec::new(),
-            compression_threads: crate::gzip::threads_per_output(gzip_outputs),
+            compression_threads: crate::io::threads_per_output(gzip_outputs),
         }
     }
     fn open(&mut self, path: &str, a: &Args, config: split::SplitConfig) -> Result<()> {
@@ -1982,7 +1982,26 @@ impl Output {
 
 /// fastp defaults to 3 workers. Output does not depend on the worker count, so
 /// fasterp uses every CPU by default, up to the 16 workers fastp allows.
+/// wasm32 cannot spawn threads, so its one worker is the calling thread. A
+/// thread can join only one pool, so build it once and reuse it across runs.
+#[cfg(target_arch = "wasm32")]
+fn wasm_pool() -> Result<&'static rayon::ThreadPool> {
+    static POOL: std::sync::OnceLock<rayon::ThreadPool> = std::sync::OnceLock::new();
+    if let Some(pool) = POOL.get() {
+        return Ok(pool);
+    }
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(1)
+        .use_current_thread()
+        .build()?;
+    Ok(POOL.get_or_init(|| pool))
+}
+
 fn worker_threads(a: &Args) -> usize {
+    // wasm32-unknown-unknown cannot spawn threads.
+    if cfg!(target_arch = "wasm32") {
+        return 1;
+    }
     a.threads.unwrap_or_else(|| num_cpus::get().clamp(1, 16))
 }
 
@@ -2316,7 +2335,7 @@ fn load_sequences(path: Option<&str>, fasta: bool) -> Result<Vec<Vec<u8>>> {
     let Some(path) = path else {
         return Ok(Vec::new());
     };
-    let text = std::fs::read_to_string(path).with_context(|| format!("Cannot read {path}"))?;
+    let text = crate::io::read_to_string(path).with_context(|| format!("Cannot read {path}"))?;
     let mut seqs = Vec::<Vec<u8>>::new();
     for line in text.lines().map(str::trim).filter(|s| !s.is_empty()) {
         if fasta && line.starts_with('>') {
@@ -2387,6 +2406,8 @@ pub fn run(mut a: Args) -> Result<()> {
         a.merged_out = None;
     }
     validate(&a)?;
+    // The in-memory file system has no symlinks or directories to check.
+    #[cfg(feature = "native")]
     validate_paths(&a)?;
     let pe = a.input2.is_some() || a.interleaved_in;
     let total_for_split = if a.split.is_some() {
@@ -2417,7 +2438,8 @@ pub fn run(mut a: Args) -> Result<()> {
     // Compact-output jobs retain evaluation data in the same blocks used
     // by processing. The sample is read once without allocating four fields per
     // record, and each block is released as soon as processing consumes it.
-    let pipelined = a.max_backlog != Some(1)
+    let pipelined = cfg!(feature = "native")
+        && a.max_backlog != Some(1)
         && std::iter::once(a.input.as_str())
             .chain(a.input2.as_deref())
             .all(|path| std::fs::metadata(path).is_ok_and(|m| m.is_file()));
@@ -2574,9 +2596,14 @@ pub fn run(mut a: Args) -> Result<()> {
         load_sequences(a.filter_by_index2.as_deref(), false)?,
     ];
     let threads = worker_threads(&a);
-    let pool = rayon::ThreadPoolBuilder::new()
+    #[cfg(not(target_arch = "wasm32"))]
+    let owned_pool = rayon::ThreadPoolBuilder::new()
         .num_threads(threads)
         .build()?;
+    #[cfg(not(target_arch = "wasm32"))]
+    let pool = &owned_pool;
+    #[cfg(target_arch = "wasm32")]
+    let pool = wasm_pool()?;
     let max_bytes = if let Some(mb) = a.max_memory {
         ensure!(mb >= 16, "--max_memory must be at least 16 MB");
         a.batch_bytes.min(mb.saturating_mul(1024 * 1024) / 8).max(1)
@@ -2751,7 +2778,6 @@ pub fn run(mut a: Args) -> Result<()> {
                     }
                 }
             });
-            let pool = &pool;
             let config = &config;
             let before = &before_templates;
             let after = &after_templates;
@@ -2801,7 +2827,7 @@ pub fn run(mut a: Args) -> Result<()> {
                 match serial_reader.as_mut().unwrap().next_batch()? {
                     Some(batch) => process_batch(
                         batch,
-                        &pool,
+                        pool,
                         &config,
                         &before_templates,
                         &after_templates,
@@ -3056,7 +3082,7 @@ fn make_report(before: &[Sample; 2], after: &[Sample; 2], pe: bool, merge: bool)
 
 fn write_reports(a: &Args, report: &Value, start: Instant) -> Result<()> {
     if a.stats_format != "off" {
-        let mut writer = BufWriter::new(std::fs::File::create(&a.json)?);
+        let mut writer = BufWriter::new(crate::io::create_file(&a.json)?);
         if a.stats_format == "pretty" {
             serde_json::to_writer_pretty(&mut writer, report)?;
         } else {
@@ -3088,7 +3114,7 @@ fn write_reports(a: &Args, report: &Value, start: Instant) -> Result<()> {
         output2: a.output2.clone(),
     };
     html::generate_html_report(&typed, &config, &a.html, start.elapsed())?;
-    let mut text = std::fs::read_to_string(&a.html)?;
+    let mut text = crate::io::read_to_string(&a.html)?;
     if a.report_title != "fasterp report" {
         text = text.replace(
             "fasterp Quality Control Report",
@@ -3140,7 +3166,11 @@ fn write_reports(a: &Args, report: &Value, start: Instant) -> Result<()> {
         }
         extra.push_str("</section>");
     }
-    std::fs::write(&a.html, text.replace("</body>", &format!("{extra}</body>")))?;
+    crate::io::write_file(
+        &a.html,
+        text.replace("</body>", &format!("{extra}</body>"))
+            .as_bytes(),
+    )?;
     Ok(())
 }
 

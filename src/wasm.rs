@@ -1,15 +1,51 @@
 //! WebAssembly bindings for fasterp
 //!
-//! This module provides WASM-compatible functions for FASTQ processing.
-//! All I/O is done via byte arrays instead of files.
+//! These run the same fastp 1.4.0 compatible engine as the CLI (`compat::run`)
+//! over an in-memory file system: inputs are passed in as named byte arrays and
+//! every file the run writes is handed back.
 
-use std::io::Cursor;
+use std::collections::BTreeMap;
 use wasm_bindgen::prelude::*;
 
-use crate::adapter::AdapterConfig;
-use crate::processor::{process_fastq_stream, process_paired_fastq_stream};
-use crate::stats;
-use crate::trimming::TrimmingConfig;
+use crate::Args;
+use clap::Parser;
+
+/// Run the engine with command-line style `args` (without the program name)
+/// over `inputs`, returning every file written: outputs, `fasterp.json` and
+/// `fasterp.html` unless `-j`/`-h` name other paths.
+pub fn run_files(
+    args: &[String],
+    inputs: Vec<(String, Vec<u8>)>,
+) -> anyhow::Result<BTreeMap<String, Vec<u8>>> {
+    let args =
+        Args::try_parse_from(std::iter::once("fasterp".to_string()).chain(args.iter().cloned()))?;
+    let (result, files) = crate::io::with_files(inputs, || crate::compat::run(args));
+    result.map(|()| files)
+}
+
+/// Run fasterp exactly like the CLI. `args` is an array of strings such as
+/// `["-i", "in.fq", "-o", "out.fq"]` and `files` maps input names to
+/// `Uint8Array`s. Returns a `Map` of every file written (FASTQ outputs and the
+/// JSON and HTML reports).
+#[wasm_bindgen]
+pub fn run(args: js_sys::Array, files: js_sys::Map) -> Result<js_sys::Map, JsValue> {
+    let args: Vec<String> = args.iter().filter_map(|a| a.as_string()).collect();
+    let mut inputs = Vec::new();
+    files.for_each(&mut |value, key| {
+        if let Some(name) = key.as_string() {
+            inputs.push((name, js_sys::Uint8Array::new(&value).to_vec()));
+        }
+    });
+    let outputs = run_files(&args, inputs).map_err(|e| JsValue::from_str(&format!("{e:#}")))?;
+    let map = js_sys::Map::new();
+    for (name, data) in outputs {
+        map.set(
+            &JsValue::from_str(&name),
+            &js_sys::Uint8Array::from(data.as_slice()),
+        );
+    }
+    Ok(map)
+}
 
 /// Result of processing a FASTQ file
 #[wasm_bindgen]
@@ -190,246 +226,117 @@ impl Default for WasmConfig {
     }
 }
 
-/// Process single-end FASTQ data
-///
-/// # Arguments
-/// * `input` - Raw FASTQ data (can be gzip compressed)
-/// * `config` - Processing configuration
-///
-/// # Returns
-/// `WasmProcessResult` containing processed data and statistics
+impl WasmConfig {
+    /// The CLI flags for this configuration.
+    fn args(&self) -> Vec<String> {
+        let mut args = vec![
+            format!("-l{}", self.min_length),
+            format!("-b{}", self.max_length),
+            format!("-e{}", self.average_qual),
+            format!("-n{}", self.n_base_limit),
+            format!("-q{}", self.qualified_quality_phred),
+            format!("-u{}", self.unqualified_percent_limit),
+            format!("-Y{}", self.complexity_threshold),
+            format!("-f{}", self.trim_front),
+            format!("-t{}", self.trim_tail),
+            format!("-M{}", self.cut_mean_quality),
+            format!("-W{}", self.cut_window_size),
+            format!("--poly_g_min_len={}", self.poly_g_min_len),
+        ];
+        for (on, flag) in [
+            (self.low_complexity_filter, "-y"),
+            (self.cut_front, "-5"),
+            (self.cut_tail, "-3"),
+            (self.trim_poly_x, "-x"),
+            (self.trim_poly_g, "-g"),
+            (!self.trim_poly_g, "-G"),
+        ] {
+            if on {
+                args.push(flag.into());
+            }
+        }
+        args
+    }
+}
+
+fn js_error(e: anyhow::Error) -> JsValue {
+    JsValue::from_str(&format!("{e:#}"))
+}
+
+/// Run `args` plus the config flags and return the outputs, the JSON report
+/// and the passed and failed read counts.
+fn run_config(
+    config: &WasmConfig,
+    inputs: Vec<(String, Vec<u8>)>,
+    mut args: Vec<String>,
+    outputs: &[&str],
+) -> anyhow::Result<(Vec<Vec<u8>>, String, usize, usize)> {
+    args.extend([
+        "-j".into(),
+        "fasterp.json".into(),
+        "-h".into(),
+        "fasterp.html".into(),
+    ]);
+    args.extend(config.args());
+    let mut files = run_files(&args, inputs)?;
+    let json_report = String::from_utf8(files.remove("fasterp.json").unwrap_or_default())?;
+    let report: serde_json::Value = serde_json::from_str(&json_report)?;
+    let count = |v: &serde_json::Value| v.as_u64().unwrap_or(0) as usize;
+    let total = count(&report["summary"]["before_filtering"]["total_reads"]);
+    let passed = count(&report["filtering_result"]["passed_filter_reads"]);
+    let outputs = outputs
+        .iter()
+        .map(|name| files.remove(*name).unwrap_or_default())
+        .collect();
+    Ok((outputs, json_report, passed, total - passed))
+}
+
+/// Process single-end FASTQ data (plain or gzip) with `config`.
 #[wasm_bindgen]
 pub fn process_single_end(input: &[u8], config: &WasmConfig) -> Result<WasmProcessResult, JsValue> {
-    // Detect if input is gzip compressed
-    let reader: Box<dyn std::io::BufRead> =
-        if input.len() >= 2 && input[0] == 0x1f && input[1] == 0x8b {
-            // Gzip compressed
-            use flate2::read::MultiGzDecoder;
-            let decoder = MultiGzDecoder::new(Cursor::new(input));
-            Box::new(std::io::BufReader::new(decoder))
-        } else {
-            // Plain text
-            Box::new(std::io::BufReader::new(Cursor::new(input)))
-        };
-
-    let mut output = Vec::new();
-
-    // Create adapter config (disabled for simplicity in WASM)
-    let adapter_config = AdapterConfig::new();
-
-    // Create trimming config
-    let trimming_config = TrimmingConfig {
-        enable_trim_front: config.cut_front && config.cut_mean_quality > 0,
-        enable_trim_tail: config.cut_tail && config.cut_mean_quality > 0,
-        cut_mean_quality: config.cut_mean_quality,
-        cut_window_size: config.cut_window_size,
-        trim_front_bases: config.trim_front,
-        trim_tail_bases: config.trim_tail,
-        max_len: config.max_length,
-        enable_poly_g: config.trim_poly_g,
-        enable_poly_x: config.trim_poly_x,
-        poly_min_len: config.poly_g_min_len,
-        adapter_config,
-    };
-
-    // Process
-    let acc = process_fastq_stream(
-        reader,
-        &mut output,
-        config.min_length,
-        config.n_base_limit,
-        config.qualified_quality_phred,
-        config.unqualified_percent_limit,
-        config.average_qual,
-        config.low_complexity_filter,
-        config.complexity_threshold,
-        &trimming_config,
+    let args = ["-i", "in.fq", "-o", "out.fq"].map(String::from).to_vec();
+    let (mut outputs, json_report, passed_reads, failed_reads) = run_config(
+        config,
+        vec![("in.fq".into(), input.to_vec())],
+        args,
+        &["out.fq"],
     )
-    .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    // Build report
-    let before_stats = acc.before.to_read_stats();
-    let after_stats = acc.after.to_read_stats();
-    let kmer_map = acc.kmer_table_to_map();
-    let duplication_rate = stats::calculate_duplication_rate(&kmer_map);
-
-    // Create a simple JSON report
-    let report = serde_json::json!({
-        "summary": {
-            "before_filtering": {
-                "total_reads": before_stats.total_reads,
-                "total_bases": before_stats.total_bases,
-                "q20_bases": before_stats.q20_bases,
-                "q30_bases": before_stats.q30_bases,
-                "gc_content": before_stats.gc_content,
-            },
-            "after_filtering": {
-                "total_reads": after_stats.total_reads,
-                "total_bases": after_stats.total_bases,
-                "q20_bases": after_stats.q20_bases,
-                "q30_bases": after_stats.q30_bases,
-                "gc_content": after_stats.gc_content,
-            }
-        },
-        "filtering_result": {
-            "passed_filter_reads": acc.after.total_reads,
-            "low_quality_reads": acc.low_quality,
-            "low_complexity_reads": acc.low_complexity,
-            "too_many_n_reads": acc.too_many_n,
-            "too_short_reads": acc.too_short,
-        },
-        "duplication": {
-            "rate": duplication_rate
-        }
-    });
-
-    let json_report =
-        serde_json::to_string_pretty(&report).map_err(|e| JsValue::from_str(&e.to_string()))?;
-
+    .map_err(js_error)?;
     Ok(WasmProcessResult {
-        output,
+        output: outputs.remove(0),
         json_report,
-        passed_reads: acc.after.total_reads,
-        failed_reads: acc.before.total_reads - acc.after.total_reads,
+        passed_reads,
+        failed_reads,
     })
 }
 
-/// Process paired-end FASTQ data
-///
-/// # Arguments
-/// * `input1` - Raw FASTQ data for read 1
-/// * `input2` - Raw FASTQ data for read 2
-/// * `config` - Processing configuration
-///
-/// # Returns
-/// Tuple of (output1, output2, json_report)
+/// Process paired-end FASTQ data (plain or gzip) with `config`.
 #[wasm_bindgen]
 pub fn process_paired_end(
     input1: &[u8],
     input2: &[u8],
     config: &WasmConfig,
 ) -> Result<WasmPairedResult, JsValue> {
-    // Detect if inputs are gzip compressed
-    let reader1: Box<dyn std::io::BufRead> =
-        if input1.len() >= 2 && input1[0] == 0x1f && input1[1] == 0x8b {
-            use flate2::read::MultiGzDecoder;
-            let decoder = MultiGzDecoder::new(Cursor::new(input1));
-            Box::new(std::io::BufReader::new(decoder))
-        } else {
-            Box::new(std::io::BufReader::new(Cursor::new(input1)))
-        };
-
-    let reader2: Box<dyn std::io::BufRead> =
-        if input2.len() >= 2 && input2[0] == 0x1f && input2[1] == 0x8b {
-            use flate2::read::MultiGzDecoder;
-            let decoder = MultiGzDecoder::new(Cursor::new(input2));
-            Box::new(std::io::BufReader::new(decoder))
-        } else {
-            Box::new(std::io::BufReader::new(Cursor::new(input2)))
-        };
-
-    let mut output1 = Vec::new();
-    let mut output2 = Vec::new();
-
-    // Create adapter config
-    let adapter_config = AdapterConfig::new();
-
-    // Create trimming configs
-    let trimming_config = TrimmingConfig {
-        enable_trim_front: config.cut_front && config.cut_mean_quality > 0,
-        enable_trim_tail: config.cut_tail && config.cut_mean_quality > 0,
-        cut_mean_quality: config.cut_mean_quality,
-        cut_window_size: config.cut_window_size,
-        trim_front_bases: config.trim_front,
-        trim_tail_bases: config.trim_tail,
-        max_len: config.max_length,
-        enable_poly_g: config.trim_poly_g,
-        enable_poly_x: config.trim_poly_x,
-        poly_min_len: config.poly_g_min_len,
-        adapter_config: adapter_config.clone(),
-    };
-
-    let trimming_config_r2 = trimming_config.clone();
-
-    // Process
-    let pe_acc = process_paired_fastq_stream(
-        reader1,
-        reader2,
-        &mut output1,
-        &mut output2,
-        None::<&mut Vec<u8>>,
-        false,
-        false,
-        config.min_length,
-        config.n_base_limit,
-        config.qualified_quality_phred,
-        config.unqualified_percent_limit,
-        config.average_qual,
-        config.low_complexity_filter,
-        config.complexity_threshold,
-        &trimming_config,
-        &trimming_config_r2,
-        None,
-        None,
-        None,
-        None,
-    )
-    .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    // Build report
-    let before_stats_r1 = pe_acc.before_r1.to_read_stats();
-    let after_stats_r1 = pe_acc.after_r1.to_read_stats();
-    let before_stats_r2 = pe_acc.before_r2.to_read_stats();
-    let after_stats_r2 = pe_acc.after_r2.to_read_stats();
-
-    let report = serde_json::json!({
-        "summary": {
-            "read1_before_filtering": {
-                "total_reads": before_stats_r1.total_reads,
-                "total_bases": before_stats_r1.total_bases,
-                "gc_content": before_stats_r1.gc_content,
-            },
-            "read1_after_filtering": {
-                "total_reads": after_stats_r1.total_reads,
-                "total_bases": after_stats_r1.total_bases,
-                "gc_content": after_stats_r1.gc_content,
-            },
-            "read2_before_filtering": {
-                "total_reads": before_stats_r2.total_reads,
-                "total_bases": before_stats_r2.total_bases,
-                "gc_content": before_stats_r2.gc_content,
-            },
-            "read2_after_filtering": {
-                "total_reads": after_stats_r2.total_reads,
-                "total_bases": after_stats_r2.total_bases,
-                "gc_content": after_stats_r2.gc_content,
-            }
-        },
-        "filtering_result": {
-            "passed_filter_reads": pe_acc.after_r1.total_reads,
-            "low_quality_reads": pe_acc.low_quality,
-            "low_complexity_reads": pe_acc.low_complexity,
-            "too_many_n_reads": pe_acc.too_many_n,
-            "too_short_reads": pe_acc.too_short,
-        }
-    });
-
-    let json_report =
-        serde_json::to_string_pretty(&report).map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    let total_before = before_stats_r1.total_reads + before_stats_r2.total_reads;
-    let total_after = after_stats_r1.total_reads + after_stats_r2.total_reads;
-
+    let args = [
+        "-i", "in1.fq", "-I", "in2.fq", "-o", "out1.fq", "-O", "out2.fq",
+    ]
+    .map(String::from)
+    .to_vec();
+    let inputs = vec![
+        ("in1.fq".into(), input1.to_vec()),
+        ("in2.fq".into(), input2.to_vec()),
+    ];
+    let (mut outputs, json_report, passed_reads, failed_reads) =
+        run_config(config, inputs, args, &["out1.fq", "out2.fq"]).map_err(js_error)?;
     Ok(WasmPairedResult {
-        output1,
-        output2,
+        output2: outputs.pop().unwrap(),
+        output1: outputs.pop().unwrap(),
         json_report,
-        passed_reads: total_after,
-        failed_reads: total_before - total_after,
+        passed_reads,
+        failed_reads,
     })
 }
 
-/// Result of processing paired-end FASTQ files
 #[wasm_bindgen]
 pub struct WasmPairedResult {
     output1: Vec<u8>,

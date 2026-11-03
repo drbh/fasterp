@@ -3,6 +3,24 @@
 //! All unsafe operations are encapsulated in small, auditable functions.
 //! Callers must validate lengths/capacity before calling these functions.
 
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) use std::time::Instant;
+
+/// `std::time::Instant::now` panics on wasm32-unknown-unknown; use the JS clock.
+#[cfg(target_arch = "wasm32")]
+#[derive(Clone, Copy)]
+pub(crate) struct Instant(f64);
+
+#[cfg(target_arch = "wasm32")]
+impl Instant {
+    pub(crate) fn now() -> Self {
+        Self(js_sys::Date::now())
+    }
+    pub(crate) fn elapsed(&self) -> std::time::Duration {
+        std::time::Duration::from_secs_f64(((js_sys::Date::now() - self.0) / 1000.0).max(0.0))
+    }
+}
+
 /// Fast iteration over seq, qual, and position index without bounds checks
 ///
 /// # Safety
