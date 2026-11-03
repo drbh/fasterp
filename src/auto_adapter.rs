@@ -1,5 +1,6 @@
 //! Adapter evaluation ported from OpenGene/fastp v1.4.0 evaluator.cpp and
 //! nucleotidetree.cpp. Upstream copyright and MIT terms: LICENSE.fastp.
+use rayon::prelude::*;
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 
@@ -121,7 +122,7 @@ fn known(reads: &[&[u8]]) -> Option<Vec<u8>> {
         .then(|| KNOWN[best].to_vec())
 }
 
-fn count_seeds(read: &[u8], shift: usize, counts: &mut [usize]) {
+fn count_seeds(read: &[u8], shift: usize, counts: &mut [u32]) {
     let end = read.len().saturating_sub(10 + shift).saturating_add(1);
     if end <= 20 {
         return;
@@ -148,10 +149,11 @@ fn count_seeds(read: &[u8], shift: usize, counts: &mut [usize]) {
     }
 }
 
+/// 40 bytes: children are node indices, 0 for none (the root is never a child).
 #[derive(Default)]
 struct Node {
-    children: [Option<usize>; 8],
-    count: usize,
+    children: [u32; 8],
+    count: u32,
     base: u8,
 }
 
@@ -171,16 +173,17 @@ impl Tree {
                 break;
             }
             let idx = (b & 7) as usize;
-            let child = if let Some(child) = self.nodes[node].children[idx] {
-                child
-            } else {
-                let child = self.nodes.len();
-                self.nodes.push(Node {
-                    base: b,
-                    ..Node::default()
-                });
-                self.nodes[node].children[idx] = Some(child);
-                child
+            let child = match self.nodes[node].children[idx] {
+                0 => {
+                    let child = self.nodes.len();
+                    self.nodes.push(Node {
+                        base: b,
+                        ..Node::default()
+                    });
+                    self.nodes[node].children[idx] = child as u32;
+                    child
+                }
+                child => child as usize,
             };
             self.nodes[child].count += 1;
             node = child;
@@ -190,21 +193,19 @@ impl Tree {
         let mut node = 0;
         let mut path = Vec::new();
         loop {
-            let total: usize = self.nodes[node]
-                .children
-                .iter()
-                .flatten()
-                .map(|&n| self.nodes[n].count)
-                .sum();
+            let children = || {
+                self.nodes[node]
+                    .children
+                    .iter()
+                    .filter(|&&n| n != 0)
+                    .map(|&n| n as usize)
+            };
+            let total: usize = children().map(|n| self.nodes[n].count as usize).sum();
             if total < 50 {
                 break;
             }
-            let next = self.nodes[node]
-                .children
-                .iter()
-                .flatten()
-                .find(|&&n| self.nodes[n].count as f64 / total as f64 >= 0.95);
-            if let Some(&next) = next {
+            let next = children().find(|&n| self.nodes[n].count as f64 / total as f64 >= 0.95);
+            if let Some(next) = next {
                 path.push(self.nodes[next].base);
                 node = next;
             } else {
@@ -224,15 +225,29 @@ pub fn detect(reads: &[&[u8]], tail: usize) -> Option<Vec<u8>> {
         return Some(known);
     }
     let shift = tail.max(1);
-    let mut counts = vec![0usize; 1 << 20];
-    for r in reads {
-        count_seeds(r, shift, &mut counts);
-    }
+    // Seed counts are sums, so each thread counts a contiguous share of the
+    // sample into its own table (u32 is enough for 256K reads) and they add up.
+    let share = reads.len().div_ceil(rayon::current_num_threads()).max(1);
+    let mut counts = reads
+        .par_chunks(share)
+        .map(|chunk| {
+            let mut counts = vec![0u32; 1 << 20];
+            for r in chunk {
+                count_seeds(r, shift, &mut counts);
+            }
+            counts
+        })
+        .reduce_with(|mut a, b| {
+            a.iter_mut().zip(b).for_each(|(a, b)| *a += b);
+            a
+        })
+        .unwrap_or_else(|| vec![0; 1 << 20]);
     counts[0] = 0;
     // Only the ten highest (count, key) pairs are used by discovery.
     let mut candidates = BinaryHeap::with_capacity(10);
     let mut total = 0;
     for (key, &n) in counts.iter().enumerate() {
+        let n = n as usize;
         if n == 0 {
             continue;
         }
@@ -270,15 +285,25 @@ pub fn detect(reads: &[&[u8]], tail: usize) -> Option<Vec<u8>> {
         if seed.windows(2).filter(|w| w[0] != w[1]).count() < 3 {
             continue;
         }
+        // Find every seed hit in parallel, then add them to the trees in
+        // read order, as a single pass would.
+        let seed_ref = &seed[..];
+        let hits: Vec<(usize, usize)> = reads
+            .par_iter()
+            .enumerate()
+            .flat_map_iter(|(i, r)| {
+                let end = 500.min(r.len().saturating_sub(10 + shift).saturating_add(1));
+                (20..end)
+                    .filter(move |&pos| &r[pos..pos + 10] == seed_ref)
+                    .map(move |pos| (i, pos))
+            })
+            .collect();
         let mut forward = Tree::new();
         let mut backward = Tree::new();
-        for r in reads {
-            for pos in 20..500.min(r.len().saturating_sub(10 + shift).saturating_add(1)) {
-                if r[pos..pos + 10] == seed {
-                    forward.add(r[pos + 10..r.len() - shift].iter().copied());
-                    backward.add(r[..pos].iter().rev().copied());
-                }
-            }
+        for (i, pos) in hits {
+            let r = reads[i];
+            forward.add(r[pos + 10..r.len() - shift].iter().copied());
+            backward.add(r[..pos].iter().rev().copied());
         }
         let mut leaf = true;
         let right = forward.path(&mut leaf);

@@ -2725,15 +2725,27 @@ pub fn run(mut a: Args) -> Result<()> {
                 .collect()
         }
     };
+    let threads = worker_threads(&a);
+    #[cfg(not(target_arch = "wasm32"))]
+    let owned_pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(threads)
+        .build()?;
+    #[cfg(not(target_arch = "wasm32"))]
+    let pool = &owned_pool;
+    #[cfg(target_arch = "wasm32")]
+    let pool = wasm_pool()?;
+    // Detection scans the whole sample; it runs on the worker pool.
+    let detect =
+        |mate: usize| pool.install(|| auto_adapter::detect(&sample_sequences(mate), a.trim_tail1));
     if !a.disable_adapter_trimming && !a.disable_adapter_detection && sample_count >= 10000 {
         if !pe && adapters[0].is_none() {
-            adapters[0] = auto_adapter::detect(&sample_sequences(0), a.trim_tail1);
+            adapters[0] = detect(0);
         } else if pe && a.detect_adapter_for_pe {
             if adapters[0].is_none() {
-                adapters[0] = auto_adapter::detect(&sample_sequences(0), a.trim_tail1);
+                adapters[0] = detect(0);
             }
             if adapters[1].is_none() {
-                adapters[1] = auto_adapter::detect(&sample_sequences(1), a.trim_tail1);
+                adapters[1] = detect(1);
             }
         }
     }
@@ -2759,15 +2771,6 @@ pub fn run(mut a: Args) -> Result<()> {
         load_sequences(a.filter_by_index1.as_deref(), false)?,
         load_sequences(a.filter_by_index2.as_deref(), false)?,
     ];
-    let threads = worker_threads(&a);
-    #[cfg(not(target_arch = "wasm32"))]
-    let owned_pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(threads)
-        .build()?;
-    #[cfg(not(target_arch = "wasm32"))]
-    let pool = &owned_pool;
-    #[cfg(target_arch = "wasm32")]
-    let pool = wasm_pool()?;
     let max_bytes = if let Some(mb) = a.max_memory {
         ensure!(mb >= 16, "--max_memory must be at least 16 MB");
         a.batch_bytes.min(mb.saturating_mul(1024 * 1024) / 8).max(1)
