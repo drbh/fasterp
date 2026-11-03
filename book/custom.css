@@ -41,3 +41,36 @@
         padding: 6px;
     }
 }
+
+/* Benchmarks chapter (src/benchmarks.js). Series colors are checked for
+   color-blind separation and contrast against each theme background. */
+:root {
+    --bench-fastp: #2a78d6;
+    --bench-fasterp: #eb6834;
+}
+.coal, .navy, .ayu {
+    --bench-fastp: #3987e5;
+    --bench-fasterp: #d95926;
+}
+.bench-legend { display: flex; gap: 16px; font-size: 0.9em; margin: 0 0 8px; }
+.bench-legend span::before {
+    content: ""; display: inline-block; width: 12px; height: 12px;
+    border-radius: 2px; margin-right: 6px; vertical-align: -1px;
+}
+.bench-legend .fastp::before { background: var(--bench-fastp); }
+.bench-legend .fasterp::before { background: var(--bench-fasterp); }
+.bench-dataset { margin: 0 0 24px; }
+.bench-dataset figcaption { font-weight: 600; margin-bottom: 4px; }
+.bench-grid-panels { display: grid; gap: 8px 16px; }
+.bench-panel-title { font-size: 0.85em; color: var(--icons); }
+.bench-panel { display: block; }
+.bench-panel text { font-family: inherit; }
+.bench-tick { fill: var(--icons); font-size: 11px; }
+.bench-label { fill: var(--fg); font-size: 11px; }
+.bench-grid { stroke: var(--table-border-color); stroke-width: 1; }
+.bench-fastp { fill: var(--bench-fastp); }
+.bench-fasterp { fill: var(--bench-fasterp); }
+.bench-whisker { stroke: var(--fg); stroke-width: 1; opacity: 0.6; }
+.bench-hit { fill: transparent; }
+.bench-mark:hover rect:not(.bench-hit) { opacity: 0.8; }
+.bench-meta { font-size: 0.85em; color: var(--icons); }

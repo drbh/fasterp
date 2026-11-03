@@ -1980,6 +1980,12 @@ impl Output {
     }
 }
 
+/// fastp defaults to 3 workers. Output does not depend on the worker count, so
+/// fasterp uses every CPU by default, up to the 16 workers fastp allows.
+fn worker_threads(a: &Args) -> usize {
+    a.threads.unwrap_or_else(|| num_cpus::get().clamp(1, 16))
+}
+
 fn validate(a: &Args) -> Result<()> {
     let pe = a.input2.is_some() || a.interleaved_in;
     ensure!(
@@ -2020,7 +2026,7 @@ fn validate(a: &Args) -> Result<()> {
         "Cannot enable and disable polyG trimming together"
     );
     ensure!(
-        (1..=16).contains(&a.threads.unwrap_or(3)),
+        (1..=16).contains(&worker_threads(a)),
         "Worker thread count must be between 1 and 16"
     );
     ensure!(
@@ -2567,7 +2573,7 @@ pub fn run(mut a: Args) -> Result<()> {
         load_sequences(a.filter_by_index1.as_deref(), false)?,
         load_sequences(a.filter_by_index2.as_deref(), false)?,
     ];
-    let threads = a.threads.unwrap_or(3);
+    let threads = worker_threads(&a);
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(threads)
         .build()?;
