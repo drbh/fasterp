@@ -153,7 +153,8 @@
   var chartRoot = document.getElementById('bench-chart');
   if (!chartRoot) return;
   var prefix = (typeof path_to_root !== 'undefined' && path_to_root) ? path_to_root : '';
-  fetch(prefix + 'benchmarks.csv')
+  // Revalidate on every load so new rows show up without a hard reload.
+  fetch(prefix + 'benchmarks.csv', { cache: 'no-cache' })
     .then(function (response) { return response.text(); })
     .then(function (text) {
       var rows = parse(text);
