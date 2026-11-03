@@ -11,7 +11,8 @@
 #   CSV=book/src/benchmarks.csv bash scripts/bench.sh
 #
 # updates that dataset in the book's benchmarks chapter. Override with R1, R2,
-# DATASET, WORKERS (comma separated), RUNS and OUT.
+# DATASET, WORKERS (comma separated), RUNS and OUT. ARGS is added to every
+# command for both programs, for example ARGS=-g to trim poly-G tails.
 set -euo pipefail
 
 fastp=${1:-fastp}
@@ -22,6 +23,7 @@ dataset=${DATASET:-$(basename "$r1" | sed 's/_1\..*//')}
 workers=${WORKERS:-1,4,8}
 runs=${RUNS:-3}
 out=${OUT:-target/bench}
+extra=${ARGS:-}
 csv=${CSV:-$out/results.csv}
 
 command -v hyperfine >/dev/null || { echo "hyperfine is required (brew install hyperfine)" >&2; exit 1; }
@@ -46,8 +48,8 @@ bench() {
   local name=$1 args=$2 w
   for w in ${workers//,/ }; do
     hyperfine --warmup 1 --runs "$runs" --export-csv "$tmp/run.csv" \
-      -n "fastp $w" "$fastp $args -j $tmp/fastp.json -h $tmp/fastp.html -w $w" \
-      -n "fasterp $w" "$fasterp $args -j $tmp/fasterp.json -h $tmp/fasterp.html -w $w"
+      -n "fastp $w" "$fastp $args $extra -j $tmp/fastp.json -h $tmp/fastp.html -w $w" \
+      -n "fasterp $w" "$fasterp $args $extra -j $tmp/fasterp.json -h $tmp/fasterp.html -w $w"
     # hyperfine columns: command,mean,stddev,median,user,system,min,max
     tail -n +2 "$tmp/run.csv" | while IFS=, read -r command mean stddev _ _ _ min max; do
       program=${command% *}
