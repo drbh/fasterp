@@ -49,6 +49,8 @@ pub(crate) fn is_s3_path(_path: &str) -> bool {
     false
 }
 
+pub(crate) fn set_split_decoding(_enabled: bool) {}
+
 pub(crate) fn threads_per_output(_outputs: usize) -> usize {
     1
 }

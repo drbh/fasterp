@@ -2591,6 +2591,9 @@ pub fn run(mut a: Args) -> Result<()> {
     } else {
         None
     };
+    // A second input brings its own decoder thread, and output compression
+    // then needs the cores; split decoding of one member pays off only alone.
+    io::set_split_decoding(a.input2.is_none());
     let mut reader1 = Reader::open(&a.input, a.phred64)?;
     let mut reader2 = a
         .input2

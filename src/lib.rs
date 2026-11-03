@@ -40,6 +40,8 @@ pub mod io;
 #[cfg(feature = "native")]
 pub mod gzip;
 #[cfg(feature = "native")]
+mod pgzip;
+#[cfg(feature = "native")]
 pub mod pipeline;
 
 pub use args::Args;

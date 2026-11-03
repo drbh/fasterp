@@ -1091,6 +1091,7 @@ dependencies = [
  "aws-sdk-s3",
  "bytes",
  "clap",
+ "crc32fast",
  "criterion",
  "crossbeam-channel",
  "flate2",

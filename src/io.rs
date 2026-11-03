@@ -686,6 +686,14 @@ impl Drop for PrefetchInput {
 }
 
 /// Open input file, URL, S3, or stdin with automatic decompression.
+static SPLIT_DECODING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether large single-member gzip inputs opened from now on are decoded in
+/// parallel regions (`pgzip`) rather than by one sequential decoder.
+pub(crate) fn set_split_decoding(enabled: bool) {
+    SPLIT_DECODING.store(enabled, std::sync::atomic::Ordering::Relaxed);
+}
+
 pub(crate) fn open_input(path: &str) -> Result<Box<dyn BufRead + Send>> {
     let raw: Box<dyn Read + Send> = if path == "-" || path == "/dev/stdin" {
         Box::new(std::io::stdin())
@@ -717,6 +725,27 @@ pub(crate) fn open_input(path: &str) -> Result<Box<dyn BufRead + Send>> {
                 let (sender, receiver) = crossbeam_channel::bounded(2);
                 let (recycle, _) = crossbeam_channel::bounded::<Vec<u8>>(1);
                 let worker = std::thread::spawn(move || decompress_members(file, threads, sender));
+                return Ok(Box::new(PrefetchInput {
+                    receiver: Some(receiver),
+                    recycle,
+                    worker: Some(worker),
+                    buffer: Vec::new(),
+                    position: 0,
+                    finished: false,
+                }));
+            }
+            if local
+                && SPLIT_DECODING.load(std::sync::atomic::Ordering::Relaxed)
+                && std::fs::metadata(path).is_ok_and(|m| crate::pgzip::worth_it(m.len()))
+            {
+                // One large member: decode regions of it in parallel.
+                drop(buffered);
+                let threads = num_cpus::get().div_ceil(2).clamp(2, 8);
+                let (sender, receiver) = crossbeam_channel::bounded(4);
+                let (recycle, _) = crossbeam_channel::bounded::<Vec<u8>>(1);
+                let path = path.to_string();
+                let worker =
+                    std::thread::spawn(move || crate::pgzip::decompress(&path, threads, sender));
                 return Ok(Box::new(PrefetchInput {
                     receiver: Some(receiver),
                     recycle,
