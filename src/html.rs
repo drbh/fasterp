@@ -6,7 +6,6 @@
 use crate::stats::{DetailedReadStats, FasterpReport, InsertSizeStats};
 use anyhow::{Context, Result};
 use std::fmt::Write as FmtWrite;
-use std::fs::File;
 use std::io::Write;
 use std::time::Duration;
 
@@ -33,8 +32,8 @@ pub fn generate_html_report(
     write_footer(&mut html);
 
     // Write to file
-    let mut file =
-        File::create(output_path).context(format!("Failed to create HTML file: {output_path}"))?;
+    let mut file = crate::io::create_file(output_path)
+        .context(format!("Failed to create HTML file: {output_path}"))?;
     file.write_all(html.as_bytes())?;
 
     Ok(())

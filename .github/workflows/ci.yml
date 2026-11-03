@@ -120,6 +120,14 @@ jobs:
         mkdir -p book/src/playground/pkg
         cp -r pkg/* book/src/playground/pkg/
 
+    - name: Check WASM matches the native CLI
+      run: |
+        wasm-bindgen target/wasm32-unknown-unknown/release/fasterp.wasm --out-dir target/wasm-node --target nodejs
+        mkdir -p target/wasm-parity
+        gzip -dc test_data/SRR5808766_1.fastq.gz | head -n 400000 > target/wasm-parity/R1.fq || true
+        gzip -dc test_data/SRR5808766_2.fastq.gz | head -n 400000 > target/wasm-parity/R2.fq || true
+        node scripts/wasm_parity.js target/wasm-node target/release/fasterp target/wasm-parity/R1.fq target/wasm-parity/R2.fq
+
     - name: Build documentation
       run: |
         # Build mdBook

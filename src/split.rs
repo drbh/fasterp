@@ -69,7 +69,7 @@ impl SplitWriter {
             config,
             compression_level,
             parallel_compression,
-            crate::gzip::threads_per_output(1),
+            crate::io::threads_per_output(1),
         )
     }
 
@@ -240,7 +240,8 @@ impl Write for SplitWriter {
     }
 }
 
-#[cfg(test)]
+// These write real files.
+#[cfg(all(test, feature = "native"))]
 mod tests {
     use super::*;
     use tempfile::TempDir;
