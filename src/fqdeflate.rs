@@ -32,15 +32,24 @@ const HASH_BITS: u32 = 12;
 const MAX_BINS: u32 = 6;
 const SAMPLE_RECORDS: usize = 64;
 
+/// Reads from a run sorted by alignment position overlap their neighbours,
+/// and level 4 finds those matches where this encoder does not: on a sorted
+/// 30x NovaSeq run its output was twice level 4's. There most reads share 16
+/// bases with one of the previous few; elsewhere almost none do outside
+/// duplicates. Blocks where more than a quarter of the tested reads do stay
+/// with libdeflate.
+const OVERLAP_READS: usize = 8;
+const OVERLAP_KEY: usize = 16;
+
 /// Whether the FASTQ-aware encoder should compress `input` instead of
-/// libdeflate: the block's first records have binned qualities. The choice
-/// depends only on the block, so output is the same on every run and thread
-/// count.
+/// libdeflate: the block's first records have binned qualities and do not
+/// overlap each other like sorted reads. The choice depends only on the
+/// block, so output is the same on every run and thread count.
 pub(crate) fn suits(input: &[u8]) -> bool {
-    binned(input)
+    binned_unsorted(input)
 }
 
-fn binned(data: &[u8]) -> bool {
+fn binned_unsorted(data: &[u8]) -> bool {
     let n = data.len();
     let mut pos = 0;
     while !record_starts(data, pos) {
@@ -51,6 +60,8 @@ fn binned(data: &[u8]) -> bool {
     }
     let mut seen = [0u64; 4];
     let mut records = 0;
+    let mut overlapping = 0;
+    let mut sequences = [(0, 0); OVERLAP_READS];
     while records < SAMPLE_RECORDS && pos < n && data[pos] == b'@' {
         let seq = line_end(data, pos) + 1;
         let plus = line_end(data, seq.min(n)) + 1;
@@ -62,10 +73,28 @@ fn binned(data: &[u8]) -> bool {
         for &b in &data[qual..end] {
             seen[(b >> 6) as usize] |= 1 << (b & 63);
         }
+        let sequence = (seq, plus - 1);
+        if records % 4 == 3 && sequence.1 - sequence.0 >= 2 * OVERLAP_KEY {
+            let middle = (sequence.0 + sequence.1) / 2;
+            let key = memchr::memmem::Finder::new(
+                &data[middle - OVERLAP_KEY / 2..middle + OVERLAP_KEY / 2],
+            );
+            let earlier = &sequences[..records.min(OVERLAP_READS)];
+            if earlier
+                .iter()
+                .any(|&(a, b)| key.find(&data[a..b]).is_some())
+            {
+                overlapping += 1;
+            }
+        }
+        sequences[records % OVERLAP_READS] = sequence;
         records += 1;
         pos = end + 1;
     }
-    records > 0 && seen.iter().map(|w| w.count_ones()).sum::<u32>() <= MAX_BINS
+    records > 0
+        && seen.iter().map(|w| w.count_ones()).sum::<u32>() <= MAX_BINS
+        // Every fourth record is tested.
+        && overlapping * 16 <= records
 }
 
 // ---- static tables --------------------------------------------------------
@@ -1059,6 +1088,34 @@ mod tests {
             .copied()
             .collect();
         roundtrip(&mixed);
+    }
+
+    #[test]
+    fn sorted_reads_stay_with_libdeflate() {
+        // A genome and binned qualities; reads start at random positions, or
+        // at increasing ones as in a run sorted by alignment position.
+        let mut x = 7u64;
+        let mut next = |n: usize| {
+            x = x.wrapping_mul(6364136223846793005).wrapping_add(1);
+            (x >> 33) as usize % n
+        };
+        let genome: Vec<u8> = (0..1 << 20).map(|_| b"ACGT"[next(4)]).collect();
+        let fastq = |starts: &mut dyn FnMut(usize) -> usize| {
+            let mut out = Vec::new();
+            for i in 0..800 {
+                let at = starts(i);
+                out.extend_from_slice(format!("@ERR3239279.{i} {i}/1\n").as_bytes());
+                out.extend_from_slice(&genome[at..at + 150]);
+                out.extend_from_slice(b"\n+\n");
+                out.extend((0..150).map(|k| b"?5+%"[(k * 7 + i) % 4]));
+                out.push(b'\n');
+            }
+            out
+        };
+        let unsorted = fastq(&mut |_| next(genome.len() - 150));
+        let sorted = fastq(&mut |i| i * 5);
+        assert!(suits(&unsorted));
+        assert!(!suits(&sorted));
     }
 }
 
