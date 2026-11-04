@@ -967,7 +967,9 @@ pub(crate) fn gzip_member(input: &[u8], out: &mut Vec<u8>) {
     let size_at = out.len();
     out.extend_from_slice(&[0; 4]);
     MATCHER.with(|m| deflate(input, &mut m.borrow_mut(), out));
-    out.extend_from_slice(&crc32fast::hash(input).to_le_bytes());
+    let mut crc = libdeflater::Crc::new();
+    crc.update(input);
+    out.extend_from_slice(&crc.sum().to_le_bytes());
     out.extend_from_slice(&(input.len() as u32).to_le_bytes());
     let total = (out.len() - start) as u32;
     out[size_at..size_at + 4].copy_from_slice(&total.to_le_bytes());

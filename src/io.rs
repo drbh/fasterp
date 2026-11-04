@@ -398,7 +398,7 @@ struct PrefetchInput {
     /// each member, sent before the member's last buffer.
     trailers: Option<crossbeam_channel::Receiver<Trailer>>,
     trailer: Option<Trailer>,
-    hasher: crc32fast::Hasher,
+    hasher: libdeflater::Crc,
     hashed: u64,
 }
 
@@ -428,7 +428,7 @@ impl PrefetchInput {
             finished: false,
             trailers: Some(trailer_rx),
             trailer: None,
-            hasher: crc32fast::Hasher::new(),
+            hasher: libdeflater::Crc::new(),
             hashed: 0,
         }
     }
@@ -457,10 +457,10 @@ impl PrefetchInput {
         }
         match self.trailer {
             Some((crc, isize, bytes)) if self.hashed == bytes => {
-                let hasher = std::mem::replace(&mut self.hasher, crc32fast::Hasher::new());
+                let hasher = std::mem::replace(&mut self.hasher, libdeflater::Crc::new());
                 self.hashed = 0;
                 self.trailer = None;
-                if hasher.finalize() != crc || bytes as u32 != isize {
+                if hasher.sum() != crc || bytes as u32 != isize {
                     return Err(bad("corrupt gzip stream does not have a matching checksum"));
                 }
                 Ok(())
@@ -922,7 +922,7 @@ pub(crate) fn open_input(path: &str) -> Result<Box<dyn BufRead + Send>> {
                     finished: false,
                     trailers: None,
                     trailer: None,
-                    hasher: crc32fast::Hasher::new(),
+                    hasher: libdeflater::Crc::new(),
                     hashed: 0,
                 }));
             }
@@ -949,7 +949,7 @@ pub(crate) fn open_input(path: &str) -> Result<Box<dyn BufRead + Send>> {
                     finished: false,
                     trailers: None,
                     trailer: None,
-                    hasher: crc32fast::Hasher::new(),
+                    hasher: libdeflater::Crc::new(),
                     hashed: 0,
                 }));
             }
