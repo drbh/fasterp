@@ -66,10 +66,17 @@ impl FormatSpec for Gzip {
         &self,
         input: &[u8],
         encoder: &mut Compressor,
-        _level: Compression,
+        level: Compression,
         _dict: Option<&Bytes>,
         _is_last: bool,
     ) -> Result<Vec<u8>, GzpError> {
+        if (2..=4).contains(&level.level()) && crate::fqdeflate::suits(input) {
+            // Binned qualities: a FASTQ-aware encoder is as small as
+            // libdeflate at these levels and much faster.
+            let mut output = Vec::new();
+            crate::fqdeflate::gzip_member(input, &mut output);
+            return Ok(output);
+        }
         let mut output = vec![0; encoder.gzip_compress_bound(input.len())];
         let size = encoder
             .gzip_compress(input, &mut output)
