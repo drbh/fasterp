@@ -1,0 +1,46 @@
+[package]
+name = "fasterp-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+flate2 = "1.0"
+libdeflater = "1.21"
+fasterp = { path = ".." }
+
+# Not part of the main crate's build.
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "fqdeflate_roundtrip"
+path = "fuzz_targets/fqdeflate_roundtrip.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "pgzip_differential"
+path = "fuzz_targets/pgzip_differential.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "pgzip_corrupt"
+path = "fuzz_targets/pgzip_corrupt.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "gzip_members"
+path = "fuzz_targets/gzip_members.rs"
+test = false
+doc = false
+bench = false

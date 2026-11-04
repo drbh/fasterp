@@ -384,6 +384,11 @@ impl<'a> Inflater<'a> {
                     if sym < 256 {
                         out[*n] = T::byte(sym as u8);
                         *n += 1;
+                        // Past the end the bits read as zeros, which can
+                        // decode as literals forever: stop there as copies do.
+                        if bits.overrun() {
+                            return Err(Error::More);
+                        }
                         continue;
                     }
                 }
@@ -621,36 +626,89 @@ fn find_block(data: &[u8], from: usize, to: usize) -> Option<usize> {
 
 // driver
 
-#[cfg(unix)]
-fn read_at(file: &File, buf: &mut [u8], offset: u64) -> io::Result<()> {
-    std::os::unix::fs::FileExt::read_exact_at(file, buf, offset)
+/// Compressed input: a file, or bytes in memory for tests and fuzzing.
+pub(crate) trait Source: Sync {
+    fn len(&self) -> usize;
+    /// Fill `buf` with the bytes at `offset`.
+    fn read_at(&self, buf: &mut [u8], offset: usize) -> io::Result<()>;
+    /// The bytes from `offset` to the end, for the members after the first.
+    fn rest(&self, offset: usize) -> io::Result<Box<dyn Read + Send + '_>>;
 }
 
-#[cfg(windows)]
-fn read_at(file: &File, mut buf: &mut [u8], mut offset: u64) -> io::Result<()> {
-    while !buf.is_empty() {
-        match std::os::windows::fs::FileExt::seek_read(file, buf, offset)? {
-            0 => return Err(io::ErrorKind::UnexpectedEof.into()),
-            n => {
-                buf = &mut buf[n..];
-                offset += n as u64;
+pub(crate) struct FileSource {
+    file: File,
+    len: usize,
+}
+
+impl FileSource {
+    pub(crate) fn open(path: &str) -> io::Result<Self> {
+        let file = File::open(path)?;
+        let len = file.metadata()?.len() as usize;
+        Ok(Self { file, len })
+    }
+}
+
+impl Source for FileSource {
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    #[cfg(unix)]
+    fn read_at(&self, buf: &mut [u8], offset: usize) -> io::Result<()> {
+        std::os::unix::fs::FileExt::read_exact_at(&self.file, buf, offset as u64)
+    }
+
+    #[cfg(windows)]
+    fn read_at(&self, mut buf: &mut [u8], offset: usize) -> io::Result<()> {
+        let mut offset = offset as u64;
+        while !buf.is_empty() {
+            match std::os::windows::fs::FileExt::seek_read(&self.file, buf, offset)? {
+                0 => return Err(io::ErrorKind::UnexpectedEof.into()),
+                n => {
+                    buf = &mut buf[n..];
+                    offset += n as u64;
+                }
             }
         }
+        Ok(())
     }
-    Ok(())
+
+    fn rest(&self, offset: usize) -> io::Result<Box<dyn Read + Send + '_>> {
+        let mut file = self.file.try_clone()?;
+        io::Seek::seek(&mut file, io::SeekFrom::Start(offset as u64))?;
+        Ok(Box::new(file))
+    }
 }
 
-/// Bytes `from..to` of the file.
-fn read_range(file: &File, from: usize, to: usize) -> io::Result<Vec<u8>> {
+impl Source for &[u8] {
+    fn len(&self) -> usize {
+        <[u8]>::len(self)
+    }
+
+    fn read_at(&self, buf: &mut [u8], offset: usize) -> io::Result<()> {
+        let bytes = self
+            .get(offset..offset + buf.len())
+            .ok_or(io::ErrorKind::UnexpectedEof)?;
+        buf.copy_from_slice(bytes);
+        Ok(())
+    }
+
+    fn rest(&self, offset: usize) -> io::Result<Box<dyn Read + Send + '_>> {
+        Ok(Box::new(self.get(offset..).unwrap_or_default()))
+    }
+}
+
+/// Bytes `from..to` of the input.
+fn read_range(src: &dyn Source, from: usize, to: usize) -> io::Result<Vec<u8>> {
     let mut buf = Vec::new();
-    read_range_into(file, from, to, &mut buf)?;
+    read_range_into(src, from, to, &mut buf)?;
     Ok(buf)
 }
 
-/// Bytes `from..to` of the file into `buf`, reusing its capacity.
-fn read_range_into(file: &File, from: usize, to: usize, buf: &mut Vec<u8>) -> io::Result<()> {
+/// Bytes `from..to` of the input into `buf`, reusing its capacity.
+fn read_range_into(src: &dyn Source, from: usize, to: usize, buf: &mut Vec<u8>) -> io::Result<()> {
     buf.resize(to - from, 0);
-    read_at(file, buf, from as u64)
+    src.read_at(buf, from)
 }
 
 fn invalid(message: &str) -> io::Error {
@@ -660,7 +718,8 @@ fn invalid(message: &str) -> io::Error {
 /// Bit offset of the deflate stream after a gzip member header at `data[0]`.
 fn header_len(data: &[u8]) -> io::Result<usize> {
     let bad = || invalid("Invalid gzip header");
-    if data.len() < 10 || data[..3] != [0x1f, 0x8b, 8] {
+    // Reserved flag bits must be zero.
+    if data.len() < 10 || data[..3] != [0x1f, 0x8b, 8] || data[3] & 0xe0 != 0 {
         return Err(bad());
     }
     let flags = data[3];
@@ -680,6 +739,11 @@ fn header_len(data: &[u8]) -> io::Result<usize> {
         }
     }
     if flags & 2 != 0 {
+        // The header CRC covers every header byte before it.
+        let crc = data.get(at..at + 2).ok_or_else(bad)?;
+        if u16::from_le_bytes([crc[0], crc[1]]) != crc32fast::hash(&data[..at]) as u16 {
+            return Err(invalid("Invalid gzip header checksum"));
+        }
         at += 2;
     }
     if at > data.len() {
@@ -692,21 +756,22 @@ fn header_len(data: &[u8]) -> io::Result<usize> {
 /// reading more past the region if the block crossing its end needs it.
 /// `Ok(None)` means no block start was found in the region.
 fn region(
-    file: &File,
-    len: usize,
+    src: &dyn Source,
+    size: usize,
     k: usize,
     deflate: usize,
     start: Option<usize>,
     pool: &Pool,
 ) -> io::Result<Option<Decoded>> {
-    let begin = deflate / 8 + k * REGION;
-    let end = (begin + REGION).min(len);
+    let len = src.len();
+    let begin = deflate / 8 + k * size;
+    let end = (begin + size).min(len);
     let from = start.map_or(begin, |s| s / 8);
     let mut margin = MARGIN;
     let mut data = pool.bytes();
     let result = loop {
         let read_to = (end + margin).min(len);
-        if let Err(e) = read_range_into(file, from, read_to, &mut data) {
+        if let Err(e) = read_range_into(src, from, read_to, &mut data) {
             break Err(e);
         }
         let base = from * 8;
@@ -777,22 +842,45 @@ pub(crate) fn decompress(
     sender: crossbeam_channel::Sender<io::Result<Vec<u8>>>,
     returned: crossbeam_channel::Receiver<Vec<u8>>,
 ) {
-    if let Err(e) = run(path, threads, &sender, returned) {
+    let result =
+        FileSource::open(path).and_then(|src| run(&src, region_size(), threads, &sender, returned));
+    if let Err(e) = result {
         let _ = sender.send(Err(e));
     }
 }
 
+/// `decompress` from any source in regions of `size` compressed bytes.
+pub(crate) fn decompress_source(
+    src: &dyn Source,
+    size: usize,
+    threads: usize,
+    sender: crossbeam_channel::Sender<io::Result<Vec<u8>>>,
+    returned: crossbeam_channel::Receiver<Vec<u8>>,
+) {
+    if let Err(e) = run(src, size, threads, &sender, returned) {
+        let _ = sender.send(Err(e));
+    }
+}
+
+/// Region size for files: `REGION`, unless tests asked for smaller regions
+/// so that small inputs cross many of them.
+fn region_size() -> usize {
+    match crate::io::forced_split_region() {
+        0 => REGION,
+        size => size,
+    }
+}
+
 fn run(
-    path: &str,
+    src: &dyn Source,
+    size: usize,
     threads: usize,
     sender: &crossbeam_channel::Sender<io::Result<Vec<u8>>>,
     returned: crossbeam_channel::Receiver<Vec<u8>>,
 ) -> io::Result<()> {
-    let file = File::open(path)?;
-    let len = file.metadata()?.len() as usize;
-    let deflate = header_len(&read_range(&file, 0, len.min(64 << 10))?)?;
-    let regions = (len - deflate / 8).div_ceil(REGION).max(1);
-    let file = &file;
+    let len = src.len();
+    let deflate = header_len(&read_range(src, 0, len.min(64 << 10))?)?;
+    let regions = (len - deflate / 8).div_ceil(size).max(1);
     // Stops the workers early if the reader goes away.
     let stopped = std::sync::atomic::AtomicBool::new(false);
     let stopped = &stopped;
@@ -816,7 +904,7 @@ fn run(
                         // A failure here may only be a false block start, so
                         // the coordinator decides; it re-decodes from known output.
                         Job::Decode(k) => {
-                            let _ = decoded_tx.send((k, region(file, len, k, deflate, None, pool)));
+                            let _ = decoded_tx.send((k, region(src, size, k, deflate, None, pool)));
                         }
                         Job::Resolve(k, mut decoded, window) => {
                             let head = resolve(&decoded.head, &window, pool.bytes());
@@ -900,7 +988,7 @@ fn run(
                 jobs.send(Job::Decode(queued)).ok();
                 queued += 1;
             }
-            let region_end = (deflate / 8 + (k + 1) * REGION).min(len) * 8;
+            let region_end = (deflate / 8 + (k + 1) * size).min(len) * 8;
             if pos >= region_end {
                 // An earlier region's last block covered this one.
                 k += 1;
@@ -908,7 +996,7 @@ fn run(
             }
             let decoded = match result {
                 Ok(Some(d)) if d.start == pos => d,
-                _ => region(file, len, k, deflate, Some(pos), pool)?.unwrap(),
+                _ => region(src, size, k, deflate, Some(pos), pool)?.unwrap(),
             };
             // The next region's window is this region's last 32 KiB. Only that
             // much of the head is resolved here; workers resolve the rest.
@@ -958,7 +1046,7 @@ fn run(
         if trailer_at + 8 > len {
             return Err(invalid("Truncated gzip input"));
         }
-        let trailer = read_range(file, trailer_at, trailer_at + 8)?;
+        let trailer = read_range(src, trailer_at, trailer_at + 8)?;
         if u32::from_le_bytes(trailer[..4].try_into().unwrap()) != crc.finalize()
             || u32::from_le_bytes(trailer[4..].try_into().unwrap()) != total as u32
         {
@@ -966,8 +1054,7 @@ fn run(
         }
         // Any further members are decoded sequentially, as MultiGzDecoder would.
         if trailer_at + 8 < len {
-            let mut rest = File::open(path)?;
-            io::Seek::seek(&mut rest, io::SeekFrom::Start((trailer_at + 8) as u64))?;
+            let rest = src.rest(trailer_at + 8)?;
             let mut decoder =
                 flate2::bufread::MultiGzDecoder::new(io::BufReader::with_capacity(1 << 20, rest));
             loop {
@@ -1098,6 +1185,18 @@ mod tests {
                 total >> 20
             );
         }
+    }
+
+    #[test]
+    fn damaged_stream_fails_instead_of_decoding_zeros() {
+        // Found by fuzzing: a 40-byte damaged member whose block runs past
+        // the end of the input. The bits read there are zeros, which decoded
+        // as literals forever, until the decoder ran out of memory.
+        let gz = [
+            0x1f, 0x8b, 0x08, 0x04, 0, 0, 0, 0, 0, 0x03, 0x08, 0, 0x46, 0x50, 0x04, 0, 0x28, 0, 0,
+            0, 0x05, 0xc1, 0x81, 0x08, 0, 0, 0, 0, 0xa0, 0xfd, 0xa9, 0x2f, 0, 0, 0, 0, 0, 0, 0, 0,
+        ];
+        assert!(crate::testing::pgzip(&gz, 64, 1).is_err());
     }
 
     #[test]

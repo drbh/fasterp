@@ -471,6 +471,12 @@ impl PrefetchInput {
     }
 }
 
+/// Gzip input read ahead and checked member by member, as local files that
+/// cannot be split are read.
+pub(crate) fn read_gzip_ahead(input: BufReader<Box<dyn Read + Send>>) -> Box<dyn BufRead + Send> {
+    Box::new(PrefetchInput::new_gzip(input))
+}
+
 /// Bytes per buffer of decompressed gzip input.
 const BUFFER: usize = 1024 * 1024;
 
@@ -492,24 +498,38 @@ fn inflate_members(
             break;
         }
         input.read_exact(&mut header)?;
-        if header[0] != 0x1f || header[1] != 0x8b || header[2] != 8 {
+        // Reserved flag bits must be zero.
+        if header[0] != 0x1f || header[1] != 0x8b || header[2] != 8 || header[3] & 0xe0 != 0 {
             return Err(bad("invalid gzip header"));
         }
+        // The optional header CRC covers every header byte before it.
+        let mut header_crc = crc32fast::Hasher::new();
+        header_crc.update(&header);
         let flags = header[3];
         if flags & 0x04 != 0 {
             let mut len = [0u8; 2];
             input.read_exact(&mut len)?;
             let mut extra = vec![0u8; u16::from_le_bytes(len) as usize];
             input.read_exact(&mut extra)?;
+            header_crc.update(&len);
+            header_crc.update(&extra);
         }
         for flag in [0x08, 0x10] {
             if flags & flag != 0 {
-                let mut skipped = Vec::new();
-                input.read_until(0, &mut skipped)?;
+                let mut text = Vec::new();
+                input.read_until(0, &mut text)?;
+                if text.last() != Some(&0) {
+                    return Err(bad("invalid gzip header"));
+                }
+                header_crc.update(&text);
             }
         }
         if flags & 0x02 != 0 {
-            input.read_exact(&mut [0u8; 2])?;
+            let mut crc = [0u8; 2];
+            input.read_exact(&mut crc)?;
+            if u16::from_le_bytes(crc) != header_crc.finalize() as u16 {
+                return Err(bad("invalid gzip header checksum"));
+            }
         }
         // Deflate stream.
         let mut decoder = flate2::bufread::DeflateDecoder::new(input);
@@ -834,6 +854,20 @@ pub(crate) fn set_split_decoding(enabled: bool) {
     SPLIT_DECODING.store(enabled, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// Compressed bytes per region when tests force parallel decoding, or 0.
+static FORCED_SPLIT_REGION: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Decode every single-member gzip input in parallel, whatever its size or
+/// the run, in regions of `region` compressed bytes; 0 restores the normal
+/// choice. For tests, so that small inputs cross many regions.
+pub(crate) fn force_split_decoding(region: usize) {
+    FORCED_SPLIT_REGION.store(region, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub(crate) fn forced_split_region() -> usize {
+    FORCED_SPLIT_REGION.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Whether `path` is a local gzip file whose first records have binned
 /// qualities, judged from its first 256 KiB.
 pub(crate) fn binned_gzip_input(path: &str) -> bool {
@@ -892,10 +926,10 @@ pub(crate) fn open_input(path: &str) -> Result<Box<dyn BufRead + Send>> {
                     hashed: 0,
                 }));
             }
-            if local
-                && SPLIT_DECODING.load(std::sync::atomic::Ordering::Relaxed)
-                && std::fs::metadata(path).is_ok_and(|m| crate::pgzip::worth_it(m.len()))
-            {
+            let split = forced_split_region() > 0
+                || SPLIT_DECODING.load(std::sync::atomic::Ordering::Relaxed)
+                    && std::fs::metadata(path).is_ok_and(|m| crate::pgzip::worth_it(m.len()));
+            if local && split {
                 // One large member: decode regions of it in parallel.
                 drop(buffered);
                 let threads = num_cpus::get().div_ceil(2).clamp(2, 8);
@@ -1060,6 +1094,44 @@ mod input_tests {
             corrupt[bad][crc] ^= 1;
             std::fs::write(&path, corrupt.concat()).unwrap();
             assert!(read_all(&path).is_err(), "bad CRC in member {bad}");
+        }
+    }
+
+    #[test]
+    fn gzip_headers_are_checked_like_zlib() {
+        // Found by fuzzing: reserved flag bits and the optional header CRC
+        // were ignored, so damaged headers were accepted.
+        let data = b"@r\nACGT\n+\nFFFF\n".repeat(1000);
+        let plain = plain_gzip(&data);
+        let with_flags = |flags: u8, crc: Option<u16>| {
+            let mut out = plain[..10].to_vec();
+            out[3] = flags;
+            let crc = crc.unwrap_or(crc32fast::hash(&out) as u16);
+            out.extend_from_slice(&crc.to_le_bytes());
+            out.extend_from_slice(&plain[10..]);
+            out
+        };
+        let good = with_flags(2, None);
+        let bad_crc = with_flags(2, Some(crc32fast::hash(&good[..10]) as u16 ^ 1));
+        let mut reserved = plain.clone();
+        reserved[3] = 0x20;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("in.fq.gz");
+        for (name, bytes, ok) in [
+            ("header crc", &good, true),
+            ("bad header crc", &bad_crc, false),
+            ("reserved flag", &reserved, false),
+        ] {
+            std::fs::write(&path, bytes).unwrap();
+            assert_eq!(read_all(&path).is_ok(), ok, "{name}, sequential");
+            assert_eq!(
+                crate::testing::pgzip(bytes, 1024, 2).is_ok(),
+                ok,
+                "{name}, parallel"
+            );
+            if ok {
+                assert!(read_all(&path).unwrap() == data);
+            }
         }
     }
 

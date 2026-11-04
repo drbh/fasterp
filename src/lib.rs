@@ -45,6 +45,9 @@ pub mod gzip;
 mod pgzip;
 #[cfg(feature = "native")]
 pub mod pipeline;
+#[cfg(feature = "native")]
+#[doc(hidden)]
+pub mod testing;
 
 pub use args::Args;
 
