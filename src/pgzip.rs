@@ -22,7 +22,7 @@ use std::io::{self, Read};
 
 const WINDOW: usize = 32768;
 /// Compressed bytes per region.
-const REGION: usize = 4 << 20;
+const REGION: usize = 2 << 20;
 /// Bytes read past a region for the block that crosses its end.
 const MARGIN: usize = 1 << 20;
 
@@ -457,11 +457,63 @@ impl<'a> Inflater<'a> {
 /// Elements per copy step for back-references at least this far back.
 const CHUNK: usize = 16;
 
-/// Make `out` at least `need` long, doubling so growth is amortized.
+/// Make `out` at least `need` long. Capacity doubles so growth is amortized,
+/// but only a little past `need` is initialized: zero-filling the whole
+/// doubled buffer would make all of it resident and write it twice.
 fn grow<T: Symbol>(out: &mut Vec<T>, need: usize) {
     if out.len() < need {
-        let len = need.max(out.len() * 2).max(1 << 16);
+        let len = need + (1 << 18);
+        if out.capacity() < len {
+            out.reserve(len.max(out.capacity() * 2) - out.len());
+        }
         out.resize(len, T::byte(0));
+    }
+}
+
+/// Buffers kept for reuse between regions. Every region needs several
+/// megabytes of buffers; allocating them fresh faults in new zeroed pages, and
+/// freeing them unmaps pages, which interrupts every core.
+struct Pool {
+    bytes: (
+        crossbeam_channel::Sender<Vec<u8>>,
+        crossbeam_channel::Receiver<Vec<u8>>,
+    ),
+    words: (
+        crossbeam_channel::Sender<Vec<u16>>,
+        crossbeam_channel::Receiver<Vec<u16>>,
+    ),
+    /// Output buffers the reader is done with.
+    returned: crossbeam_channel::Receiver<Vec<u8>>,
+}
+
+impl Pool {
+    fn new(size: usize, returned: crossbeam_channel::Receiver<Vec<u8>>) -> Self {
+        Self {
+            bytes: crossbeam_channel::bounded(size),
+            words: crossbeam_channel::bounded(size),
+            returned,
+        }
+    }
+    fn bytes(&self) -> Vec<u8> {
+        let mut v = (self
+            .bytes
+            .1
+            .try_recv()
+            .or_else(|_| self.returned.try_recv()))
+        .unwrap_or_default();
+        v.clear();
+        v
+    }
+    fn words(&self) -> Vec<u16> {
+        let mut v = self.words.1.try_recv().unwrap_or_default();
+        v.clear();
+        v
+    }
+    fn give_bytes(&self, v: Vec<u8>) {
+        let _ = self.bytes.0.try_send(v);
+    }
+    fn give_words(&self, v: Vec<u16>) {
+        let _ = self.words.0.try_send(v);
     }
 }
 
@@ -481,13 +533,19 @@ struct Decoded {
 /// Decode from bit `start` of `data` until a block boundary at or after bit
 /// `stop`, or the final block. `first` means the stream starts at `start`, so
 /// there is no window and copies may not reach before it.
-fn decode(data: &[u8], start: usize, stop: usize, first: bool) -> Result<Decoded, Error> {
+fn decode(
+    data: &[u8],
+    start: usize,
+    stop: usize,
+    first: bool,
+    pool: &Pool,
+) -> Result<Decoded, Error> {
     let mut inflater = Inflater {
         bits: Bits::at(data, start),
         fixed: None,
     };
-    let mut head: Vec<u16> = Vec::new();
-    let mut tail: Vec<u8> = Vec::new();
+    let mut head = pool.words();
+    let mut tail = pool.bytes();
     let (mut head_n, mut tail_n) = (0, 0);
     let mut in_tail = first;
     let mut last_window = 0;
@@ -584,9 +642,15 @@ fn read_at(file: &File, mut buf: &mut [u8], mut offset: u64) -> io::Result<()> {
 
 /// Bytes `from..to` of the file.
 fn read_range(file: &File, from: usize, to: usize) -> io::Result<Vec<u8>> {
-    let mut buf = vec![0; to - from];
-    read_at(file, &mut buf, from as u64)?;
+    let mut buf = Vec::new();
+    read_range_into(file, from, to, &mut buf)?;
     Ok(buf)
+}
+
+/// Bytes `from..to` of the file into `buf`, reusing its capacity.
+fn read_range_into(file: &File, from: usize, to: usize, buf: &mut Vec<u8>) -> io::Result<()> {
+    buf.resize(to - from, 0);
+    read_at(file, buf, from as u64)
 }
 
 fn invalid(message: &str) -> io::Error {
@@ -633,35 +697,41 @@ fn region(
     k: usize,
     deflate: usize,
     start: Option<usize>,
+    pool: &Pool,
 ) -> io::Result<Option<Decoded>> {
     let begin = deflate / 8 + k * REGION;
     let end = (begin + REGION).min(len);
     let from = start.map_or(begin, |s| s / 8);
     let mut margin = MARGIN;
-    loop {
+    let mut data = pool.bytes();
+    let result = loop {
         let read_to = (end + margin).min(len);
-        let data = read_range(file, from, read_to)?;
+        if let Err(e) = read_range_into(file, from, read_to, &mut data) {
+            break Err(e);
+        }
         let base = from * 8;
         let local_start = match start {
             Some(s) => s - base,
             None if k == 0 => deflate - base,
             None => match find_block(&data, 0, (end - from) * 8) {
                 Some(bit) => bit,
-                None => return Ok(None),
+                None => break Ok(None),
             },
         };
         let first = k == 0 && start.is_none_or(|s| s == deflate);
-        match decode(&data, local_start, (end - from) * 8, first) {
+        match decode(&data, local_start, (end - from) * 8, first, pool) {
             Ok(mut decoded) => {
                 decoded.start += base;
                 decoded.end += base;
-                return Ok(Some(decoded));
+                break Ok(Some(decoded));
             }
             Err(Error::More) if read_to < len => margin *= 4,
-            Err(Error::More) => return Err(invalid("Truncated gzip input")),
-            Err(Error::Bad) => return Err(invalid("Invalid deflate data")),
+            Err(Error::More) => break Err(invalid("Truncated gzip input")),
+            Err(Error::Bad) => break Err(invalid("Invalid deflate data")),
         }
-    }
+    };
+    pool.give_bytes(data);
+    result
 }
 
 enum Job {
@@ -671,7 +741,7 @@ enum Job {
 }
 
 /// Bytes for `head`, filling placeholders from `window`, the bytes before it.
-fn resolve(head: &[u16], window: &[u8]) -> io::Result<Vec<u8>> {
+fn resolve(head: &[u16], window: &[u8], mut out: Vec<u8>) -> io::Result<Vec<u8>> {
     let mut lut = [0u8; 256 + WINDOW];
     for (i, b) in lut[..256].iter_mut().enumerate() {
         *b = i as u8;
@@ -687,7 +757,9 @@ fn resolve(head: &[u16], window: &[u8]) -> io::Result<Vec<u8>> {
     {
         return Err(invalid("Invalid deflate distance"));
     }
-    Ok(head.iter().map(|&s| lut[usize::from(s)]).collect())
+    out.clear();
+    out.extend(head.iter().map(|&s| lut[usize::from(s)]));
+    Ok(out)
 }
 
 /// Whether a gzip file of `len` bytes spans enough regions to decode in parallel.
@@ -698,12 +770,14 @@ pub(crate) fn worth_it(len: u64) -> bool {
 /// Decompress the gzip file at `path` on `threads` workers, sending output in
 /// order on `sender`, then an empty buffer at the end. Members after the first
 /// are decoded sequentially.
+/// The reader hands buffers it is done with back on `returned`.
 pub(crate) fn decompress(
     path: &str,
     threads: usize,
     sender: crossbeam_channel::Sender<io::Result<Vec<u8>>>,
+    returned: crossbeam_channel::Receiver<Vec<u8>>,
 ) {
-    if let Err(e) = run(path, threads, &sender) {
+    if let Err(e) = run(path, threads, &sender, returned) {
         let _ = sender.send(Err(e));
     }
 }
@@ -712,6 +786,7 @@ fn run(
     path: &str,
     threads: usize,
     sender: &crossbeam_channel::Sender<io::Result<Vec<u8>>>,
+    returned: crossbeam_channel::Receiver<Vec<u8>>,
 ) -> io::Result<()> {
     let file = File::open(path)?;
     let len = file.metadata()?.len() as usize;
@@ -721,6 +796,8 @@ fn run(
     // Stops the workers early if the reader goes away.
     let stopped = std::sync::atomic::AtomicBool::new(false);
     let stopped = &stopped;
+    // Enough for the regions in flight and the reader's buffers.
+    let pool = &Pool::new(4 * (threads + 2), returned);
     let result = std::thread::scope(|scope| -> io::Result<()> {
         // Regions decode to about 3x their size; keep a few in flight per worker.
         let ahead = threads + 2;
@@ -739,10 +816,11 @@ fn run(
                         // A failure here may only be a false block start, so
                         // the coordinator decides; it re-decodes from known output.
                         Job::Decode(k) => {
-                            let _ = decoded_tx.send((k, region(file, len, k, deflate, None)));
+                            let _ = decoded_tx.send((k, region(file, len, k, deflate, None, pool)));
                         }
-                        Job::Resolve(k, decoded, window) => {
-                            let head = resolve(&decoded.head, &window);
+                        Job::Resolve(k, mut decoded, window) => {
+                            let head = resolve(&decoded.head, &window, pool.bytes());
+                            pool.give_words(std::mem::take(&mut decoded.head));
                             let crc = head.as_ref().map(|h| crc32fast::hash(h)).unwrap_or(0);
                             let _ = resolved_tx.send((k, head, crc, decoded));
                         }
@@ -830,7 +908,7 @@ fn run(
             }
             let decoded = match result {
                 Ok(Some(d)) if d.start == pos => d,
-                _ => region(file, len, k, deflate, Some(pos))?.unwrap(),
+                _ => region(file, len, k, deflate, Some(pos), pool)?.unwrap(),
             };
             // The next region's window is this region's last 32 KiB. Only that
             // much of the head is resolved here; workers resolve the rest.
@@ -838,6 +916,7 @@ fn run(
             let head_end = resolve(
                 &decoded.head[decoded.head.len().saturating_sub(need)..],
                 &window,
+                Vec::with_capacity(need),
             )?;
             let this_window = std::sync::Arc::new(window.clone());
             for part in [&head_end[..], &decoded.tail[..]] {
@@ -947,7 +1026,12 @@ mod tests {
         let file = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(file.path(), gz).unwrap();
         let (sender, receiver) = crossbeam_channel::unbounded();
-        decompress(file.path().to_str().unwrap(), threads, sender);
+        decompress(
+            file.path().to_str().unwrap(),
+            threads,
+            sender,
+            crossbeam_channel::never(),
+        );
         let mut out = Vec::new();
         for part in receiver {
             let part = part?;
@@ -996,7 +1080,9 @@ mod tests {
             let t = std::time::Instant::now();
             let (sender, receiver) = crossbeam_channel::bounded(4);
             let p = path.clone();
-            let worker = std::thread::spawn(move || decompress(&p, threads, sender));
+            let worker = std::thread::spawn(move || {
+                decompress(&p, threads, sender, crossbeam_channel::never())
+            });
             let mut total = 0;
             for part in receiver {
                 let part = part.unwrap();

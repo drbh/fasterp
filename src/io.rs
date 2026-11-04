@@ -886,10 +886,12 @@ pub(crate) fn open_input(path: &str) -> Result<Box<dyn BufRead + Send>> {
                 drop(buffered);
                 let threads = num_cpus::get().div_ceil(2).clamp(2, 8);
                 let (sender, receiver) = crossbeam_channel::bounded(4);
-                let (recycle, _) = crossbeam_channel::bounded::<Vec<u8>>(1);
+                // Finished buffers go back to the decoder for reuse.
+                let (recycle, returned) = crossbeam_channel::bounded::<Vec<u8>>(4);
                 let path = path.to_string();
-                let worker =
-                    std::thread::spawn(move || crate::pgzip::decompress(&path, threads, sender));
+                let worker = std::thread::spawn(move || {
+                    crate::pgzip::decompress(&path, threads, sender, returned)
+                });
                 return Ok(Box::new(PrefetchInput {
                     receiver: Some(receiver),
                     recycle,
