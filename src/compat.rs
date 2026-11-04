@@ -2007,7 +2007,13 @@ fn process_batch(
     let interleaved = config.args.interleaved_in;
     let stride = if interleaved { 2 } else { 1 };
     let count = raw.as_ref().map_or(reads.len(), |r| r[0].len() / stride);
-    let chunk_size = count.div_ceil(threads).max(1);
+    // One chunk per worker leaves the batch waiting on its slowest chunk,
+    // and with few workers that is often one on an efficiency core. Split
+    // into chunks of about 4000 records, up to four per worker, so faster
+    // workers take more of the batch; more and smaller chunks only add
+    // per-chunk overhead.
+    let chunks = (count / 4000).clamp(threads, 4 * threads);
+    let chunk_size = count.div_ceil(chunks).max(1);
     let results: Vec<Result<Chunk<'static>>> = pool.install(|| {
         if let Some(raw) = raw {
             (0..count.div_ceil(chunk_size))
@@ -2900,8 +2906,9 @@ pub fn run(mut a: Args) -> Result<()> {
     // scoped threads are being joined.
     // Compact synchronous jobs use the same batch ceiling as the pipeline,
     // limiting serial parsing work before each parallel processing step.
+    // Smaller batches leave the worker pool waiting between them.
     let max_bytes = if pipelined || pack_main_output(a) {
-        max_bytes.min(2 * 1024 * 1024)
+        max_bytes.min(8 * 1024 * 1024)
     } else {
         max_bytes
     };
