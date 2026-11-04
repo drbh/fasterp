@@ -12,7 +12,7 @@
     return lines.slice(1).map(function (line) {
       var values = line.split(','), row = {};
       keys.forEach(function (k, i) { row[k] = values[i]; });
-      ['workers', 'mean', 'stddev', 'min', 'max'].forEach(function (k) { row[k] = +row[k]; });
+      ['workers', 'mean', 'stddev', 'min', 'max', 'output_bytes'].forEach(function (k) { row[k] = +row[k]; });
       return row;
     });
   }
@@ -117,7 +117,7 @@
       root.appendChild(heading);
       var t = document.createElement('table');
       t.innerHTML = '<thead><tr><th>Workload</th><th>Workers</th>' +
-        '<th>fastp (s)</th><th>fasterp (s)</th><th>Speedup</th></tr></thead>';
+        '<th>fastp (s)</th><th>fasterp (s)</th><th>Speedup</th><th>Output vs fastp</th></tr></thead>';
       var body = document.createElement('tbody');
       rows.filter(function (r) { return r.dataset === dataset && r.program === 'fastp'; }).forEach(function (a) {
         var b = rows.filter(function (r) {
@@ -128,7 +128,12 @@
         [a.workload, a.workers,
           a.mean.toFixed(2) + ' ± ' + a.stddev.toFixed(2),
           b.mean.toFixed(2) + ' ± ' + b.stddev.toFixed(2),
-          (a.mean / b.mean).toFixed(2) + 'x'].forEach(function (v, i) {
+          (a.mean / b.mean).toFixed(2) + 'x',
+          // Gzip output size, recorded since rows gained the column.
+          a.output_bytes > 0 && b.output_bytes > 0
+            ? (b.output_bytes >= a.output_bytes ? '+' : '') +
+              (100 * (b.output_bytes / a.output_bytes - 1)).toFixed(1) + '%'
+            : ''].forEach(function (v, i) {
           var td = document.createElement('td');
           td.textContent = v;
           if (i >= 1) td.style.textAlign = 'right';

@@ -45,30 +45,41 @@ date=$(date +%F)
 rows=$tmp/rows.csv
 : >"$rows"
 
+# Total size of the gzip files a program wrote, so output size is checked
+# alongside time: a faster encoder must not write larger files.
+output_bytes() {
+  find "$1" -name '*.gz' -exec wc -c {} + | awk '$2 != "total" {s += $1} END {print s + 0}'
+}
+
+# Arguments name output files as @/file; each program writes to its own
+# directory so their sizes can be compared.
 bench() {
   local name=$1 args=$2 w
   for w in ${workers//,/ }; do
+    rm -rf "$tmp/fastp" "$tmp/fasterp"
+    mkdir -p "$tmp/fastp" "$tmp/fasterp"
     hyperfine --warmup "$warmup" --runs "$runs" --export-csv "$tmp/run.csv" \
-      -n "fastp $w" "$fastp $args $extra -j $tmp/fastp.json -h $tmp/fastp.html -w $w" \
-      -n "fasterp $w" "$fasterp $args $extra -j $tmp/fasterp.json -h $tmp/fasterp.html -w $w"
+      -n "fastp $w" "$fastp ${args//@/$tmp/fastp} $extra -j $tmp/fastp.json -h $tmp/fastp.html -w $w" \
+      -n "fasterp $w" "$fasterp ${args//@/$tmp/fasterp} $extra -j $tmp/fasterp.json -h $tmp/fasterp.html -w $w"
     # hyperfine columns: command,mean,stddev,median,user,system,min,max
     tail -n +2 "$tmp/run.csv" | while IFS=, read -r command mean stddev _ _ _ min max; do
       program=${command% *}
       version=$fastp_version
       [ "$program" = fasterp ] && version=$fasterp_version
-      printf '%s,%s,%s,%s,%s,%.3f,%.3f,%.3f,%.3f,%s,%s,%s\n' "$dataset" "$name" "$w" "$program" \
-        "$version" "$mean" "$stddev" "$min" "$max" "$runs" "$machine" "$date" >>"$rows"
+      printf '%s,%s,%s,%s,%s,%.3f,%.3f,%.3f,%.3f,%s,%s,%s,%s\n' "$dataset" "$name" "$w" "$program" \
+        "$version" "$mean" "$stddev" "$min" "$max" "$runs" "$machine" "$date" \
+        "$(output_bytes "$tmp/$program")" >>"$rows"
     done
   done
 }
 
-bench single-end "-i $r1 -o $tmp/se.fq.gz"
-bench paired-end "-i $r1 -I $r2 -o $tmp/r1.fq.gz -O $tmp/r2.fq.gz"
-bench paired-correct-merge "-i $r1 -I $r2 -c -m --merged_out $tmp/merged.fq.gz -o $tmp/r1.fq.gz -O $tmp/r2.fq.gz"
+bench single-end "-i $r1 -o @/se.fq.gz"
+bench paired-end "-i $r1 -I $r2 -o @/r1.fq.gz -O @/r2.fq.gz"
+bench paired-correct-merge "-i $r1 -I $r2 -c -m --merged_out @/merged.fq.gz -o @/r1.fq.gz -O @/r2.fq.gz"
 
 # keep other datasets' rows, replace this one's
 {
-  echo dataset,workload,workers,program,version,mean,stddev,min,max,runs,machine,date
+  echo dataset,workload,workers,program,version,mean,stddev,min,max,runs,machine,date,output_bytes
   if [ -f "$csv" ]; then tail -n +2 "$csv" | awk -F, -v d="$dataset" '$1 != d'; fi
   cat "$rows"
 } >"$tmp/merged.csv"
