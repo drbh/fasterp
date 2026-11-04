@@ -834,6 +834,20 @@ pub(crate) fn set_split_decoding(enabled: bool) {
     SPLIT_DECODING.store(enabled, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// Whether `path` is a local gzip file whose first records have binned
+/// qualities, judged from its first 256 KiB.
+pub(crate) fn binned_gzip_input(path: &str) -> bool {
+    let Ok(file) = File::open(path) else {
+        return false;
+    };
+    let mut head = Vec::with_capacity(256 << 10);
+    let decoder = MultiGzDecoder::new(BufReader::new(file));
+    if decoder.take(256 << 10).read_to_end(&mut head).is_err() {
+        return false;
+    }
+    crate::fqdeflate::suits(&head)
+}
+
 pub(crate) fn open_input(path: &str) -> Result<Box<dyn BufRead + Send>> {
     let raw: Box<dyn Read + Send> = if path == "-" || path == "/dev/stdin" {
         Box::new(std::io::stdin())

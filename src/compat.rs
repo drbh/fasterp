@@ -2591,9 +2591,14 @@ pub fn run(mut a: Args) -> Result<()> {
     } else {
         None
     };
-    // A second input brings its own decoder thread, and output compression
-    // then needs the cores; split decoding of one member pays off only alone.
-    io::set_split_decoding(a.input2.is_none());
+    // Decoding one large member in parallel costs about 2.5 times zlib's CPU
+    // per byte, so it pays off only when decoding limits the run: a single
+    // input (a second brings its own decoder and the compressors need the
+    // cores) whose output is not gzip, or whose qualities are binned, which
+    // makes compressing the output cheap. Otherwise the extra CPU comes out
+    // of processing and compression.
+    let gzip_out = io::CompressionFormat::from_path(&a.output) == io::CompressionFormat::Gzip;
+    io::set_split_decoding(a.input2.is_none() && (!gzip_out || io::binned_gzip_input(&a.input)));
     let mut reader1 = Reader::open(&a.input, a.phred64)?;
     let mut reader2 = a
         .input2
