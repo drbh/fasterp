@@ -3,6 +3,7 @@
 use super::{Read, Reader};
 use anyhow::{ensure, Result};
 use std::borrow::Cow;
+use std::sync::Mutex;
 
 #[derive(Default)]
 pub(super) struct Records {
@@ -10,7 +11,35 @@ pub(super) struct Records {
     ends: Vec<[usize; 4]>,
 }
 
+/// Buffers of dropped batches, reused by later batches so their pages stay
+/// mapped. Freed large blocks go back to the kernel and every new batch
+/// faulted them in again. A few batches are in flight at once, so a few
+/// spares are enough.
+static SPARE: Mutex<Vec<Records>> = Mutex::new(Vec::new());
+const SPARES: usize = 8;
+
+impl Drop for Records {
+    fn drop(&mut self) {
+        if self.data.capacity() == 0 {
+            return;
+        }
+        let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
+        if spare.len() < SPARES {
+            let mut data = std::mem::take(&mut self.data);
+            let mut ends = std::mem::take(&mut self.ends);
+            data.clear();
+            ends.clear();
+            spare.push(Records { data, ends });
+        }
+    }
+}
+
 impl Records {
+    fn reused() -> Self {
+        let spare = SPARE.lock().unwrap_or_else(|e| e.into_inner()).pop();
+        spare.unwrap_or_default()
+    }
+
     pub(super) fn len(&self) -> usize {
         self.ends.len()
     }
@@ -130,7 +159,7 @@ fn read_batch_inner<const SAMPLE: bool, const INTERLEAVED: bool>(
     limit: usize,
     base_limit: usize,
 ) -> Result<Option<[Records; 2]>> {
-    let mut blocks: [Records; 2] = std::array::from_fn(|_| Records::default());
+    let mut blocks: [Records; 2] = std::array::from_fn(|_| Records::reused());
     let mut bases = 0;
     let stride = if INTERLEAVED { 2 } else { 1 };
     while blocks[0].len() / stride < limit

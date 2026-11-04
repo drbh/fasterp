@@ -1378,10 +1378,34 @@ struct PackedChunk {
     unknown: usize,
 }
 
+/// Output buffers of written chunks, reused by later chunks for the same
+/// reason as batch buffers: freed large blocks are faulted in again. At most
+/// a few batches of chunks are in flight.
+static SPARE_OUTPUT: std::sync::Mutex<Vec<Vec<u8>>> = std::sync::Mutex::new(Vec::new());
+const SPARE_OUTPUTS: usize = 256;
+
+fn spare_output() -> Vec<u8> {
+    let spare = SPARE_OUTPUT.lock().unwrap_or_else(|e| e.into_inner()).pop();
+    spare.unwrap_or_default()
+}
+
+impl Drop for PackedChunk {
+    fn drop(&mut self) {
+        let mut spare = SPARE_OUTPUT.lock().unwrap_or_else(|e| e.into_inner());
+        for out in &mut self.output {
+            if out.capacity() > 0 && spare.len() < SPARE_OUTPUTS {
+                let mut out = std::mem::take(out);
+                out.clear();
+                spare.push(out);
+            }
+        }
+    }
+}
+
 impl PackedChunk {
     fn new(records: usize, recycle_limit: usize, duplication: bool) -> Self {
         Self {
-            output: std::array::from_fn(|_| Vec::new()),
+            output: std::array::from_fn(|_| spare_output()),
             positions: Vec::with_capacity(if duplication { records } else { 0 }),
             duplicates: 0,
             recycled: ReadPool {
@@ -3063,7 +3087,7 @@ pub fn run(mut a: Args) -> Result<()> {
                 for (dst, src) in after.iter_mut().zip(chunk.after) {
                     dst.merge(src);
                 }
-                if let Some(packed) = chunk.packed {
+                if let Some(mut packed) = chunk.packed {
                     out.write_packed(main1, &packed.output[0])?;
                     out.write_packed(main2, &packed.output[1])?;
                     out.write_packed(merged_out, &packed.output[2])?;
@@ -3078,7 +3102,7 @@ pub fn run(mut a: Args) -> Result<()> {
                     for (dst, src) in failures.iter_mut().zip(packed.failures) {
                         *dst += src;
                     }
-                    for (dst, src) in histogram.iter_mut().zip(packed.histogram) {
+                    for (dst, src) in histogram.iter_mut().zip(&packed.histogram) {
                         *dst += src;
                     }
                     for (dst, src) in poly_reads.iter_mut().zip(packed.poly_reads) {
@@ -3087,7 +3111,7 @@ pub fn run(mut a: Args) -> Result<()> {
                     for (dst, src) in poly_bases.iter_mut().zip(packed.poly_bases) {
                         *dst += src;
                     }
-                    read_pools.push(packed.recycled);
+                    read_pools.push(std::mem::take(&mut packed.recycled));
                     continue;
                 }
                 for p in chunk.processed {
