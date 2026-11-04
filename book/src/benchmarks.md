@@ -6,6 +6,8 @@ Wall time in seconds for fastp and fasterp on the same inputs and options, measu
 <div id="bench-chart"></div>
 <p id="bench-meta" class="bench-meta"></p>
 
+fasterp `0.2.1-dev` is the development build ahead of the next release. Its gzip output is new: blocks with binned qualities, as NovaSeq writes them, use a FASTQ-aware encoder that is as small as level 4 at about 2.4 times its speed, and other blocks are compressed as before.
+
 ## Workloads
 
 All workloads read gzip input and write gzip output, with the default filters and an HTML and JSON report.
