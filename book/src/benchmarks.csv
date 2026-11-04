@@ -95,3 +95,9 @@ ERR3534523,paired-end,8,fastp,1.4.0,33.098,1.160,32.277,33.918,2,Apple M3 Max 14
 ERR3534523,paired-end,8,fasterp,0.2.1-dev,10.826,0.051,10.790,10.862,2,Apple M3 Max 14 cpus Darwin,2026-11-03
 ERR3534523,paired-correct-merge,8,fastp,1.4.0,31.547,0.193,31.410,31.683,2,Apple M3 Max 14 cpus Darwin,2026-11-03
 ERR3534523,paired-correct-merge,8,fasterp,0.2.1-dev,10.643,0.029,10.622,10.663,2,Apple M3 Max 14 cpus Darwin,2026-11-03
+ERR3239279-400M,single-end,8,fastp,1.4.0,215.577,0.000,215.577,215.577,1,Apple M3 Max 14 cpus Darwin,2026-11-04
+ERR3239279-400M,single-end,8,fasterp,0.2.1-dev,49.374,0.000,49.374,49.374,1,Apple M3 Max 14 cpus Darwin,2026-11-04
+ERR3239279-400M,paired-end,8,fastp,1.4.0,262.700,0.000,262.700,262.700,1,Apple M3 Max 14 cpus Darwin,2026-11-04
+ERR3239279-400M,paired-end,8,fasterp,0.2.1-dev,111.736,0.000,111.736,111.736,1,Apple M3 Max 14 cpus Darwin,2026-11-04
+ERR3239279-400M,paired-correct-merge,8,fastp,1.4.0,265.934,0.000,265.934,265.934,1,Apple M3 Max 14 cpus Darwin,2026-11-04
+ERR3239279-400M,paired-correct-merge,8,fasterp,0.2.1-dev,113.308,0.000,113.308,113.308,1,Apple M3 Max 14 cpus Darwin,2026-11-04

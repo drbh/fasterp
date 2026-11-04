@@ -30,8 +30,9 @@ The files are mirrored at `genedata.dholtz.com` so they download quickly. `.gith
 | `err3534523-2m` | 1000 Genomes 30x run [ERR3534523](https://www.ebi.ac.uk/ena/browser/view/ERR3534523), NovaSeq 6000, 2x150 bp with binned qualities | First 2,000,000 records per mate, recompressed with `gzip -4 -n` |
 | `err3534523` | The full ERR3534523 run, 33.1 million pairs | Recompressed with `gzip -4 -n` |
 | `srr891269-2m` | GM12878 ATAC-seq run [SRR891269](https://www.ebi.ac.uk/ena/browser/view/SRR891269) from Buenrostro et al. 2013, 2x50 bp with short inserts and Nextera adapters | First 2,000,000 records per mate from ENA, recompressed with `gzip -4 -n` |
+| `err3239279-400m` | Human WGS 30x run [ERR3239279](https://www.ebi.ac.uk/ena/browser/view/ERR3239279), NovaSeq 6000, 2x150 bp with binned qualities, 25 GB gzipped. Run only at 8 workers, once, because fastp takes over four minutes per run | First 400,000,000 pairs, converted from NCBI's copy with `fastq-dump --split-spot` and compressed with `pigz -4 -n`. Not in the `all` set because of its size |
 
-ERR3534523 was converted from NCBI's copy with `fasterq-dump`, which does not keep the original Illumina read names, so its headers look like `@ERR3534523.1 1/1`. The sequences and qualities of the first 2,000,000 records of mate 2 match ENA's file. Read names starting with `@ERR` also mean fastp does not detect a two-color instrument, so poly-G trimming has to be enabled with `-g` (`ARGS=-g` below).
+ERR3534523 was converted from NCBI's copy with `fasterq-dump`, and ERR3239279 with `fastq-dump`. Neither keeps the original Illumina read names, so the headers look like `@ERR3534523.1 1/1`. For ERR3534523, the sequences and qualities of the first 2,000,000 records of mate 2 match ENA's file. Read names starting with `@ERR` also mean fastp does not detect a two-color instrument, so poly-G trimming has to be enabled with `-g` (`ARGS=-g` below).
 
 ## Results
 
@@ -46,7 +47,7 @@ cargo build --release
 CSV=book/src/benchmarks.csv bash scripts/bench.sh fastp target/release/fasterp
 ```
 
-The results are written to `book/src/benchmarks.csv`, which this page reads. Rows for the same dataset are replaced and other datasets are kept, so set `R1`, `R2` and `DATASET` to add or update another dataset. `WORKERS` and `RUNS` change the worker counts and the number of timed runs, and `ARGS` adds options to every command. For example, for the NovaSeq prefix:
+The results are written to `book/src/benchmarks.csv`, which this page reads. Rows for the same dataset are replaced and other datasets are kept, so set `R1`, `R2` and `DATASET` to add or update another dataset. `WORKERS`, `RUNS` and `WARMUP` change the worker counts, the number of timed runs and the number of untimed runs before them, and `ARGS` adds options to every command. For example, for the NovaSeq prefix:
 
 ```bash
 bash .github/scripts/download_test_data.sh test_data err3534523-2m

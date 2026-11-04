@@ -14,7 +14,8 @@ set -euo pipefail
 #   err3534523-2m       NovaSeq 6000 WGS, 2x150 bp, first 2M pairs         0.3 GB
 #   err3534523          the full ERR3534523 run, 33.1M pairs, gzip -4      5.5 GB
 #   srr891269-2m        GM12878 ATAC-seq, 2x50 bp, first 2M pairs          0.2 GB
-#   all                 every set above
+#   err3239279-400m     NovaSeq 6000 WGS, 2x150 bp, first 400M pairs      25.3 GB
+#   all                 every set above except err3239279-400m
 #
 # Files already present with the right checksum are skipped.
 
@@ -48,6 +49,10 @@ files_for() {
         srr891269-2m)
             echo "10691cc21fe6ea6a754b589824ccf9108daeea573bc3e8fd2b9873bffab45338 SRX298001/SRR891269_2M_1.fastq.gz"
             echo "99327587f5ba557960c0dfaf0bb89b95ad81e2184d75841f56c591dcaaf6d7bd SRX298001/SRR891269_2M_2.fastq.gz"
+            ;;
+        err3239279-400m)
+            echo "da31bec3f64d2f839dce07aaf40997d2698051ad08af0a015697b581d27f63bb ERX3266654/ERR3239279_400M_1.fastq.gz"
+            echo "3c98090ac91b00515294f24258680484e61eca815e34380d5b904d1f28630292 ERX3266654/ERR3239279_400M_2.fastq.gz"
             ;;
         all)
             for set in ci srr1766443-2m srr1766443-2m-bgzf err3534523-2m err3534523 srr891269-2m; do
