@@ -117,7 +117,8 @@
       root.appendChild(heading);
       var t = document.createElement('table');
       t.innerHTML = '<thead><tr><th>Workload</th><th>Workers</th>' +
-        '<th>fastp (s)</th><th>fasterp (s)</th><th>Speedup</th><th>Output vs fastp</th></tr></thead>';
+        '<th>fastp (s)</th><th>fasterp (s)</th><th>Speedup</th><th>Output size vs fastp</th>' +
+        '<th>Identical output</th></tr></thead>';
       var body = document.createElement('tbody');
       rows.filter(function (r) { return r.dataset === dataset && r.program === 'fastp'; }).forEach(function (a) {
         var b = rows.filter(function (r) {
@@ -133,6 +134,10 @@
           a.output_bytes > 0 && b.output_bytes > 0
             ? (b.output_bytes >= a.output_bytes ? '+' : '') +
               (100 * (b.output_bytes / a.output_bytes - 1)).toFixed(1) + '%'
+            : '',
+          // Digest of the decompressed records, so equal means byte for byte.
+          a.output_sha256 && b.output_sha256
+            ? (a.output_sha256 === b.output_sha256 ? 'yes' : 'no')
             : ''].forEach(function (v, i) {
           var td = document.createElement('td');
           td.textContent = v;

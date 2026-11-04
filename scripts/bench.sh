@@ -51,6 +51,20 @@ output_bytes() {
   find "$1" -name '*.gz' -exec wc -c {} + | awk '$2 != "total" {s += $1} END {print s + 0}'
 }
 
+sha256() {
+  if command -v sha256sum >/dev/null; then sha256sum | cut -c1-64; else shasum -a 256 | cut -c1-64; fi
+}
+
+# Digest of the decompressed outputs: each file's name and SHA-256, in name
+# order, hashed together. Equal digests mean both programs wrote the same
+# records byte for byte, whatever their compression.
+output_sha256() {
+  local f
+  for f in $(cd "$1" && ls *.gz 2>/dev/null | sort); do
+    echo "$f $(gzip -dc "$1/$f" | sha256)"
+  done | sha256 | cut -c1-16
+}
+
 # Arguments name output files as @/file; each program writes to its own
 # directory so their sizes can be compared.
 bench() {
@@ -66,9 +80,9 @@ bench() {
       program=${command% *}
       version=$fastp_version
       [ "$program" = fasterp ] && version=$fasterp_version
-      printf '%s,%s,%s,%s,%s,%.3f,%.3f,%.3f,%.3f,%s,%s,%s,%s\n' "$dataset" "$name" "$w" "$program" \
+      printf '%s,%s,%s,%s,%s,%.3f,%.3f,%.3f,%.3f,%s,%s,%s,%s,%s\n' "$dataset" "$name" "$w" "$program" \
         "$version" "$mean" "$stddev" "$min" "$max" "$runs" "$machine" "$date" \
-        "$(output_bytes "$tmp/$program")" >>"$rows"
+        "$(output_bytes "$tmp/$program")" "$(output_sha256 "$tmp/$program")" >>"$rows"
     done
   done
 }
@@ -79,7 +93,7 @@ bench paired-correct-merge "-i $r1 -I $r2 -c -m --merged_out @/merged.fq.gz -o @
 
 # keep other datasets' rows, replace this one's
 {
-  echo dataset,workload,workers,program,version,mean,stddev,min,max,runs,machine,date,output_bytes
+  echo dataset,workload,workers,program,version,mean,stddev,min,max,runs,machine,date,output_bytes,output_sha256
   if [ -f "$csv" ]; then tail -n +2 "$csv" | awk -F, -v d="$dataset" '$1 != d'; fi
   cat "$rows"
 } >"$tmp/merged.csv"

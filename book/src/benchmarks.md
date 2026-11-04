@@ -1,6 +1,6 @@
 # Benchmarks
 
-Wall time in seconds for fastp and fasterp on the same inputs and options, measured with [hyperfine](https://github.com/sharkdp/hyperfine). Lower is better. The label next to each pair is fastp time divided by fasterp time, and the whiskers span the fastest and slowest run. The results tables also give the total size of fasterp's gzip output relative to fastp's, so a faster setting cannot hide larger files.
+Wall time in seconds for fastp and fasterp on the same inputs and options, measured with [hyperfine](https://github.com/sharkdp/hyperfine). Lower is better. The label next to each pair is fastp time divided by fasterp time, and the whiskers span the fastest and slowest run. The results tables also give the total size of fasterp's gzip output relative to fastp's, so a faster setting cannot hide larger files, and whether the two programs' outputs are identical once decompressed, compared by SHA-256.
 
 <div class="bench-legend"><span class="fastp">fastp</span><span class="fasterp">fasterp</span></div>
 <div id="bench-chart"></div>
