@@ -86,6 +86,42 @@ pub fn detect_overlap(
     detect_overlap_reusing(r1_seq, r2_seq, config, &mut Vec::new())
 }
 
+const FILTER: usize = 16;
+
+/// Try `check` at every offset `s < count` whose window `seq[s..s + 16]`
+/// equals `fixed` in at least `need` bytes, in increasing order. Sixteen
+/// offsets are scored at once, one per lane: for each position j, compare
+/// bytes j..j + 16 of the block with `fixed[j]` and add the result, so there
+/// is no horizontal add per offset. `seq` must be padded by 32 bytes.
+#[inline(always)]
+fn scan(
+    seq: &[u8],
+    count: usize,
+    fixed: &[u8; FILTER],
+    need: u8,
+    mut check: impl FnMut(usize) -> Option<OverlapResult>,
+) -> Option<OverlapResult> {
+    for base in (0..count).step_by(FILTER) {
+        let block: &[u8; 2 * FILTER] = seq[base..base + 2 * FILTER].try_into().unwrap();
+        let mut score = [0u8; FILTER];
+        for (j, &f) in fixed.iter().enumerate() {
+            for (lane, &b) in score.iter_mut().zip(&block[j..j + FILTER]) {
+                *lane += u8::from(b == f);
+            }
+        }
+        if score.iter().any(|&n| n >= need) {
+            for (lane, &n) in score.iter().enumerate().take(count - base) {
+                if n >= need {
+                    if let Some(result) = check(base + lane) {
+                        return Some(result);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
 /// Same overlap search with worker-owned reverse-complement storage.
 /// Reusing capacity avoids an allocation for every input pair.
 pub(crate) fn detect_overlap_reusing(
@@ -97,36 +133,71 @@ pub(crate) fn detect_overlap_reusing(
     if r1_seq.is_empty() || r2_seq.is_empty() {
         return None;
     }
+    // Scratch holds the reverse complement and, for the scans below, padded
+    // copies of both sequences so 32-byte blocks can be read past the end.
     rc.clear();
     rc.extend(r2_seq.iter().rev().map(|&b| complement_base(b)));
-    let forward = (0..r1_seq.len().saturating_sub(config.min_overlap_len)).map(|n| n as isize);
-    let reverse = (0..r2_seq.len().saturating_sub(config.min_overlap_len)).map(|n| -(n as isize));
-    for offset in forward.chain(reverse) {
-        let start1 = offset.max(0) as usize;
-        let start2 = (-offset).max(0) as usize;
-        let len = (r1_seq.len() - start1).min(rc.len() - start2);
-        let a = &r1_seq[start1..start1 + len];
-        let b = &rc[start2..start2 + len];
-        let limit = config.max_diff.min(len * config.max_diff_percent / 100);
-        let protected = len.min(50);
-        // fastp 1.3.x protects the first 50 bases, then counts every remaining
-        // mismatch for correction/reporting, even when the total exceeds limit.
-        let (prefix, _) =
-            crate::simd::count_mismatches(&a[..protected], &b[..protected], limit, protected);
-        if prefix > limit {
-            continue;
+    let n2 = rc.len();
+    rc.extend([0; 2 * FILTER]);
+    rc.extend_from_slice(r1_seq);
+    rc.extend([0; 2 * FILTER]);
+    let (rc_padded, r1_padded) = rc.split_at(n2 + 2 * FILTER);
+    let rc = &rc_padded[..n2];
+    let forward = r1_seq.len().saturating_sub(config.min_overlap_len);
+    let reverse = r2_seq.len().saturating_sub(config.min_overlap_len);
+    // Every overlap checked is at least `min_overlap_len` long and the limit is
+    // at most `max_diff`, so an offset with more than `max_diff` mismatches in
+    // its first 16 bases cannot pass. In each direction one side of that window
+    // is the same for every offset, so the scan is one 16-byte compare per
+    // offset and only the few offsets that survive get the exact check.
+    if config.max_diff < FILTER
+        && config.min_overlap_len >= FILTER
+        && r1_seq.len() >= FILTER
+        && rc.len() >= FILTER
+    {
+        let need = (FILTER - config.max_diff) as u8;
+        let fixed = rc[..FILTER].try_into().unwrap();
+        if let Some(result) = scan(r1_padded, forward, fixed, need, |s| {
+            check(r1_seq, rc, s as isize, config)
+        }) {
+            return Some(result);
         }
-        let (tail, _) =
-            crate::simd::count_mismatches(&a[protected..], &b[protected..], usize::MAX, 0);
-        let diff = prefix + tail;
-        return Some(OverlapResult {
-            overlapped: true,
-            offset,
-            overlap_len: len,
-            diff,
+        let fixed = r1_seq[..FILTER].try_into().unwrap();
+        return scan(rc_padded, reverse, fixed, need, |s| {
+            check(r1_seq, rc, -(s as isize), config)
         });
     }
-    None
+    let forward = (0..forward).map(|n| n as isize);
+    let reverse = (0..reverse).map(|n| -(n as isize));
+    forward
+        .chain(reverse)
+        .find_map(|offset| check(r1_seq, rc, offset, config))
+}
+
+/// The exact test at one offset: at most the limit of mismatches in the first
+/// 50 bases of the overlap, then every remaining mismatch is counted.
+fn check(r1_seq: &[u8], rc: &[u8], offset: isize, config: &OverlapConfig) -> Option<OverlapResult> {
+    let start1 = offset.max(0) as usize;
+    let start2 = (-offset).max(0) as usize;
+    let len = (r1_seq.len() - start1).min(rc.len() - start2);
+    let a = &r1_seq[start1..start1 + len];
+    let b = &rc[start2..start2 + len];
+    let limit = config.max_diff.min(len * config.max_diff_percent / 100);
+    let protected = len.min(50);
+    // fastp 1.3.x protects the first 50 bases, then counts every remaining
+    // mismatch for correction/reporting, even when the total exceeds limit.
+    let (prefix, _) =
+        crate::simd::count_mismatches(&a[..protected], &b[..protected], limit, protected);
+    if prefix > limit {
+        return None;
+    }
+    let (tail, _) = crate::simd::count_mismatches(&a[protected..], &b[protected..], usize::MAX, 0);
+    Some(OverlapResult {
+        overlapped: true,
+        offset,
+        overlap_len: len,
+        diff: prefix + tail,
+    })
 }
 
 /// Correct bases in overlapping region using quality scores
@@ -265,6 +336,82 @@ pub fn merge_reads(
 
 #[cfg(test)]
 mod tests {
+
+    /// The search without the 16-byte prefilter, as it was before it.
+    fn unfiltered(r1: &[u8], r2: &[u8], config: &OverlapConfig) -> Option<(isize, usize, usize)> {
+        let rc = reverse_complement(r2);
+        if r1.is_empty() || r2.is_empty() {
+            return None;
+        }
+        let forward = (0..r1.len().saturating_sub(config.min_overlap_len)).map(|n| n as isize);
+        let reverse = (0..r2.len().saturating_sub(config.min_overlap_len)).map(|n| -(n as isize));
+        for offset in forward.chain(reverse) {
+            let start1 = offset.max(0) as usize;
+            let start2 = (-offset).max(0) as usize;
+            let len = (r1.len() - start1).min(rc.len() - start2);
+            let a = &r1[start1..start1 + len];
+            let b = &rc[start2..start2 + len];
+            let limit = config.max_diff.min(len * config.max_diff_percent / 100);
+            let protected = len.min(50);
+            let prefix = a[..protected]
+                .iter()
+                .zip(&b[..protected])
+                .filter(|(x, y)| x != y)
+                .count();
+            if prefix > limit {
+                continue;
+            }
+            let tail = a[protected..]
+                .iter()
+                .zip(&b[protected..])
+                .filter(|(x, y)| x != y)
+                .count();
+            return Some((offset, len, prefix + tail));
+        }
+        None
+    }
+
+    #[test]
+    fn prefiltered_overlap_matches_unfiltered_search() {
+        let mut state = 140u64;
+        let mut next = |n: usize| {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            (state >> 33) as usize % n
+        };
+        let mut found = 0;
+        for case in 0..20000 {
+            let len1 = 1 + next(220);
+            let r1: Vec<u8> = (0..len1)
+                .map(|_| b"ACGTN"[next(if case % 7 == 0 { 5 } else { 4 })])
+                .collect();
+            // Mates built from the reverse complement of part of r1, with
+            // mutations, so many pairs overlap at some offset.
+            let mut r2 = if case % 3 == 0 {
+                (0..1 + next(220)).map(|_| b"ACGT"[next(4)]).collect()
+            } else {
+                let start = next(len1);
+                let end = start + next(len1 - start + 1);
+                let mut part = reverse_complement(&r1[start..end]);
+                part.extend((0..next(80)).map(|_| b"ACGT"[next(4)]));
+                part
+            };
+            for _ in 0..next(8) {
+                if !r2.is_empty() {
+                    let i = next(r2.len());
+                    r2[i] = b"ACGTN"[next(5)];
+                }
+            }
+            let config = OverlapConfig {
+                min_overlap_len: [10, 16, 20, 30, 40][next(5)],
+                max_diff: [0, 1, 5, 10, 15, 16, 20][next(7)],
+                max_diff_percent: [5, 20, 50, 100][next(4)],
+            };
+            let fast = detect_overlap(&r1, &r2, &config).map(|r| (r.offset, r.overlap_len, r.diff));
+            assert_eq!(fast, unfiltered(&r1, &r2, &config), "case {case}");
+            found += usize::from(fast.is_some());
+        }
+        assert!(found > 2000, "too few overlaps exercised: {found}");
+    }
     use super::*;
 
     #[test]

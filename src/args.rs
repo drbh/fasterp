@@ -126,7 +126,7 @@ pub struct Args {
     #[arg(short = 'w', long = "thread", alias = "threads")]
     pub(crate) threads: Option<usize>,
 
-    /// Batch size in bytes (default: 32 MiB)
+    /// Largest batch in bytes; most runs use at most 8 MiB (default: 32 MiB)
     #[arg(long, default_value = "33554432", alias = "batch-bytes")]
     pub(crate) batch_bytes: usize,
 
@@ -268,7 +268,7 @@ pub struct Args {
     #[arg(short = 'U', long)]
     pub(crate) umi: bool,
 
-    /// UMI location: `read1/read2/index1/index2/per_read/per_index` (default: read1)
+    /// UMI location, required with --umi: `read1/read2/index1/index2/per_read/per_index`
     #[arg(long, default_value = "", alias = "umi-loc")]
     pub(crate) umi_loc: String,
 

@@ -38,9 +38,16 @@ pub mod io;
 
 // Native-only modules (require threading, file I/O, etc.)
 #[cfg(feature = "native")]
+pub(crate) mod fqdeflate;
+#[cfg(feature = "native")]
 pub mod gzip;
 #[cfg(feature = "native")]
+mod pgzip;
+#[cfg(feature = "native")]
 pub mod pipeline;
+#[cfg(feature = "native")]
+#[doc(hidden)]
+pub mod testing;
 
 pub use args::Args;
 

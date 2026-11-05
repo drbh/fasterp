@@ -2,7 +2,7 @@
 set -e
 
 echo "🦀 Building WASM..."
-cargo build --target wasm32-unknown-unknown --no-default-features --features wasm --lib --release
+cargo rustc --lib --release --crate-type cdylib --target wasm32-unknown-unknown --no-default-features --features wasm
 
 echo "🔧 Generating JS bindings..."
 wasm-bindgen target/wasm32-unknown-unknown/release/fasterp.wasm \

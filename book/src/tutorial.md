@@ -5,7 +5,7 @@ This tutorial walks through downloading real sequencing data, running both **fas
 ## Prerequisites
 
 - **fasterp** installed (`cargo install --git https://github.com/drbh/fasterp.git`)
-- **fastp** installed ([installation guide](https://github.com/OpenGene/fastp#get-fastp))
+- **fastp** 1.4.0 installed ([installation guide](https://github.com/OpenGene/fastp#get-fastp))
 - **curl** for downloading files
 - **jq** (optional) for inspecting JSON reports
 
@@ -80,17 +80,19 @@ reads passed filter: 19523574
 reads failed due to low quality: 74384
 reads failed due to too many N: 194
 reads failed due to too short: 0
+reads failed due to adapter dimer: 0
 reads with adapter trimmed: 3113628
 bases trimmed due to adapters: 23734734
 
-Duplication rate: 28.3885%
+Duplication rate: 28.3275%
 
 Insert size peak (evaluated by paired-end reads): 51
 
 JSON report: fastp_report.json
 HTML report: fastp_report.html
 
-fastp v1.0.1, time used: 11 seconds
+fastp -i SRR5808766_1.fastq.gz -I SRR5808766_2.fastq.gz -o fastp_out_R1.fq.gz -O fastp_out_R2.fq.gz -j fastp_report.json -h fastp_report.html 
+fastp v1.4.0, time used: 10 seconds
 ```
 
 ## Step 3: Run fasterp
@@ -107,59 +109,12 @@ fasterp \
 
 Expected output:
 ```
-Detecting adapter sequence for read1...
-No adapter detected for read1
-
-Detecting adapter sequence for read2...
-No adapter detected for read2
-
-Read1 before filtering:
-total reads: 9799076
-total bases: 499752876
-Q20 bases: 494840792(99.0171%)
-Q30 bases: 490032403(98.0549%)
-Q40 bases: 333003632(66.6337%)
-
-Read2 before filtering:
-total reads: 9799076
-total bases: 499752876
-Q20 bases: 491032411(98.2550%)
-Q30 bases: 485393847(97.1268%)
-Q40 bases: 335965361(67.2263%)
-
-Read1 after filtering:
-total reads: 9761787
-total bases: 485985544
-Q20 bases: 481444894(99.0657%)
-Q30 bases: 476939326(98.1386%)
-Q40 bases: 324904111(66.8547%)
-
-Read2 after filtering:
-total reads: 9761787
-total bases: 485985544
-Q20 bases: 479080210(98.5791%)
-Q30 bases: 473663787(97.4646%)
-Q40 bases: 327920585(67.4754%)
-
-Filtering result:
-reads passed filter: 19523574
-reads failed due to low quality: 74384
-reads failed due to too many N: 194
-reads failed due to too short: 0
-reads with adapter trimmed: 3113628
-bases trimmed due to adapters: 23734734
-
-Duplication rate: 28.3885%
-
-Insert size peak (evaluated by paired-end reads): 51
-
-JSON report: fasterp_report.json
-HTML report: fasterp_report.html
-
-fasterp v0.1.0, time used: 6 seconds
+Processed 9799076 pairs; passed 19523574 reads. Compatibility target: fastp 1.4.0
 ```
 
-Note: fasterp processed ~10 million read pairs in 6 seconds vs fastp's 11 seconds.
+fasterp prints this one line. The statistics fastp prints to the terminal are in the JSON and HTML reports.
+
+On an Apple M3 Max, fasterp took 2.9 seconds and fastp 10 seconds for these 9.8 million read pairs.
 
 ## Step 4: Compare Outputs
 
@@ -196,14 +151,14 @@ echo "=== fastp ==="
 jq '{
   before: .summary.before_filtering.total_reads,
   after: .summary.after_filtering.total_reads,
-  passed_rate: .summary.after_filtering.total_reads / .summary.before_filtering.total_reads * 100
+  passed_rate: (.summary.after_filtering.total_reads / .summary.before_filtering.total_reads * 100)
 }' fastp_report.json
 
 echo "=== fasterp ==="
 jq '{
   before: .summary.before_filtering.total_reads,
   after: .summary.after_filtering.total_reads,
-  passed_rate: .summary.after_filtering.total_reads / .summary.before_filtering.total_reads * 100
+  passed_rate: (.summary.after_filtering.total_reads / .summary.before_filtering.total_reads * 100)
 }' fasterp_report.json
 ```
 

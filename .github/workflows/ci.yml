@@ -6,6 +6,10 @@ on:
   pull_request:
     branches: [ main ]
   workflow_dispatch:
+    inputs:
+      fuzz_seconds:
+        description: Seconds to run each fuzz target
+        default: '60'
 
 jobs:
   test-and-build:
@@ -108,7 +112,7 @@ jobs:
         [ "$(wasm-bindgen --version 2>/dev/null)" = "wasm-bindgen 0.2.92" ] || cargo install wasm-bindgen-cli --version 0.2.92 --force
 
         # Build WASM
-        RUSTFLAGS='' cargo build --locked --target wasm32-unknown-unknown --no-default-features --features wasm --lib --release
+        RUSTFLAGS='' cargo rustc --locked --lib --release --crate-type cdylib --target wasm32-unknown-unknown --no-default-features --features wasm
 
         # Generate JS bindings
         wasm-bindgen target/wasm32-unknown-unknown/release/fasterp.wasm \
@@ -162,6 +166,49 @@ jobs:
       uses: actions/upload-pages-artifact@v3
       with:
         path: book/book
+
+  fuzz:
+    # Coverage-guided fuzzing of the gzip encoder and decoders (see fuzz/).
+    runs-on: ubuntu-24.04
+    env:
+      RUSTFLAGS: ''
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@nightly
+
+    - name: Cache cargo dependencies
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/.cargo/bin/
+          ~/.cargo/registry/index/
+          ~/.cargo/registry/cache/
+          fuzz/target/
+        key: ${{ runner.os }}-cargo-fuzz-${{ hashFiles('**/Cargo.lock') }}-v1
+
+    - name: Install cargo-fuzz
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y libssl-dev
+        cargo fuzz --version 2>/dev/null || cargo install cargo-fuzz --locked
+
+    - name: Fuzz
+      working-directory: fuzz
+      run: |
+        for target in $(cargo fuzz list); do
+          cargo fuzz run -O "$target" -- \
+            -max_total_time=${{ inputs.fuzz_seconds || 60 }} \
+            -max_len=65536 -timeout=20 -rss_limit_mb=8192 -malloc_limit_mb=2048
+        done
+
+    - name: Upload failing inputs
+      if: failure()
+      uses: actions/upload-artifact@v4
+      with:
+        name: fuzz-artifacts
+        path: fuzz/artifacts
 
   deploy:
     needs: test-and-build

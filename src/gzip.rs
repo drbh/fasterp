@@ -9,6 +9,31 @@ use std::io;
 #[derive(Clone, Copy, Debug)]
 pub struct Gzip;
 
+/// Extra-field subfield that records a member's total compressed size, like
+/// BGZF's `BC` but 32 bits so members can exceed 64 KiB. Other gzip readers
+/// skip it; `io` uses it to find member boundaries and decompress members in
+/// parallel.
+pub(crate) const MEMBER_SIZE_ID: [u8; 2] = *b"FP";
+
+/// Add the member-size subfield to a gzip member with no extra field.
+fn with_member_size(member: Vec<u8>) -> Vec<u8> {
+    const FEXTRA: u8 = 4;
+    if member.len() < 18 || member[3] & !0x08 != 0 {
+        return member;
+    }
+    let total = (member.len() + 10) as u32;
+    let mut out = Vec::with_capacity(member.len() + 10);
+    out.extend_from_slice(&member[..3]);
+    out.push(member[3] | FEXTRA);
+    out.extend_from_slice(&member[4..10]);
+    out.extend_from_slice(&8u16.to_le_bytes());
+    out.extend_from_slice(&MEMBER_SIZE_ID);
+    out.extend_from_slice(&4u16.to_le_bytes());
+    out.extend_from_slice(&total.to_le_bytes());
+    out.extend_from_slice(&member[10..]);
+    out
+}
+
 pub(crate) fn threads_per_output(outputs: usize) -> usize {
     // Share the compression budget across files, leaving room for decoding and
     // processing. A single output can use the whole budget.
@@ -41,16 +66,23 @@ impl FormatSpec for Gzip {
         &self,
         input: &[u8],
         encoder: &mut Compressor,
-        _level: Compression,
+        level: Compression,
         _dict: Option<&Bytes>,
         _is_last: bool,
     ) -> Result<Vec<u8>, GzpError> {
+        if (2..=4).contains(&level.level()) && crate::fqdeflate::suits(input) {
+            // Binned qualities: a FASTQ-aware encoder is as small as
+            // libdeflate at these levels and much faster.
+            let mut output = Vec::new();
+            crate::fqdeflate::gzip_member(input, &mut output);
+            return Ok(output);
+        }
         let mut output = vec![0; encoder.gzip_compress_bound(input.len())];
         let size = encoder
             .gzip_compress(input, &mut output)
             .map_err(|e| io::Error::other(format!("gzip compression failed: {e:?}")))?;
         output.truncate(size);
-        Ok(output)
+        Ok(with_member_size(output))
     }
 
     fn header(&self, _level: Compression) -> Vec<u8> {

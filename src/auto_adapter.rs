@@ -1,5 +1,6 @@
 //! Adapter evaluation ported from OpenGene/fastp v1.4.0 evaluator.cpp and
 //! nucleotidetree.cpp. Upstream copyright and MIT terms: LICENSE.fastp.
+use rayon::prelude::*;
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 
@@ -87,28 +88,45 @@ impl KnownSeeds {
 }
 
 fn known(reads: &[&[u8]]) -> Option<Vec<u8>> {
-    let mut seeds = KnownSeeds::new(KNOWN);
+    // Whether a read matches an adapter does not depend on the other reads, so
+    // find every match in parallel, then replay fastp's ordered loop (which
+    // skips adapters that fall behind and stops early) over those results.
+    let matches: Vec<Vec<(usize, usize)>> = reads[..reads.len().min(100000)]
+        .par_iter()
+        .map_init(
+            || KnownSeeds::new(KNOWN),
+            |seeds, r| {
+                seeds.collect(r);
+                KNOWN
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, adapter)| adapter.len() < r.len())
+                    .filter_map(|(i, adapter)| seeds.first_match(i, r, adapter).map(|d| (i, d)))
+                    .collect()
+            },
+        )
+        .collect();
     let mut counts = vec![0usize; KNOWN.len()];
     let mut mismatches = vec![0usize; KNOWN.len()];
     let mut checked = 0;
     let mut bases = 0;
     let mut max = 0;
-    for r in reads {
+    for (r, found) in reads
+        .iter()
+        .zip(matches.iter().map(Some).chain(std::iter::repeat(None)))
+    {
         checked += 1;
         bases += r.len();
         if checked > 100000 || bases > 100000000 || max > 1000 {
             break;
         }
-        seeds.collect(r);
-        for (i, adapter) in KNOWN.iter().enumerate() {
-            if adapter.len() >= r.len() || (max > 20 && counts[i] < max / 10) {
+        for &(i, diff) in found.into_iter().flatten() {
+            if max > 20 && counts[i] < max / 10 {
                 continue;
             }
-            if let Some(diff) = seeds.first_match(i, r, adapter) {
-                counts[i] += 1;
-                max = max.max(counts[i]);
-                mismatches[i] += diff;
-            }
+            counts[i] += 1;
+            max = max.max(counts[i]);
+            mismatches[i] += diff;
         }
     }
     let mut best = 0;
@@ -121,7 +139,7 @@ fn known(reads: &[&[u8]]) -> Option<Vec<u8>> {
         .then(|| KNOWN[best].to_vec())
 }
 
-fn count_seeds(read: &[u8], shift: usize, counts: &mut [usize]) {
+fn count_seeds(read: &[u8], shift: usize, counts: &mut [u32]) {
     let end = read.len().saturating_sub(10 + shift).saturating_add(1);
     if end <= 20 {
         return;
@@ -148,10 +166,11 @@ fn count_seeds(read: &[u8], shift: usize, counts: &mut [usize]) {
     }
 }
 
+/// 40 bytes: children are node indices, 0 for none (the root is never a child).
 #[derive(Default)]
 struct Node {
-    children: [Option<usize>; 8],
-    count: usize,
+    children: [u32; 8],
+    count: u32,
     base: u8,
 }
 
@@ -171,16 +190,17 @@ impl Tree {
                 break;
             }
             let idx = (b & 7) as usize;
-            let child = if let Some(child) = self.nodes[node].children[idx] {
-                child
-            } else {
-                let child = self.nodes.len();
-                self.nodes.push(Node {
-                    base: b,
-                    ..Node::default()
-                });
-                self.nodes[node].children[idx] = Some(child);
-                child
+            let child = match self.nodes[node].children[idx] {
+                0 => {
+                    let child = self.nodes.len();
+                    self.nodes.push(Node {
+                        base: b,
+                        ..Node::default()
+                    });
+                    self.nodes[node].children[idx] = child as u32;
+                    child
+                }
+                child => child as usize,
             };
             self.nodes[child].count += 1;
             node = child;
@@ -190,21 +210,19 @@ impl Tree {
         let mut node = 0;
         let mut path = Vec::new();
         loop {
-            let total: usize = self.nodes[node]
-                .children
-                .iter()
-                .flatten()
-                .map(|&n| self.nodes[n].count)
-                .sum();
+            let children = || {
+                self.nodes[node]
+                    .children
+                    .iter()
+                    .filter(|&&n| n != 0)
+                    .map(|&n| n as usize)
+            };
+            let total: usize = children().map(|n| self.nodes[n].count as usize).sum();
             if total < 50 {
                 break;
             }
-            let next = self.nodes[node]
-                .children
-                .iter()
-                .flatten()
-                .find(|&&n| self.nodes[n].count as f64 / total as f64 >= 0.95);
-            if let Some(&next) = next {
+            let next = children().find(|&n| self.nodes[n].count as f64 / total as f64 >= 0.95);
+            if let Some(next) = next {
                 path.push(self.nodes[next].base);
                 node = next;
             } else {
@@ -224,15 +242,29 @@ pub fn detect(reads: &[&[u8]], tail: usize) -> Option<Vec<u8>> {
         return Some(known);
     }
     let shift = tail.max(1);
-    let mut counts = vec![0usize; 1 << 20];
-    for r in reads {
-        count_seeds(r, shift, &mut counts);
-    }
+    // Seed counts are sums, so each thread counts a contiguous share of the
+    // sample into its own table (u32 is enough for 256K reads) and they add up.
+    let share = reads.len().div_ceil(rayon::current_num_threads()).max(1);
+    let mut counts = reads
+        .par_chunks(share)
+        .map(|chunk| {
+            let mut counts = vec![0u32; 1 << 20];
+            for r in chunk {
+                count_seeds(r, shift, &mut counts);
+            }
+            counts
+        })
+        .reduce_with(|mut a, b| {
+            a.iter_mut().zip(b).for_each(|(a, b)| *a += b);
+            a
+        })
+        .unwrap_or_else(|| vec![0; 1 << 20]);
     counts[0] = 0;
     // Only the ten highest (count, key) pairs are used by discovery.
     let mut candidates = BinaryHeap::with_capacity(10);
     let mut total = 0;
     for (key, &n) in counts.iter().enumerate() {
+        let n = n as usize;
         if n == 0 {
             continue;
         }
@@ -270,15 +302,25 @@ pub fn detect(reads: &[&[u8]], tail: usize) -> Option<Vec<u8>> {
         if seed.windows(2).filter(|w| w[0] != w[1]).count() < 3 {
             continue;
         }
+        // Find every seed hit in parallel, then add them to the trees in
+        // read order, as a single pass would.
+        let seed_ref = &seed[..];
+        let hits: Vec<(usize, usize)> = reads
+            .par_iter()
+            .enumerate()
+            .flat_map_iter(|(i, r)| {
+                let end = 500.min(r.len().saturating_sub(10 + shift).saturating_add(1));
+                (20..end)
+                    .filter(move |&pos| &r[pos..pos + 10] == seed_ref)
+                    .map(move |pos| (i, pos))
+            })
+            .collect();
         let mut forward = Tree::new();
         let mut backward = Tree::new();
-        for r in reads {
-            for pos in 20..500.min(r.len().saturating_sub(10 + shift).saturating_add(1)) {
-                if r[pos..pos + 10] == seed {
-                    forward.add(r[pos + 10..r.len() - shift].iter().copied());
-                    backward.add(r[..pos].iter().rev().copied());
-                }
-            }
+        for (i, pos) in hits {
+            let r = reads[i];
+            forward.add(r[pos + 10..r.len() - shift].iter().copied());
+            backward.add(r[..pos].iter().rev().copied());
         }
         let mut leaf = true;
         let right = forward.path(&mut leaf);
@@ -303,6 +345,82 @@ pub fn detect(reads: &[&[u8]], tail: usize) -> Option<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
+
+    /// fastp's ordered loop, run sequentially, as it was before the parallel scan.
+    fn known_sequential(reads: &[&[u8]]) -> Option<Vec<u8>> {
+        let mut seeds = KnownSeeds::new(KNOWN);
+        let mut counts = vec![0usize; KNOWN.len()];
+        let mut mismatches = vec![0usize; KNOWN.len()];
+        let mut checked = 0;
+        let mut bases = 0;
+        let mut max = 0;
+        for r in reads {
+            checked += 1;
+            bases += r.len();
+            if checked > 100000 || bases > 100000000 || max > 1000 {
+                break;
+            }
+            seeds.collect(r);
+            for (i, adapter) in KNOWN.iter().enumerate() {
+                if adapter.len() >= r.len() || (max > 20 && counts[i] < max / 10) {
+                    continue;
+                }
+                if let Some(diff) = seeds.first_match(i, r, adapter) {
+                    counts[i] += 1;
+                    max = max.max(counts[i]);
+                    mismatches[i] += diff;
+                }
+            }
+        }
+        let mut best = 0;
+        for i in 1..counts.len() {
+            if counts[i] > counts[best] {
+                best = i;
+            }
+        }
+        (counts[best] > checked / 50
+            || (counts[best] > checked / 200 && mismatches[best] < checked))
+            .then(|| KNOWN[best].to_vec())
+    }
+
+    #[test]
+    fn parallel_known_scan_matches_sequential_loop() {
+        let mut state = 7u64;
+        let mut next = |n: usize| {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            (state >> 33) as usize % n
+        };
+        let mut detected = 0;
+        for trial in 0..12 {
+            // A few adapters at different rates, so the skip heuristic and the
+            // early stop at 1000 matches both come into play.
+            let picks: Vec<usize> = (0..3).map(|_| next(KNOWN.len())).collect();
+            let rates = [[0, 0, 0], [40, 5, 1], [3, 2, 1], [200, 1, 0]][trial % 4];
+            let reads: Vec<Vec<u8>> = (0..12000)
+                .map(|_| {
+                    let mut r: Vec<u8> = (0..20 + next(130)).map(|_| b"ACGTN"[next(5)]).collect();
+                    for (&a, &rate) in picks.iter().zip(&rates) {
+                        if rate > 0 && next(1000) < rate {
+                            let adapter = KNOWN[a];
+                            let at = next(r.len());
+                            r.truncate(at);
+                            r.extend_from_slice(&adapter[..adapter.len().min(150 - at.min(149))]);
+                            if next(3) == 0 && !r.is_empty() {
+                                let i = next(r.len());
+                                r[i] = b"ACGT"[next(4)];
+                            }
+                        }
+                    }
+                    r
+                })
+                .collect();
+            let reads: Vec<&[u8]> = reads.iter().map(|r| r.as_slice()).collect();
+            let found = known(&reads);
+            assert_eq!(found, known_sequential(&reads), "trial {trial}");
+            detected += usize::from(found.is_some());
+        }
+        assert!(detected >= 3, "only {detected} trials detected an adapter");
+    }
     use super::*;
 
     #[test]

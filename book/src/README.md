@@ -53,7 +53,7 @@ Copy-paste commands for common tasks:
 | **Compressed in/out**       | `fasterp -i in.fq.gz -o out.fq.gz`                                        |
 | **Split into 10 files**     | `fasterp -i in.fq -o out.fq -s 10`                                        |
 | **Skip all filtering**      | `fasterp -i in.fq -o out.fq -A -G -Q -L`                                  |
-| **With UMI extraction**     | `fasterp -i in.fq -o out.fq --umi --umi-len 8`                            |
+| **With UMI extraction**     | `fasterp -i in.fq -o out.fq --umi --umi-loc read1 --umi-len 8`            |
 | **Deduplicate**             | `fasterp -i in.fq -o out.fq -D`                                           |
 | **Custom report name**      | `fasterp -i in.fq -o out.fq -j report.json --html report.html`            |
 
@@ -106,7 +106,7 @@ Reads that are too short often come from errors or failed sequencing. Think of i
 | Flag | Long                      | Default | Description                                              |
 | ---- | ------------------------- | ------- | -------------------------------------------------------- |
 | `-l` | `--length-required`       | 15      | Minimum length required                                  |
-| `-L` | `--disable-length-filter` |         | Disable length filtering (fastp compatibility)           |
+| `-L` | `--disable-length-filtering` |         | Disable length filtering (fastp compatibility)           |
 | `-b` | `--max-len1`              | 0       | Maximum length for read1 - trim if longer (0 = disabled) |
 | `-B` | `--max-len2`              | 0       | Maximum length for read2 - trim if longer (0 = disabled) |
 
@@ -219,11 +219,11 @@ Instead of cutting a fixed amount, this looks at actual quality scores and trims
 
 | Flag | Long                         | Default | Description                                               |
 | ---- | ---------------------------- | ------- | --------------------------------------------------------- |
-|      | `--cut-mean-quality`         | 0       | Quality cutoff for sliding-window trimming (0 = disabled) |
-|      | `--cut-window-size`          | 4       | Sliding window size for quality trimming                  |
-|      | `--cut-front`                |         | Enable quality trimming at 5' end (front)                 |
-|      | `--cut-tail`                 |         | Enable quality trimming at 3' end (tail)                  |
-|      | `--disable-quality-trimming` |         | Disable polyG/quality tail trimming                       |
+| `-M` | `--cut-mean-quality`         | 20      | Quality cutoff for sliding-window trimming                |
+| `-W` | `--cut-window-size`          | 4       | Sliding window size for quality trimming                  |
+| `-5` | `--cut-front`                |         | Enable quality trimming at 5' end (front)                 |
+| `-3` | `--cut-tail`                 |         | Enable quality trimming at 3' end (tail)                  |
+|      | `--disable-trim-tail`        |         | Disable polyG/quality tail trimming                       |
 
 <svg viewBox="0 0 550 130" xmlns="http://www.w3.org/2000/svg" style="display:block;margin:1em auto;max-width:550px;font-family:system-ui,sans-serif;font-size:13px">
   <!-- Quality scores -->
@@ -349,10 +349,10 @@ A UMI (Unique Molecular Identifier) is a short random tag added to each original
 
 | Flag | Long           | Default | Description                                                |
 | ---- | -------------- | ------- | ---------------------------------------------------------- |
-|      | `--umi`        |         | Enable UMI preprocessing                                   |
-|      | `--umi-loc`    | read1   | UMI location: read1/read2/index1/index2/per_read/per_index |
+| `-U` | `--umi`        |         | Enable UMI preprocessing                                   |
+|      | `--umi-loc`    |         | UMI location, required with --umi: read1/read2/index1/index2/per_read/per_index |
 |      | `--umi-len`    | 0       | UMI length (required when --umi is enabled)                |
-|      | `--umi-prefix` | UMI     | Prefix in read name for UMI                                |
+|      | `--umi-prefix` |         | Prefix in read name for UMI                                |
 |      | `--umi-skip`   | 0       | Skip N bases before UMI                                    |
 
 <svg viewBox="0 0 500 130" xmlns="http://www.w3.org/2000/svg" style="display:block;margin:1em auto;max-width:500px;font-family:system-ui,sans-serif;font-size:14px">
@@ -379,7 +379,7 @@ During sample preparation, molecules get copied many times. Identical reads are 
 | Flag | Long                      | Default | Description                                         |
 | ---- | ------------------------- | ------- | --------------------------------------------------- |
 | `-D` | `--dedup`                 |         | Enable deduplication to remove duplicate reads      |
-|      | `--dup-calc-accuracy`     | 0       | Deduplication accuracy (1-6), higher = more memory  |
+|      | `--dup-calc-accuracy`     | 1       | Deduplication accuracy (1-6), higher = more memory; 3 with `--dedup` |
 |      | `--dont-eval-duplication` |         | Don't evaluate duplication rate (saves time/memory) |
 
 <svg viewBox="0 0 550 150" xmlns="http://www.w3.org/2000/svg" style="display:block;margin:1em auto;max-width:550px;font-family:system-ui,sans-serif;font-size:13px">
@@ -453,22 +453,22 @@ fasterp generates detailed statistics about your data before and after processin
 | Flag | Long             | Default      | Description                                         |
 | ---- | ---------------- | ------------ | --------------------------------------------------- |
 | `-j` | `--json`         | fasterp.json | JSON report file                                    |
-|      | `--html`         | fasterp.html | HTML report file                                    |
-|      | `--stats-format` | compact      | Stats output format: compact, pretty, off, or jsonl |
+| `-h` | `--html`         | fasterp.html | HTML report file                                    |
+|      | `--stats-format` | compact      | JSON report format: compact, pretty, jsonl, or off for no JSON report |
 
 ### Performance
 
-Control how fasterp uses your system resources. More threads = faster processing but more CPU/memory usage. The batch size affects memory consumption - larger batches are more efficient but use more RAM. Use `--max-memory` to set a limit and let fasterp auto-tune the other settings.
+Control how fasterp uses your system resources. More threads = faster processing but more CPU/memory usage. The batch size affects memory consumption - larger batches are more efficient but use more RAM. Use `--max-memory` to set a budget and fasterp sizes its batches to fit. The budget covers processing batches, not profiling and adapter samples.
 
 | Flag | Long                     | Default   | Description                              |
 | ---- | ------------------------ | --------- | ---------------------------------------- |
 | `-w` | `--thread`               | auto      | Number of worker threads                 |
-| `-z` | `--compression`          | 6         | Compression level for gzip output (0-9)  |
+| `-z` | `--compression`          | 4         | Compression level for gzip output (1-9)  |
 |      | `--parallel-compression` | true      | Use parallel compression for gzip output |
-|      | `--batch-bytes`          | 33554432  | Batch size in bytes (32 MiB)             |
+|      | `--batch-bytes`          | 33554432  | Largest batch in bytes; most runs use at most 8 MiB |
 |      | `--max-backlog`          | threads+1 | Maximum backlog of batches               |
-|      | `--max-memory`           |           | Maximum memory usage in MB               |
-|      | `--skip-kmer-counting`   |           | Skip k-mer counting for performance      |
+|      | `--max-memory`           |           | Batch memory budget in MB                |
+|      | `--no-kmer`              |           | Skip k-mer counting for performance      |
 
 ## Architecture
 
@@ -484,7 +484,7 @@ fasterp processes data in a pipeline with three stages running in parallel. The 
   <rect x="20" y="35" width="120" height="80" rx="8" fill="#dbeafe" stroke="#2563eb" stroke-width="2"/>
   <text x="80" y="60" text-anchor="middle" font-weight="700" fill="#1e40af">Producer</text>
   <text x="80" y="80" text-anchor="middle" font-size="10" fill="#1e40af">Read &amp; Parse</text>
-  <text x="80" y="95" text-anchor="middle" font-size="10" fill="#1e40af">32MB batches</text>
+  <text x="80" y="95" text-anchor="middle" font-size="10" fill="#1e40af">8 MiB batches</text>
   <!-- Arrows to workers -->
   <line x1="140" y1="55" x2="190" y2="35" stroke="#333" stroke-width="2" marker-end="url(#a6)"/>
   <line x1="140" y1="75" x2="190" y2="75" stroke="#333" stroke-width="2" marker-end="url(#a6)"/>
@@ -516,9 +516,9 @@ fasterp processes data in a pipeline with three stages running in parallel. The 
 
 fasterp uses a 3-stage pipeline for multi-threaded processing:
 
-1. **Producer**: Reads input in 32MB batches, parses FASTQ records
+1. **Producer**: Decompresses each input on its own thread, then a parser cuts the records into batches of up to 8 MiB
 2. **Workers**: Process batches in parallel (filtering, trimming, stats)
-3. **Merger**: Writes output in order, aggregates statistics
+3. **Merger**: Puts results back in order and aggregates statistics. Gzip output is compressed in blocks on separate threads, and a separate thread tracks duplicates
 
 Key optimizations:
 - SIMD acceleration (AVX2/NEON) for quality statistics

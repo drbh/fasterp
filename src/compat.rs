@@ -3,7 +3,7 @@
 //! Batches are processed in bounded waves. Results are emitted in input order;
 //! an arbitrarily slow first batch cannot accumulate an unbounded reorder queue.
 use crate::util::Instant;
-use crate::{adapter, auto_adapter, html, io, kmer, overlap, simd, split, stats, Args};
+use crate::{adapter, auto_adapter, html, io, overlap, simd, split, stats, Args};
 use anyhow::{ensure, Context, Result};
 use rayon::prelude::*;
 use rustc_hash::FxHashMap;
@@ -207,6 +207,18 @@ fn valid_quality(qual: &[u8], offset: u8) -> bool {
     }) == 0
 }
 
+/// 5-mer codes A=0 C=1 G=2 T=3 (either case); 4 for anything else.
+const KMER_CODE: [u8; 256] = {
+    let mut lut = [4u8; 256];
+    let bases = *b"ACGTacgt";
+    let mut i = 0;
+    while i < 8 {
+        lut[bases[i] as usize] = (i % 4) as u8;
+        i += 1;
+    }
+    lut
+};
+
 // Keep the counters touched for one cycle together. The reporting structure
 // stores each counter in a separate vector, which is expensive in this hot loop.
 #[derive(Clone, Default)]
@@ -217,10 +229,28 @@ struct Cycle {
     base_cnt: [u64; 4],
 }
 
+/// Per-cycle counters for the reads added since the last flush, in narrow
+/// integers and one array per counter, so the per-base loop is a handful of
+/// independent vector adds. Totals per cycle come from the read lengths.
+/// Flushed into `Sample::cycles` every 255 reads, before a u8 count or a u16
+/// quality sum (at most 255 * 93) can overflow.
+#[derive(Clone, Default)]
+struct Pending {
+    reads: u32,
+    lengths: Vec<u32>,
+    count: [Vec<u8>; 4],
+    sum: [Vec<u16>; 5],
+    /// Reads per (cycle, quality), 94 qualities per cycle. Consecutive bases
+    /// land in different counters even when their qualities repeat, so the
+    /// increments do not wait on each other like a single histogram's do.
+    quals: Vec<u8>,
+}
+
 #[derive(Clone)]
 struct Sample {
     simple: stats::SimpleStats,
     cycles: Vec<Cycle>,
+    pending: Pending,
     // Separate adjacent updates so long runs of one quality score do not form
     // a dependency chain on a single histogram counter.
     qual_hist: [[usize; 94]; 4],
@@ -234,6 +264,7 @@ impl Default for Sample {
         Self {
             simple: stats::SimpleStats::default(),
             cycles: Vec::new(),
+            pending: Pending::default(),
             qual_hist: [[0; 94]; 4],
             kmers: [0; 1024],
             max_len: 0,
@@ -254,7 +285,9 @@ impl Sample {
         }
     }
 
-    fn merge(&mut self, other: Self) {
+    fn merge(&mut self, mut other: Self) {
+        self.flush();
+        other.flush();
         self.simple.total_reads += other.simple.total_reads;
         self.simple.total_bases += other.simple.total_bases;
         self.simple.q20_bases += other.simple.q20_bases;
@@ -300,6 +333,42 @@ impl Sample {
                 ora.add(seq);
             }
         }
+        let n = seq.len().min(qual.len());
+        let (seq, qual) = (&seq[..n], &qual[..n]);
+        self.simple.total_reads += 1;
+        self.simple.total_bases += seq.len();
+        self.max_len = self.max_len.max(n);
+        let p = &mut self.pending;
+        if p.lengths.len() <= n {
+            p.lengths.resize(n + 1, 0);
+            for count in &mut p.count {
+                count.resize(n, 0);
+            }
+            for sum in &mut p.sum {
+                sum.resize(n, 0);
+            }
+            p.quals.resize(n * 94, 0);
+        }
+        p.lengths[n] += 1;
+        cycle_counts(p, seq, qual);
+        quality_cycles(&mut p.quals, qual);
+        p.reads += 1;
+        if p.reads == 255 {
+            self.flush();
+        }
+        if !no_kmer {
+            count_kmers(&mut self.kmers, seq);
+        }
+    }
+
+    /// The straightforward per-base version `add_parts` must match.
+    #[cfg(test)]
+    fn add_parts_reference(&mut self, seq: &[u8], qual: &[u8], no_kmer: bool, index: usize) {
+        if let Some(ora) = self.overrep.as_mut() {
+            if index % ora.sampling == 0 {
+                ora.add(seq);
+            }
+        }
         self.simple.total_reads += 1;
         self.simple.total_bases += seq.len();
         self.max_len = self.max_len.max(seq.len());
@@ -313,7 +382,7 @@ impl Sample {
             cycle.total_sum += q as u64;
             cycle.total_cnt += 1;
             self.qual_hist[index & 3][q] += 1;
-            if let Some(base) = kmer::base_idx(b) {
+            if let Some(base) = crate::kmer::base_idx(b) {
                 cycle.base_sum[base] += q as u64;
                 cycle.base_cnt[base] += 1;
                 if !no_kmer {
@@ -330,7 +399,46 @@ impl Sample {
         }
     }
 
+    /// Move the pending narrow counters into the per-cycle totals.
+    fn flush(&mut self) {
+        let p = &mut self.pending;
+        if p.reads == 0 {
+            return;
+        }
+        let cycles = p.lengths.len().saturating_sub(1);
+        if self.cycles.len() < cycles {
+            self.cycles.resize(cycles, Cycle::default());
+        }
+        // Reads longer than cycle i, counted from the longest down.
+        let mut longer = 0u64;
+        for i in (0..cycles).rev() {
+            longer += u64::from(p.lengths[i + 1]);
+            let cycle = &mut self.cycles[i];
+            cycle.total_cnt += longer;
+            cycle.total_sum += u64::from(p.sum[4][i]);
+            for base in 0..4 {
+                cycle.base_cnt[base] += u64::from(p.count[base][i]);
+                cycle.base_sum[base] += u64::from(p.sum[base][i]);
+            }
+        }
+        for row in p.quals.chunks_exact(94) {
+            for (dst, &src) in self.qual_hist[0].iter_mut().zip(row) {
+                *dst += usize::from(src);
+            }
+        }
+        p.quals.fill(0);
+        p.reads = 0;
+        p.lengths.fill(0);
+        for count in &mut p.count {
+            count.fill(0);
+        }
+        for sum in &mut p.sum {
+            sum.fill(0);
+        }
+    }
+
     fn finish_summary(&mut self) {
+        self.flush();
         // Derive totals from the histograms instead of rescanning reads.
         self.simple.q20_bases = self
             .qual_hist
@@ -395,6 +503,62 @@ impl Sample {
             "quality_curves":p.to_quality_curves(), "content_curves":content,
             "qual_hist":p.to_qual_hist(), "kmer_count":kmers,
             "overrepresented_sequences":self.overrep.as_ref().map(Overrep::report).unwrap_or_default()})
+    }
+}
+
+/// Base counts and quality sums per cycle. Branch-free: every lane adds 0 or 1
+/// and its quality or 0, so this vectorizes across cycles. `| 0x20` folds
+/// lowercase bases onto uppercase.
+fn cycle_counts(p: &mut Pending, seq: &[u8], qual: &[u8]) {
+    let n = seq.len();
+    let [a, t, c, g] = &mut p.count;
+    let (a, t, c, g) = (&mut a[..n], &mut t[..n], &mut c[..n], &mut g[..n]);
+    let [sa, st, sc, sg, all] = &mut p.sum;
+    let (sa, st, sc, sg, all) = (
+        &mut sa[..n],
+        &mut st[..n],
+        &mut sc[..n],
+        &mut sg[..n],
+        &mut all[..n],
+    );
+    for i in 0..n {
+        let b = seq[i] | 0x20;
+        let q = qual[i].wrapping_sub(33);
+        let is = [b == b'a', b == b't', b == b'c', b == b'g'].map(u8::from);
+        a[i] += is[0];
+        t[i] += is[1];
+        c[i] += is[2];
+        g[i] += is[3];
+        sa[i] += u16::from(q & is[0].wrapping_neg());
+        st[i] += u16::from(q & is[1].wrapping_neg());
+        sc[i] += u16::from(q & is[2].wrapping_neg());
+        sg[i] += u16::from(q & is[3].wrapping_neg());
+        all[i] += u16::from(q);
+    }
+}
+
+fn quality_cycles(quals: &mut [u8], qual: &[u8]) {
+    // Qualities are validated to 33..=126, so `min` only removes the bounds check.
+    for (row, &q) in quals.chunks_exact_mut(94).zip(qual) {
+        row[usize::from(q - 33).min(93)] += 1;
+    }
+}
+
+fn count_kmers(kmers: &mut [usize; 1024], seq: &[u8]) {
+    let mut kmer_code = 0usize;
+    let mut valid = 0usize;
+    for &b in seq {
+        let code = KMER_CODE[usize::from(b)];
+        if code < 4 {
+            kmer_code = ((kmer_code << 2) | usize::from(code)) & 1023;
+            valid += 1;
+            if valid >= 5 {
+                kmers[kmer_code] += 1;
+            }
+        } else {
+            kmer_code = 0;
+            valid = 0;
+        }
     }
 }
 
@@ -1214,10 +1378,34 @@ struct PackedChunk {
     unknown: usize,
 }
 
+/// Output buffers of written chunks, reused by later chunks for the same
+/// reason as batch buffers: freed large blocks are faulted in again. At most
+/// a few batches of chunks are in flight.
+static SPARE_OUTPUT: std::sync::Mutex<Vec<Vec<u8>>> = std::sync::Mutex::new(Vec::new());
+const SPARE_OUTPUTS: usize = 256;
+
+fn spare_output() -> Vec<u8> {
+    let spare = SPARE_OUTPUT.lock().unwrap_or_else(|e| e.into_inner()).pop();
+    spare.unwrap_or_default()
+}
+
+impl Drop for PackedChunk {
+    fn drop(&mut self) {
+        let mut spare = SPARE_OUTPUT.lock().unwrap_or_else(|e| e.into_inner());
+        for out in &mut self.output {
+            if out.capacity() > 0 && spare.len() < SPARE_OUTPUTS {
+                let mut out = std::mem::take(out);
+                out.clear();
+                spare.push(out);
+            }
+        }
+    }
+}
+
 impl PackedChunk {
     fn new(records: usize, recycle_limit: usize, duplication: bool) -> Self {
         Self {
-            output: std::array::from_fn(|_| Vec::new()),
+            output: std::array::from_fn(|_| spare_output()),
             positions: Vec::with_capacity(if duplication { records } else { 0 }),
             duplicates: 0,
             recycled: ReadPool {
@@ -1843,7 +2031,13 @@ fn process_batch(
     let interleaved = config.args.interleaved_in;
     let stride = if interleaved { 2 } else { 1 };
     let count = raw.as_ref().map_or(reads.len(), |r| r[0].len() / stride);
-    let chunk_size = count.div_ceil(threads).max(1);
+    // One chunk per worker leaves the batch waiting on its slowest chunk,
+    // and with few workers that is often one on an efficiency core. Split
+    // into chunks of about 4000 records, up to four per worker, so faster
+    // workers take more of the batch; more and smaller chunks only add
+    // per-chunk overhead.
+    let chunks = (count / 4000).clamp(threads, 4 * threads);
+    let chunk_size = count.div_ceil(chunks).max(1);
     let results: Vec<Result<Chunk<'static>>> = pool.install(|| {
         if let Some(raw) = raw {
             (0..count.div_ceil(chunk_size))
@@ -2427,6 +2621,14 @@ pub fn run(mut a: Args) -> Result<()> {
     } else {
         None
     };
+    // Decoding one large member in parallel costs about 2.5 times zlib's CPU
+    // per byte, so it pays off only when decoding limits the run: a single
+    // input (a second brings its own decoder and the compressors need the
+    // cores) whose output is not gzip, or whose qualities are binned, which
+    // makes compressing the output cheap. Otherwise the extra CPU comes out
+    // of processing and compression.
+    let gzip_out = io::CompressionFormat::from_path(&a.output) == io::CompressionFormat::Gzip;
+    io::set_split_decoding(a.input2.is_none() && (!gzip_out || io::binned_gzip_input(&a.input)));
     let mut reader1 = Reader::open(&a.input, a.phred64)?;
     let mut reader2 = a
         .input2
@@ -2561,15 +2763,27 @@ pub fn run(mut a: Args) -> Result<()> {
                 .collect()
         }
     };
+    let threads = worker_threads(&a);
+    #[cfg(not(target_arch = "wasm32"))]
+    let owned_pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(threads)
+        .build()?;
+    #[cfg(not(target_arch = "wasm32"))]
+    let pool = &owned_pool;
+    #[cfg(target_arch = "wasm32")]
+    let pool = wasm_pool()?;
+    // Detection scans the whole sample; it runs on the worker pool.
+    let detect =
+        |mate: usize| pool.install(|| auto_adapter::detect(&sample_sequences(mate), a.trim_tail1));
     if !a.disable_adapter_trimming && !a.disable_adapter_detection && sample_count >= 10000 {
         if !pe && adapters[0].is_none() {
-            adapters[0] = auto_adapter::detect(&sample_sequences(0), a.trim_tail1);
+            adapters[0] = detect(0);
         } else if pe && a.detect_adapter_for_pe {
             if adapters[0].is_none() {
-                adapters[0] = auto_adapter::detect(&sample_sequences(0), a.trim_tail1);
+                adapters[0] = detect(0);
             }
             if adapters[1].is_none() {
-                adapters[1] = auto_adapter::detect(&sample_sequences(1), a.trim_tail1);
+                adapters[1] = detect(1);
             }
         }
     }
@@ -2595,15 +2809,6 @@ pub fn run(mut a: Args) -> Result<()> {
         load_sequences(a.filter_by_index1.as_deref(), false)?,
         load_sequences(a.filter_by_index2.as_deref(), false)?,
     ];
-    let threads = worker_threads(&a);
-    #[cfg(not(target_arch = "wasm32"))]
-    let owned_pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(threads)
-        .build()?;
-    #[cfg(not(target_arch = "wasm32"))]
-    let pool = &owned_pool;
-    #[cfg(target_arch = "wasm32")]
-    let pool = wasm_pool()?;
     let max_bytes = if let Some(mb) = a.max_memory {
         ensure!(mb >= 16, "--max_memory must be at least 16 MB");
         a.batch_bytes.min(mb.saturating_mul(1024 * 1024) / 8).max(1)
@@ -2725,8 +2930,9 @@ pub fn run(mut a: Args) -> Result<()> {
     // scoped threads are being joined.
     // Compact synchronous jobs use the same batch ceiling as the pipeline,
     // limiting serial parsing work before each parallel processing step.
+    // Smaller batches leave the worker pool waiting between them.
     let max_bytes = if pipelined || pack_main_output(a) {
-        max_bytes.min(2 * 1024 * 1024)
+        max_bytes.min(8 * 1024 * 1024)
     } else {
         max_bytes
     };
@@ -2881,7 +3087,7 @@ pub fn run(mut a: Args) -> Result<()> {
                 for (dst, src) in after.iter_mut().zip(chunk.after) {
                     dst.merge(src);
                 }
-                if let Some(packed) = chunk.packed {
+                if let Some(mut packed) = chunk.packed {
                     out.write_packed(main1, &packed.output[0])?;
                     out.write_packed(main2, &packed.output[1])?;
                     out.write_packed(merged_out, &packed.output[2])?;
@@ -2896,7 +3102,7 @@ pub fn run(mut a: Args) -> Result<()> {
                     for (dst, src) in failures.iter_mut().zip(packed.failures) {
                         *dst += src;
                     }
-                    for (dst, src) in histogram.iter_mut().zip(packed.histogram) {
+                    for (dst, src) in histogram.iter_mut().zip(&packed.histogram) {
                         *dst += src;
                     }
                     for (dst, src) in poly_reads.iter_mut().zip(packed.poly_reads) {
@@ -2905,7 +3111,7 @@ pub fn run(mut a: Args) -> Result<()> {
                     for (dst, src) in poly_bases.iter_mut().zip(packed.poly_bases) {
                         *dst += src;
                     }
-                    read_pools.push(packed.recycled);
+                    read_pools.push(std::mem::take(&mut packed.recycled));
                     continue;
                 }
                 for p in chunk.processed {
@@ -3208,6 +3414,44 @@ mod tests {
     }
 
     #[test]
+    fn vectorized_sample_matches_per_base_reference() {
+        let mut fast = Sample::default();
+        let mut reference = Sample::default();
+        let mut merged = Sample::default();
+        let mut state = 140u64;
+        for ordinal in 0..2000 {
+            let mut seq = Vec::new();
+            let mut qual = Vec::new();
+            for _ in 0..(ordinal * 7) % 301 {
+                state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+                seq.push(b"ATCGNatcgnX."[(state >> 32) as usize % 12]);
+                qual.push(33 + ((state >> 24) % 94) as u8);
+            }
+            fast.add_parts(&seq, &qual, false, ordinal);
+            reference.add_parts_reference(&seq, &qual, false, ordinal);
+            // One-read samples merged in exercise flush and merge.
+            let mut part = Sample::default();
+            part.add_parts(&seq, &qual, false, ordinal);
+            merged.merge(part);
+        }
+        for sample in [&mut fast, &mut reference, &mut merged] {
+            sample.finish_summary();
+        }
+        for sample in [&fast, &merged] {
+            assert_eq!(sample.details(), reference.details());
+            assert_eq!(sample.cycles.len(), reference.cycles.len());
+            for (x, y) in sample.cycles.iter().zip(&reference.cycles) {
+                assert_eq!(
+                    (x.total_sum, x.total_cnt, x.base_sum, x.base_cnt),
+                    (y.total_sum, y.total_cnt, y.base_sum, y.base_cnt)
+                );
+            }
+            assert_eq!(sample.kmers, reference.kmers);
+            assert_eq!(sample.simple.gc_bases, reference.simple.gc_bases);
+        }
+    }
+
+    #[test]
     fn fused_statistics_match_separate_quality_and_kmer_passes() {
         let mut sample = Sample::default();
         let mut simple = stats::SimpleStats::default();
@@ -3232,7 +3476,7 @@ mod tests {
                 metrics.q40,
                 metrics.gc,
             );
-            kmer::count_k5_2bit(&read.seq, &mut kmers);
+            crate::kmer::count_k5_2bit(&read.seq, &mut kmers);
             for &q in read.qual.iter() {
                 qualities[usize::from(q - 33)] += 1;
             }

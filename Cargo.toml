@@ -10,7 +10,7 @@ license = "MIT"
 name = "fasterp"
 readme = "README.md"
 repository = "https://github.com/drbh/fasterp"
-version = "0.2.1"
+version = "0.3.0"
 
 [[bin]]
 name = "fasterp"
@@ -25,10 +25,11 @@ native = [
   "dep:tokio",
   "dep:ureq",
   "dep:libdeflater",
+  "dep:crc32fast",
   "dep:gzp",
   "dep:bytes",
   "dep:zstd",
-  "flate2/zlib-ng",
+  "dep:mimalloc",
 ]
 wasm = ["dep:wasm-bindgen", "dep:js-sys", "flate2/rust_backend"]
 
@@ -50,6 +51,8 @@ crossbeam-channel = "0.5"
 gzp = {version = "0.11", features = ["deflate_rust"], default-features = false, optional = true}
 bytes = {version = "1", optional = true}
 libdeflater = {version = "1.21", optional = true}
+crc32fast = {version = "1.4", optional = true}
+mimalloc = {version = "0.1", optional = true}
 num_cpus = "1.16"
 rayon = "1.10"
 tokio = {version = "1.0", features = ["rt-multi-thread"], optional = true}
@@ -62,8 +65,17 @@ wasm-bindgen = {version = "=0.2.92", optional = true}
 # Optional features
 zstd = {version = "0.13", optional = true}
 
+# Streaming gzip decoding: macOS's system zlib inflates about 1.5x faster than
+# zlib-ng on Apple Silicon, other native targets use zlib-ng, and wasm uses
+# the pure Rust backend selected by the wasm feature.
+[target.'cfg(target_os = "macos")'.dependencies]
+flate2 = {version = "1.0", default-features = false, features = ["zlib"]}
+
+[target.'cfg(not(any(target_os = "macos", target_arch = "wasm32")))'.dependencies]
+flate2 = {version = "1.0", default-features = false, features = ["zlib-ng"]}
+
 [lib]
-crate-type = ["cdylib", "rlib"]
+crate-type = ["rlib"]
 
 [dev-dependencies]
 assert_cmd = "2.0"

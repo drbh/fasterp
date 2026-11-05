@@ -11,7 +11,8 @@
 #   CSV=book/src/benchmarks.csv bash scripts/bench.sh
 #
 # updates that dataset in the book's benchmarks chapter. Override with R1, R2,
-# DATASET, WORKERS (comma separated), RUNS and OUT.
+# DATASET, WORKERS (comma separated), RUNS, WARMUP and OUT. ARGS is added to every
+# command for both programs, for example ARGS=-g to trim poly-G tails.
 set -euo pipefail
 
 fastp=${1:-fastp}
@@ -21,7 +22,9 @@ r2=${R2:-test_data/SRR5808766_2.fastq.gz}
 dataset=${DATASET:-$(basename "$r1" | sed 's/_1\..*//')}
 workers=${WORKERS:-1,4,8}
 runs=${RUNS:-3}
+warmup=${WARMUP:-1}
 out=${OUT:-target/bench}
+extra=${ARGS:-}
 csv=${CSV:-$out/results.csv}
 
 command -v hyperfine >/dev/null || { echo "hyperfine is required (brew install hyperfine)" >&2; exit 1; }
@@ -42,30 +45,55 @@ date=$(date +%F)
 rows=$tmp/rows.csv
 : >"$rows"
 
+# Total size of the gzip files a program wrote, so output size is checked
+# alongside time: a faster encoder must not write larger files.
+output_bytes() {
+  find "$1" -name '*.gz' -exec wc -c {} + | awk '$2 != "total" {s += $1} END {print s + 0}'
+}
+
+sha256() {
+  if command -v sha256sum >/dev/null; then sha256sum | cut -c1-64; else shasum -a 256 | cut -c1-64; fi
+}
+
+# Digest of the decompressed outputs: each file's name and SHA-256, in name
+# order, hashed together. Equal digests mean both programs wrote the same
+# records byte for byte, whatever their compression.
+output_sha256() {
+  local f
+  for f in $(cd "$1" && ls *.gz 2>/dev/null | sort); do
+    echo "$f $(gzip -dc "$1/$f" | sha256)"
+  done | sha256 | cut -c1-16
+}
+
+# Arguments name output files as @/file; each program writes to its own
+# directory so their sizes can be compared.
 bench() {
   local name=$1 args=$2 w
   for w in ${workers//,/ }; do
-    hyperfine --warmup 1 --runs "$runs" --export-csv "$tmp/run.csv" \
-      -n "fastp $w" "$fastp $args -j $tmp/fastp.json -h $tmp/fastp.html -w $w" \
-      -n "fasterp $w" "$fasterp $args -j $tmp/fasterp.json -h $tmp/fasterp.html -w $w"
+    rm -rf "$tmp/fastp" "$tmp/fasterp"
+    mkdir -p "$tmp/fastp" "$tmp/fasterp"
+    hyperfine --warmup "$warmup" --runs "$runs" --export-csv "$tmp/run.csv" \
+      -n "fastp $w" "$fastp ${args//@/$tmp/fastp} $extra -j $tmp/fastp.json -h $tmp/fastp.html -w $w" \
+      -n "fasterp $w" "$fasterp ${args//@/$tmp/fasterp} $extra -j $tmp/fasterp.json -h $tmp/fasterp.html -w $w"
     # hyperfine columns: command,mean,stddev,median,user,system,min,max
     tail -n +2 "$tmp/run.csv" | while IFS=, read -r command mean stddev _ _ _ min max; do
       program=${command% *}
       version=$fastp_version
       [ "$program" = fasterp ] && version=$fasterp_version
-      printf '%s,%s,%s,%s,%s,%.3f,%.3f,%.3f,%.3f,%s,%s,%s\n' "$dataset" "$name" "$w" "$program" \
-        "$version" "$mean" "$stddev" "$min" "$max" "$runs" "$machine" "$date" >>"$rows"
+      printf '%s,%s,%s,%s,%s,%.3f,%.3f,%.3f,%.3f,%s,%s,%s,%s,%s\n' "$dataset" "$name" "$w" "$program" \
+        "$version" "$mean" "$stddev" "$min" "$max" "$runs" "$machine" "$date" \
+        "$(output_bytes "$tmp/$program")" "$(output_sha256 "$tmp/$program")" >>"$rows"
     done
   done
 }
 
-bench single-end "-i $r1 -o $tmp/se.fq.gz"
-bench paired-end "-i $r1 -I $r2 -o $tmp/r1.fq.gz -O $tmp/r2.fq.gz"
-bench paired-correct-merge "-i $r1 -I $r2 -c -m --merged_out $tmp/merged.fq.gz -o $tmp/r1.fq.gz -O $tmp/r2.fq.gz"
+bench single-end "-i $r1 -o @/se.fq.gz"
+bench paired-end "-i $r1 -I $r2 -o @/r1.fq.gz -O @/r2.fq.gz"
+bench paired-correct-merge "-i $r1 -I $r2 -c -m --merged_out @/merged.fq.gz -o @/r1.fq.gz -O @/r2.fq.gz"
 
 # keep other datasets' rows, replace this one's
 {
-  echo dataset,workload,workers,program,version,mean,stddev,min,max,runs,machine,date
+  echo dataset,workload,workers,program,version,mean,stddev,min,max,runs,machine,date,output_bytes,output_sha256
   if [ -f "$csv" ]; then tail -n +2 "$csv" | awk -F, -v d="$dataset" '$1 != d'; fi
   cat "$rows"
 } >"$tmp/merged.csv"
