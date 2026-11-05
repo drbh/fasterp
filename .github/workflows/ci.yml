@@ -112,7 +112,7 @@ jobs:
         [ "$(wasm-bindgen --version 2>/dev/null)" = "wasm-bindgen 0.2.92" ] || cargo install wasm-bindgen-cli --version 0.2.92 --force
 
         # Build WASM
-        RUSTFLAGS='' cargo build --locked --target wasm32-unknown-unknown --no-default-features --features wasm --lib --release
+        RUSTFLAGS='' cargo rustc --locked --lib --release --crate-type cdylib --target wasm32-unknown-unknown --no-default-features --features wasm
 
         # Generate JS bindings
         wasm-bindgen target/wasm32-unknown-unknown/release/fasterp.wasm \

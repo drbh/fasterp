@@ -75,7 +75,7 @@ flate2 = {version = "1.0", default-features = false, features = ["zlib"]}
 flate2 = {version = "1.0", default-features = false, features = ["zlib-ng"]}
 
 [lib]
-crate-type = ["cdylib", "rlib"]
+crate-type = ["rlib"]
 
 [dev-dependencies]
 assert_cmd = "2.0"
