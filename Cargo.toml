@@ -10,7 +10,7 @@ license = "MIT"
 name = "fasterp"
 readme = "README.md"
 repository = "https://github.com/drbh/fasterp"
-version = "0.2.1"
+version = "0.3.0"
 
 [[bin]]
 name = "fasterp"

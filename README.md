@@ -10,7 +10,7 @@
                                                               ░██        
                                                               ░██        
 ```
-fasterp - A faster [fastp](https://github.com/OpenGene/fastp) — same interface, same output, **2-10x faster**.
+fasterp - A faster [fastp](https://github.com/OpenGene/fastp) — same interface, same output. The [benchmarks](https://drbh.github.io/fasterp/benchmarks.html) show how much faster on each dataset, workload and worker count.
 
 ```
 10M read pairs:  fastp 10s → fasterp 2.9s

@@ -6,7 +6,7 @@ Wall time in seconds for fastp and fasterp on the same inputs and options, measu
 <div id="bench-chart"></div>
 <p id="bench-meta" class="bench-meta"></p>
 
-fasterp `0.2.1-dev` is the development build ahead of the next release. Its gzip output is new: blocks with binned qualities, as NovaSeq writes them, use a FASTQ-aware encoder that is as small as level 4 at about 2.4 times its speed, and other blocks are compressed as before. Reads sorted by alignment position, as in ERR3239279, overlap their neighbours, and level 4 compresses them to half the size the FASTQ-aware encoder does, so their blocks stay with level 4.
+fasterp `0.3.0` has new gzip output: blocks with binned qualities, as NovaSeq writes them, use a FASTQ-aware encoder that is as small as level 4 at about 2.4 times its speed, and other blocks are compressed as before. Reads sorted by alignment position, as in ERR3239279, overlap their neighbours, and level 4 compresses them to half the size the FASTQ-aware encoder does, so their blocks stay with level 4.
 
 ## Workloads
 
