@@ -13,7 +13,7 @@
 fasterp - A faster [fastp](https://github.com/OpenGene/fastp) — same interface, same output, **2-10x faster**.
 
 ```
-10M read pairs:  fastp 11s → fasterp 6s
+10M read pairs:  fastp 10s → fasterp 2.9s
 ```
 
 Built with SIMD acceleration (AVX2/NEON), efficient multi-threading, and minimal memory allocation.
