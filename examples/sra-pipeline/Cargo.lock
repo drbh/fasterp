@@ -2163,6 +2163,15 @@ name = "readkit-batch"
 version = "0.0.0"
 
 [[package]]
+name = "readkit-fastq"
+version = "0.0.0"
+dependencies = [
+ "memchr",
+ "readkit-batch",
+ "readkit-io",
+]
+
+[[package]]
 name = "readkit-fetch"
 version = "0.0.0"
 dependencies = [
@@ -2186,7 +2195,9 @@ name = "readkit-sra"
 version = "0.0.0"
 dependencies = [
  "cc",
+ "libc",
  "readkit-batch",
+ "readkit-fastq",
  "readkit-fetch",
  "readkit-io",
  "reqwest",
