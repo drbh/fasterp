@@ -152,6 +152,34 @@ impl Reader {
         Ok(self.read_into(&mut read)?.then_some(read))
     }
 
+    /// fastp skips lines that cannot start a record. Skip only blank and
+    /// whitespace-only ones, and only where a header is expected; blank lines
+    /// inside a record still fail (fastp silently drops all reads from there).
+    fn skip_blank_lines(&mut self) -> Result<()> {
+        loop {
+            let buffer = self.inner.fill_buf()?;
+            if buffer.first().is_none_or(|&b| b == b'@') {
+                return Ok(());
+            }
+            match buffer.iter().position(|&b| !is_space(b)) {
+                Some(i) if buffer[i] == b'\n' => self.inner.consume(i + 1),
+                Some(0) => return Ok(()),
+                Some(_) => anyhow::bail!("Invalid FASTQ header at record {}", self.record + 1),
+                None => {
+                    // A whitespace run reaching the buffer end: read the rest
+                    // of the line to see whether it is blank.
+                    let mut line = Vec::new();
+                    self.inner.read_until(b'\n', &mut line)?;
+                    ensure!(
+                        line.iter().all(|&b| is_space(b) || b == b'\n'),
+                        "Invalid FASTQ header at record {}",
+                        self.record + 1
+                    );
+                }
+            }
+        }
+    }
+
     fn read_into(&mut self, read: &mut Read) -> Result<bool> {
         read.original = None;
         read.track_changes = false;
@@ -163,7 +191,11 @@ impl Reader {
         ];
         // Ordinary records fit in the existing input buffer. Find all four
         // boundaries with one buffer borrow instead of four virtual reads.
-        let buffer = self.inner.fill_buf()?;
+        let mut buffer = self.inner.fill_buf()?;
+        if buffer.first() != Some(&b'@') {
+            self.skip_blank_lines()?;
+            buffer = self.inner.fill_buf()?;
+        }
         let mut newlines = memchr::memchr_iter(b'\n', buffer);
         let ends = std::array::from_fn::<_, 4, _>(|_| newlines.next());
         if let [Some(a), Some(b), Some(c), Some(d)] = ends {
@@ -197,6 +229,11 @@ impl Reader {
         read.validate(self.record, self.phred64)?;
         Ok(true)
     }
+}
+
+/// Whitespace other than LF, as C `isspace`.
+fn is_space(b: u8) -> bool {
+    matches!(b, b' ' | b'\t' | b'\r' | b'\x0b' | b'\x0c')
 }
 
 // A reduction lets the compiler validate a vector of bytes at a time, without
@@ -3579,6 +3616,67 @@ mod tests {
             assert_eq!(last.seq.as_ref(), b"AC");
             assert_eq!(last.qual.as_ref(), b"))");
             assert!(reader.next_reusing(last).unwrap().is_none());
+        }
+    }
+
+    fn buffered(input: &[u8], capacity: usize) -> Reader {
+        Reader {
+            inner: Box::new(std::io::BufReader::with_capacity(
+                capacity,
+                std::io::Cursor::new(input.to_vec()),
+            )),
+            record: 0,
+            phred64: false,
+        }
+    }
+
+    #[test]
+    fn reader_skips_blank_lines_between_records_like_fastp() {
+        let spaces = " ".repeat(40);
+        let input = format!(
+            "\n \t\r\n@a\nAC\n+\nII\n\n\n@b\nT\n+\nI\n{spaces}\n\x0b\x0c\r\n@c\nG\n+\nH\n\n\t "
+        );
+        for capacity in 1..=input.len() + 1 {
+            let mut reader = buffered(input.as_bytes(), capacity);
+            let mut names = Vec::new();
+            while let Some(read) = reader.next().unwrap() {
+                names.push(read.name.into_owned());
+            }
+            assert_eq!(names, [&b"@a"[..], b"@b", b"@c"], "capacity={capacity}");
+            assert_eq!(reader.record, 3);
+        }
+        for input in [&b""[..], b"\n", b"  \n\t\r\n  "] {
+            assert!(buffered(input, 1).next().unwrap().is_none());
+        }
+    }
+
+    #[test]
+    fn reader_rejects_blank_lines_inside_records_at_the_right_record() {
+        for (input, error) in [
+            (
+                &b"\n@a\nA\n+\nI\n\n@b\n\nA\n+\nI\n"[..],
+                "Invalid FASTQ separator at record 2",
+            ),
+            (
+                b"@a\nA\n+\nI\n@b\nA\n\n+\nI\n",
+                "Invalid FASTQ separator at record 2",
+            ),
+            (
+                b"@a\nA\n+\nI\n@b\nA\n+\n\nI\n",
+                "Sequence/quality length mismatch at record 2",
+            ),
+            (
+                b"@a\nA\n+\nI\n\n  @b\nA\n+\nI\n",
+                "Invalid FASTQ header at record 2",
+            ),
+            (b"@a\nA\n+\nI\n\n@b\nA\n+\n", "Truncated FASTQ record 2"),
+        ] {
+            for capacity in 1..=input.len() + 1 {
+                let mut reader = buffered(input, capacity);
+                assert!(reader.next().unwrap().is_some());
+                let actual = reader.next().unwrap_err().to_string();
+                assert_eq!(actual, error, "capacity={capacity}, input={input:?}");
+            }
         }
     }
 

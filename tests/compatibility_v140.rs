@@ -784,6 +784,8 @@ fn malformed_and_truncated_reads_are_reported() {
         "@read\nACGT\n+\nIII\n",
         "@read\nACGT\n+\nIIIII\n",
         "bad\nACGT\n+\nIIII\n",
+        // fastp 1.4.0 drops every read from a record with a blank line inside.
+        "@a\nACGT\n+\nIIII\n@b\nACGT\n+\n\nIIII\n",
     ] {
         fs::write(d.path().join("in.fq"), text).unwrap();
         assert!(!command(d.path())

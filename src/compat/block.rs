@@ -1,5 +1,6 @@
 //! Bounded FASTQ batches. Fields borrow their batch until worker output is packed.
-//! The slow boundary path accepts the same strict four-line format as Reader.
+//! The slow boundary path accepts the same strict four-line format as Reader,
+//! including skipping blank lines between records.
 use super::{Read, Reader};
 use anyhow::{ensure, Result};
 use std::borrow::Cow;
@@ -100,6 +101,7 @@ impl Records {
     }
 
     fn read_one(&mut self, reader: &mut Reader) -> Result<bool> {
+        reader.skip_blank_lines()?;
         let mut ends = [0; 4];
         for (line, end) in ends.iter_mut().enumerate() {
             let n = reader.inner.read_until(b'\n', &mut self.data)?;
@@ -183,10 +185,20 @@ fn read_batch_inner<const SAMPLE: bool, const INTERLEAVED: bool>(
         let mut consumed = [0; 2];
         let mut full = false;
         while count < remaining {
+            // Leave any line that is not a header, such as a blank line
+            // between records, to the slow path.
+            if b1.get(consumed[0]) != Some(&b'@')
+                || b2.is_some_and(|b| b.get(consumed[1]) != Some(&b'@'))
+            {
+                break;
+            }
             let Some(ends1) = next_ends(&mut newlines1) else {
                 break;
             };
             let ends2 = if INTERLEAVED {
+                if b1.get(ends1[3]) != Some(&b'@') {
+                    break;
+                }
                 let Some(ends) = next_ends(&mut newlines1) else {
                     break;
                 };
@@ -244,20 +256,11 @@ fn read_batch_inner<const SAMPLE: bool, const INTERLEAVED: bool>(
         } else {
             // A record crosses a buffer boundary, or EOF needs checking. This
             // path also preserves a nonempty final quality line without LF.
-            let has_first = blocks[0].read_one(first)?;
-            if INTERLEAVED && has_first {
-                ensure!(
-                    blocks[0].read_one(first)?,
-                    "Odd read count in interleaved FASTQ"
-                );
-            }
-            if let Some(r) = second.as_mut() {
-                let has_second = blocks[1].read_one(r)?;
-                ensure!(
-                    has_first == has_second,
-                    "Paired input files have different read counts"
-                );
-            }
+            let has_first = read_slow::<INTERLEAVED>(&mut blocks, first, second.as_deref_mut())
+                .map_err(|error| {
+                    let records = [first.record, second.as_ref().map_or(0, |r| r.record)];
+                    earliest_error(&blocks, records, first.phred64).unwrap_or(error)
+                })?;
             if !has_first {
                 break;
             }
@@ -267,6 +270,49 @@ fn read_batch_inner<const SAMPLE: bool, const INTERLEAVED: bool>(
         }
     }
     Ok((blocks[0].len() > 0).then_some(blocks))
+}
+
+/// Read one record from each input (a pair from interleaved input).
+fn read_slow<const INTERLEAVED: bool>(
+    blocks: &mut [Records; 2],
+    first: &mut Reader,
+    second: Option<&mut Reader>,
+) -> Result<bool> {
+    let has_first = blocks[0].read_one(first)?;
+    if INTERLEAVED && has_first {
+        ensure!(
+            blocks[0].read_one(first)?,
+            "Odd read count in interleaved FASTQ"
+        );
+    }
+    if let Some(r) = second {
+        let has_second = blocks[1].read_one(r)?;
+        ensure!(
+            has_first == has_second,
+            "Paired input files have different read counts"
+        );
+    }
+    Ok(has_first)
+}
+
+/// Report records in order, as Reader does. A blank line inside a record
+/// shifts every later line, which otherwise surfaces as truncation at EOF
+/// instead of an error at the record that holds it.
+fn earliest_error(
+    blocks: &[Records; 2],
+    records: [usize; 2],
+    phred64: bool,
+) -> Option<anyhow::Error> {
+    let first = records[0] - blocks[0].len();
+    let second = records[1] - blocks[1].len();
+    (0..blocks[0].len().max(blocks[1].len())).find_map(|i| {
+        let check = |mate: usize, start: usize| {
+            (i < blocks[mate].len())
+                .then(|| blocks[mate].read(i, start + i, phred64).err())
+                .flatten()
+        };
+        check(0, first).or_else(|| check(1, second))
+    })
 }
 
 #[cfg(test)]
@@ -433,6 +479,102 @@ mod tests {
             assert_eq!(batch[0].len(), 1);
             assert_eq!(batch[1].len(), 1);
             assert!(read_batch(&mut first, Some(&mut second), 1024, usize::MAX).is_err());
+        }
+    }
+
+    fn batch_names(batch: &[Records; 2]) -> [Vec<Vec<u8>>; 2] {
+        batch
+            .each_ref()
+            .map(|b| (0..b.len()).map(|i| b.name(i).to_vec()).collect())
+    }
+
+    #[test]
+    fn blocks_skip_blank_lines_between_records_in_every_mode() {
+        let blank = format!("\n \t\r\n{}\n", " ".repeat(40));
+        let records = [
+            "@a\nAC\n+\nII\n",
+            "@b\nT\n+\nI\n",
+            "@c\nG\n+\nH\n",
+            "@d\nA\n+\nI",
+        ];
+        let clean = records.concat();
+        let messy = format!("{blank}{}", records.join(&blank)) + "\n\n  ";
+        let names = |n: &[&str]| n.iter().map(|n| n.as_bytes().to_vec()).collect::<Vec<_>>();
+        let all = names(&["@a", "@b", "@c", "@d"]);
+        for capacity in 1..=messy.len() + 1 {
+            for budget in [1, 31, 20000] {
+                let mut collected: [Vec<Vec<u8>>; 2] = Default::default();
+                let mut first = reader(messy.as_bytes(), capacity, false);
+                let mut second = reader(clean.as_bytes(), capacity, false);
+                while let Some(batch) =
+                    read_batch(&mut first, Some(&mut second), budget, usize::MAX).unwrap()
+                {
+                    let [a, b] = batch_names(&batch);
+                    collected[0].extend(a);
+                    collected[1].extend(b);
+                }
+                assert_eq!(collected, [all.clone(), all.clone()], "capacity={capacity}");
+                assert_eq!((first.record, second.record), (4, 4));
+
+                let mut interleaved = Vec::new();
+                let mut source = reader(messy.as_bytes(), capacity, false);
+                while let Some(batch) =
+                    read_interleaved_batch(&mut source, budget, usize::MAX).unwrap()
+                {
+                    interleaved.extend(batch_names(&batch)[0].clone());
+                }
+                assert_eq!(interleaved, all, "capacity={capacity}");
+
+                let mut source = reader(messy.as_bytes(), capacity, false);
+                let batch = read_sample_batch(&mut source, None, 20000, 99, 3)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(batch_names(&batch)[0], names(&["@a", "@b"]));
+                assert_eq!(source.next().unwrap().unwrap().name.as_ref(), b"@c");
+            }
+        }
+        for data in [&b""[..], b"\n", b"  \n\t\r\n  "] {
+            assert!(read_batch(&mut reader(data, 1, false), None, 1024, 9)
+                .unwrap()
+                .is_none());
+        }
+    }
+
+    #[test]
+    fn blocks_report_blank_lines_inside_records_like_owned_reader() {
+        for data in [
+            &b"\n@a\nA\n+\nI\n\n@b\n\nA\n+\nI\n@c\nA\n+\nI\n"[..],
+            b"@a\nA\n+\nI\n@b\nA\n\n+\nI\n",
+            b"@a\nA\n+\nI\n@b\nA\n+\n\nI\n@c\nA\n+\nI\n",
+            b"@a\nA\n+\nI\n\n  @b\nA\n+\nI\n",
+        ] {
+            let mut owned = reader(data, 7, false);
+            let expected = loop {
+                match owned.next() {
+                    Ok(Some(_)) => {}
+                    Ok(None) => panic!("{data:?} parsed"),
+                    Err(error) => break error.to_string(),
+                }
+            };
+            for capacity in 1..=data.len() + 1 {
+                let mut source = reader(data, capacity, false);
+                let mut ordinal = 0;
+                let actual = loop {
+                    match read_batch(&mut source, None, 1024, usize::MAX) {
+                        Ok(Some(batch)) => {
+                            for i in 0..batch[0].len() {
+                                if let Err(error) = batch[0].read(i, ordinal, false) {
+                                    panic!("{data:?} capacity={capacity}: late {error}");
+                                }
+                                ordinal += 1;
+                            }
+                        }
+                        Ok(None) => panic!("{data:?} parsed"),
+                        Err(error) => break error.to_string(),
+                    }
+                };
+                assert_eq!(actual, expected, "capacity={capacity}, data={data:?}");
+            }
         }
     }
 
