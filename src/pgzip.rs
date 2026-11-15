@@ -475,52 +475,136 @@ fn grow<T: Symbol>(out: &mut Vec<T>, need: usize) {
     }
 }
 
-/// Buffers kept for reuse between regions. Every region needs several
-/// megabytes of buffers; allocating them fresh faults in new zeroed pages, and
-/// freeing them unmaps pages, which interrupts every core.
+/// Buffers kept for reuse between regions, so that the decoder does not
+/// allocate and free several megabytes per region. Freed large blocks stay
+/// resident in most allocators (macOS kept 0.5 to 1 GB of them), and fresh
+/// ones fault in new pages. A buffer is allocated only when no idle one is
+/// available, so the buffers that exist never outnumber the most that were
+/// in use at once; each channel's capacity caps the idle ones.
+///
+/// Reused buffers keep their length and old contents: the decoder tracks how
+/// much it has written and grows only past that, so pages are not zeroed
+/// again for every region.
 struct Pool {
-    bytes: (
+    /// Compressed input, one per decoding thread.
+    input: (
         crossbeam_channel::Sender<Vec<u8>>,
         crossbeam_channel::Receiver<Vec<u8>>,
     ),
+    /// Output that may hold window placeholders.
     words: (
         crossbeam_channel::Sender<Vec<u16>>,
         crossbeam_channel::Receiver<Vec<u16>>,
     ),
-    /// Output buffers the reader is done with.
-    returned: crossbeam_channel::Receiver<Vec<u8>>,
+    /// Decoded output: buffers the reader is done with come back here.
+    output: (
+        crossbeam_channel::Sender<Vec<u8>>,
+        crossbeam_channel::Receiver<Vec<u8>>,
+    ),
+    /// Capacity for new output and placeholder buffers.
+    output_size: Estimate,
+    words_size: Estimate,
+}
+
+/// How large a buffer must be: the largest size seen so far, or a guess
+/// before the first.
+struct Estimate {
+    largest: std::sync::atomic::AtomicUsize,
+    guess: usize,
+}
+
+impl Estimate {
+    fn new(guess: usize) -> Self {
+        Self {
+            largest: std::sync::atomic::AtomicUsize::new(0),
+            guess,
+        }
+    }
+    fn get(&self) -> usize {
+        match self.largest.load(std::sync::atomic::Ordering::Relaxed) {
+            0 => self.guess,
+            n => n,
+        }
+    }
+    fn saw(&self, n: usize) {
+        self.largest
+            .fetch_max(n, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// A buffer from `idle` with capacity for at least `need` elements. A new
+/// one gets 1/8 more, so that later regions rarely outgrow it, and it is
+/// reserved exactly rather than grown by doubling, which copies and frees
+/// every smaller block on the way (freed blocks stay resident).
+fn reuse<T>(idle: &crossbeam_channel::Receiver<Vec<T>>, need: usize) -> Vec<T> {
+    let v = idle.try_recv().unwrap_or_default();
+    if v.capacity() >= need {
+        return v;
+    }
+    // Not `reserve`: reallocating would copy the old contents.
+    drop(v);
+    Vec::with_capacity(need + need / 8)
 }
 
 impl Pool {
-    fn new(size: usize, returned: crossbeam_channel::Receiver<Vec<u8>>) -> Self {
+    fn new(threads: usize, region: usize, output: Recycle) -> Self {
         Self {
-            bytes: crossbeam_channel::bounded(size),
-            words: crossbeam_channel::bounded(size),
-            returned,
+            input: crossbeam_channel::bounded(threads + 2),
+            words: crossbeam_channel::bounded(threads + 2),
+            output,
+            // About a FASTQ region's output (ratio 4 to 5); for regions with
+            // less output the rest is only address space, never touched.
+            output_size: Estimate::new(region.saturating_mul(5)),
+            // Placeholder output is often the whole region: copies of copies
+            // keep reaching the unknown window (FASTQ names and qualities).
+            words_size: Estimate::new(region.saturating_mul(5)),
         }
     }
-    fn bytes(&self) -> Vec<u8> {
-        let mut v = (self
-            .bytes
-            .1
-            .try_recv()
-            .or_else(|_| self.returned.try_recv()))
-        .unwrap_or_default();
-        v.clear();
-        v
+    fn input(&self) -> Vec<u8> {
+        self.input.1.try_recv().unwrap_or_default()
     }
+    /// A placeholder buffer with room for a region's output.
     fn words(&self) -> Vec<u16> {
-        let mut v = self.words.1.try_recv().unwrap_or_default();
-        v.clear();
-        v
+        reuse(&self.words.1, self.words_size.get())
     }
-    fn give_bytes(&self, v: Vec<u8>) {
-        let _ = self.bytes.0.try_send(v);
+    /// An output buffer with room for a region's output.
+    fn output(&self) -> Vec<u8> {
+        reuse(&self.output.1, self.output_size.get())
+    }
+    fn give_input(&self, v: Vec<u8>) {
+        if v.capacity() > 0 {
+            let _ = self.input.0.try_send(v);
+        }
     }
     fn give_words(&self, v: Vec<u16>) {
-        let _ = self.words.0.try_send(v);
+        if v.capacity() > 0 {
+            let _ = self.words.0.try_send(v);
+        }
+    }
+    fn give_output(&self, v: Vec<u8>) {
+        if v.capacity() > 0 {
+            let _ = self.output.0.try_send(v);
+        }
     }
 }
+
+/// Output buffers handed back for reuse: the reader sends on one end, the
+/// decoder takes from the other.
+pub(crate) type Recycle = (
+    crossbeam_channel::Sender<Vec<u8>>,
+    crossbeam_channel::Receiver<Vec<u8>>,
+);
+
+/// Output buffers that can be in use at once with `ahead` regions in
+/// flight: one per region in flight, the output queue's [`OUTPUT_DEPTH`],
+/// and the reader's own, plus one to spare. The reader's recycling channel
+/// holds this many, so a returned buffer is never freed.
+pub(crate) fn output_buffers(ahead: usize) -> usize {
+    ahead + OUTPUT_DEPTH + 2
+}
+
+/// Regions queued between the region decoder and the reader.
+pub(crate) const OUTPUT_DEPTH: usize = 2;
 
 /// A region decoded from a block start up to a block boundary.
 struct Decoded {
@@ -530,14 +614,29 @@ struct Decoded {
     last: bool,
     /// Output that may hold window placeholders.
     head: Vec<u16>,
-    /// Output after `head`, plain bytes, and its CRC32.
-    tail: Vec<u8>,
+    /// The region's whole output: `head.len()` bytes for the head, filled in
+    /// by [`resolve`], then the plain bytes decoded after it (the tail).
+    /// Empty until needed if there is no tail.
+    out: Vec<u8>,
+    /// CRC32 of the tail.
     tail_crc: u32,
+}
+
+impl Decoded {
+    fn tail(&self) -> &[u8] {
+        self.out.get(self.head.len()..).unwrap_or_default()
+    }
+    fn len(&self) -> usize {
+        self.head.len() + self.tail().len()
+    }
 }
 
 /// Decode from bit `start` of `data` until a block boundary at or after bit
 /// `stop`, or the final block. `first` means the stream starts at `start`, so
 /// there is no window and copies may not reach before it.
+///
+/// The tail is decoded straight into the output buffer after room for the
+/// head, so the region is delivered as one buffer without a copy.
 fn decode(
     data: &[u8],
     start: usize,
@@ -549,49 +648,70 @@ fn decode(
         bits: Bits::at(data, start),
         fixed: None,
     };
-    let mut head = pool.words();
-    let mut tail = pool.bytes();
-    let (mut head_n, mut tail_n) = (0, 0);
+    let mut head = Vec::new();
+    // Taken when the tail starts: a region that is all head needs its
+    // output buffer only once it can be resolved.
+    let mut out = Vec::new();
+    if first {
+        out = pool.output();
+    } else {
+        head = pool.words();
+    }
+    let (mut head_n, mut out_n) = (0, 0);
     let mut in_tail = first;
     let mut last_window = 0;
     let mut last = false;
     while inflater.bits.bit_pos() < stop || inflater.bits.bit_pos() == start {
-        if in_tail {
-            last = inflater.block(&mut tail, &mut tail_n, &mut last_window)?;
+        let result = if in_tail {
+            inflater.block(&mut out, &mut out_n, &mut last_window)
         } else {
-            last = inflater.block(&mut head, &mut head_n, &mut last_window)?;
-            if head_n - last_window.min(head_n) >= WINDOW {
-                // No later copy can reach a placeholder: continue in bytes,
-                // seeded with the last 32 KiB as history.
-                tail.extend(head[head_n - WINDOW..head_n].iter().map(|&s| s as u8));
-                tail_n = WINDOW;
-                in_tail = true;
+            inflater.block(&mut head, &mut head_n, &mut last_window)
+        };
+        last = match result {
+            Ok(last) => last,
+            Err(e) => {
+                pool.give_words(head);
+                pool.give_output(out);
+                return Err(e);
             }
+        };
+        if !in_tail && head_n - last_window.min(head_n) >= WINDOW {
+            // No later copy can reach a placeholder: continue in bytes after
+            // the head, whose last 32 KiB are plain bytes and the history.
+            out = pool.output();
+            grow(&mut out, head_n);
+            for (o, &s) in out[head_n - WINDOW..head_n]
+                .iter_mut()
+                .zip(&head[head_n - WINDOW..head_n])
+            {
+                *o = s as u8;
+            }
+            out_n = head_n;
+            in_tail = true;
         }
         if last {
             break;
         }
     }
     head.truncate(head_n);
-    tail.truncate(tail_n);
-    let seeded = if in_tail && !first { WINDOW } else { 0 };
-    tail.drain(..seeded);
-    let tail_crc = crc32fast::hash(&tail);
+    out.truncate(out_n);
+    pool.words_size.saw(head_n);
+    pool.output_size.saw(out_n.max(head_n));
+    let tail_crc = crc32fast::hash(out.get(head_n..).unwrap_or_default());
     Ok(Decoded {
         start,
         end: inflater.bits.bit_pos(),
         last,
         head,
-        tail,
+        out,
         tail_crc,
     })
 }
 
 /// The first bit at or after `from` and before `to` where a non-final
 /// dynamic block starts whose header is valid and whose whole block decodes.
-fn find_block(data: &[u8], from: usize, to: usize) -> Option<usize> {
+fn find_block(data: &[u8], from: usize, to: usize, scratch: &mut Vec<u16>) -> Option<usize> {
     let to = to.min(data.len().saturating_sub(8) * 8);
-    let mut scratch: Vec<u16> = Vec::new();
     for bit in from..to {
         let byte = bit / 8;
         let w = u32::from_le_bytes(data[byte..byte + 4].try_into().unwrap()) >> (bit % 8);
@@ -614,10 +734,7 @@ fn find_block(data: &[u8], from: usize, to: usize) -> Option<usize> {
             fixed: None,
         };
         let (mut n, mut last_window) = (0, 0);
-        if inflater
-            .block(&mut scratch, &mut n, &mut last_window)
-            .is_ok()
-        {
+        if inflater.block(scratch, &mut n, &mut last_window).is_ok() {
             return Some(bit);
         }
     }
@@ -768,7 +885,7 @@ fn region(
     let end = (begin + size).min(len);
     let from = start.map_or(begin, |s| s / 8);
     let mut margin = MARGIN;
-    let mut data = pool.bytes();
+    let mut data = pool.input();
     let result = loop {
         let read_to = (end + margin).min(len);
         if let Err(e) = read_range_into(src, from, read_to, &mut data) {
@@ -778,10 +895,15 @@ fn region(
         let local_start = match start {
             Some(s) => s - base,
             None if k == 0 => deflate - base,
-            None => match find_block(&data, 0, (end - from) * 8) {
-                Some(bit) => bit,
-                None => break Ok(None),
-            },
+            None => {
+                let mut scratch = pool.words();
+                let found = find_block(&data, 0, (end - from) * 8, &mut scratch);
+                pool.give_words(scratch);
+                match found {
+                    Some(bit) => bit,
+                    None => break Ok(None),
+                }
+            }
         };
         let first = k == 0 && start.is_none_or(|s| s == deflate);
         match decode(&data, local_start, (end - from) * 8, first, pool) {
@@ -795,9 +917,13 @@ fn region(
             Err(Error::Bad) => break Err(invalid("Invalid deflate data")),
         }
     };
-    pool.give_bytes(data);
+    pool.give_input(data);
     result
 }
+
+/// A resolved region: its dispatch number, the head's CRC32 (or the error
+/// resolving it), the head's length, and the region.
+type Resolved = (usize, io::Result<u32>, usize, Decoded);
 
 enum Job {
     Decode(usize),
@@ -805,8 +931,9 @@ enum Job {
     Resolve(usize, Decoded, std::sync::Arc<Vec<u8>>),
 }
 
-/// Bytes for `head`, filling placeholders from `window`, the bytes before it.
-fn resolve(head: &[u16], window: &[u8], mut out: Vec<u8>) -> io::Result<Vec<u8>> {
+/// Write the bytes for `head` into `out` (as long as `head`), filling
+/// placeholders from `window`, the bytes before it.
+fn resolve(head: &[u16], window: &[u8], out: &mut [u8]) -> io::Result<()> {
     let mut lut = [0u8; 256 + WINDOW];
     for (i, b) in lut[..256].iter_mut().enumerate() {
         *b = i as u8;
@@ -822,9 +949,10 @@ fn resolve(head: &[u16], window: &[u8], mut out: Vec<u8>) -> io::Result<Vec<u8>>
     {
         return Err(invalid("Invalid deflate distance"));
     }
-    out.clear();
-    out.extend(head.iter().map(|&s| lut[usize::from(s)]));
-    Ok(out)
+    for (o, &s) in out.iter_mut().zip(head) {
+        *o = lut[usize::from(s)];
+    }
+    Ok(())
 }
 
 /// Whether a gzip file of `len` bytes spans enough regions to decode in parallel.
@@ -835,15 +963,16 @@ pub(crate) fn worth_it(len: u64) -> bool {
 /// Decompress the gzip file at `path` on `threads` workers, sending output in
 /// order on `sender`, then an empty buffer at the end. Members after the first
 /// are decoded sequentially.
-/// The reader hands buffers it is done with back on `returned`.
+/// The reader hands buffers it is done with back on `recycle`; its channel
+/// should hold [`output_buffers`]`(threads + 2)` so that none is freed.
 pub(crate) fn decompress(
     path: &str,
     threads: usize,
     sender: crossbeam_channel::Sender<io::Result<Vec<u8>>>,
-    returned: crossbeam_channel::Receiver<Vec<u8>>,
+    recycle: Recycle,
 ) {
     let result =
-        FileSource::open(path).and_then(|src| run(&src, region_size(), threads, &sender, returned));
+        FileSource::open(path).and_then(|src| run(&src, region_size(), threads, &sender, recycle));
     if let Err(e) = result {
         let _ = sender.send(Err(e));
     }
@@ -855,9 +984,9 @@ pub(crate) fn decompress_source(
     size: usize,
     threads: usize,
     sender: crossbeam_channel::Sender<io::Result<Vec<u8>>>,
-    returned: crossbeam_channel::Receiver<Vec<u8>>,
+    recycle: Recycle,
 ) {
-    if let Err(e) = run(src, size, threads, &sender, returned) {
+    if let Err(e) = run(src, size, threads, &sender, recycle) {
         let _ = sender.send(Err(e));
     }
 }
@@ -876,7 +1005,7 @@ fn run(
     size: usize,
     threads: usize,
     sender: &crossbeam_channel::Sender<io::Result<Vec<u8>>>,
-    returned: crossbeam_channel::Receiver<Vec<u8>>,
+    recycle: Recycle,
 ) -> io::Result<()> {
     let len = src.len();
     let deflate = header_len(&read_range(src, 0, len.min(64 << 10))?)?;
@@ -884,19 +1013,39 @@ fn run(
     // Stops the workers early if the reader goes away.
     let stopped = std::sync::atomic::AtomicBool::new(false);
     let stopped = &stopped;
-    // Enough for the regions in flight and the reader's buffers.
-    let pool = &Pool::new(4 * (threads + 2), returned);
+    let pool = &Pool::new(threads, size, recycle);
     let result = std::thread::scope(|scope| -> io::Result<()> {
         // Regions decode to about 3x their size; keep a few in flight per worker.
         let ahead = threads + 2;
         let (jobs, queue) = crossbeam_channel::bounded::<Job>(2 * ahead);
+        // Resolve jobs go first: each holds a region's placeholder output,
+        // the largest buffer, until it is done.
+        let (resolves, urgent) = crossbeam_channel::unbounded::<Job>();
         let (decoded_tx, decoded_rx) = crossbeam_channel::unbounded();
         let (resolved_tx, resolved_rx) = crossbeam_channel::unbounded();
         for _ in 0..threads {
-            let (queue, decoded_tx, resolved_tx) =
-                (queue.clone(), decoded_tx.clone(), resolved_tx.clone());
+            let (queue, urgent, decoded_tx, resolved_tx) = (
+                queue.clone(),
+                urgent.clone(),
+                decoded_tx.clone(),
+                resolved_tx.clone(),
+            );
             scope.spawn(move || {
-                for job in queue {
+                let next = || match urgent.try_recv() {
+                    Ok(job) => Ok(job),
+                    Err(_) => {
+                        let mut select = crossbeam_channel::Select::new();
+                        select.recv(&urgent);
+                        select.recv(&queue);
+                        let op = select.select();
+                        match op.index() {
+                            0 => op.recv(&urgent),
+                            _ => op.recv(&queue),
+                        }
+                    }
+                };
+                // Both channels close together, at the end of the member.
+                while let Ok(job) = next() {
                     if stopped.load(std::sync::atomic::Ordering::Relaxed) {
                         break;
                     }
@@ -907,140 +1056,162 @@ fn run(
                             let _ = decoded_tx.send((k, region(src, size, k, deflate, None, pool)));
                         }
                         Job::Resolve(k, mut decoded, window) => {
-                            let head = resolve(&decoded.head, &window, pool.bytes());
-                            pool.give_words(std::mem::take(&mut decoded.head));
-                            let crc = head.as_ref().map(|h| crc32fast::hash(h)).unwrap_or(0);
-                            let _ = resolved_tx.send((k, head, crc, decoded));
+                            let n = decoded.head.len();
+                            if decoded.out.len() < n {
+                                decoded.out = pool.output();
+                                decoded.out.resize(n, 0);
+                                decoded.out.truncate(n);
+                            }
+                            let head = &mut decoded.out[..n];
+                            let crc = resolve(&decoded.head, &window, head)
+                                .map(|()| crc32fast::hash(head));
+                            // Keep only the length; the buffer is free now.
+                            let head = std::mem::take(&mut decoded.head);
+                            let _ = resolved_tx.send((k, crc, n, decoded));
+                            pool.give_words(head);
                         }
                     }
                 }
             });
         }
         drop((queue, decoded_tx, resolved_tx));
+        let stop = || stopped.store(true, std::sync::atomic::Ordering::Relaxed);
+        let workers_stopped = || invalid("Decompression workers stopped");
         let mut queued = 0;
-        while queued < regions.min(ahead) {
-            jobs.send(Job::Decode(queued)).ok();
-            queued += 1;
-        }
         let mut decoded_pending = std::collections::BTreeMap::new();
         let mut resolved_pending = std::collections::BTreeMap::new();
         let mut window: Vec<u8> = Vec::with_capacity(2 * WINDOW);
         let mut crc = crc32fast::Hasher::new();
         let mut total = 0u64;
         let mut pos = deflate;
-        // Resolve jobs are numbered in dispatch order: skipped regions have none.
-        let (mut k, mut resolving, mut next_send, mut dispatched) = (0, 0, 0, 0);
+        // Resolve jobs are numbered in dispatch order: skipped regions have
+        // none; `next_send` is the next of them to send.
+        let (mut k, mut dispatched, mut next_send) = (0, 0, 0);
         let mut finished = None;
-        // Send resolved regions in order; with `wait`, block for at least one.
-        let mut flush = |wait: bool,
-                         resolving: &mut usize,
-                         resolved_pending: &mut std::collections::BTreeMap<_, _>,
-                         crc: &mut crc32fast::Hasher|
+        // Take a resolved region and send what is now in order; `false` if
+        // the reader went away.
+        let deliver = |item: Resolved,
+                       next_send: &mut usize,
+                       resolved_pending: &mut std::collections::BTreeMap<_, _>,
+                       crc: &mut crc32fast::Hasher|
          -> io::Result<bool> {
-            let mut got = !wait;
-            loop {
-                let next = if got {
-                    resolved_rx.try_recv().ok()
-                } else {
-                    Some(
-                        resolved_rx
-                            .recv()
-                            .map_err(|_| invalid("Decompression workers stopped"))?,
-                    )
-                };
-                let Some((i, head, head_crc, decoded)) = next else {
-                    return Ok(true);
-                };
-                got = true;
-                resolved_pending.insert(i, (head, head_crc, decoded));
-                while let Some((head, head_crc, decoded)) = resolved_pending.remove(&next_send) {
-                    let head: Vec<u8> = head?;
-                    let decoded: Decoded = decoded;
-                    crc.combine(&crc32fast::Hasher::new_with_initial_len(
-                        head_crc,
-                        head.len() as u64,
-                    ));
-                    crc.combine(&crc32fast::Hasher::new_with_initial_len(
-                        decoded.tail_crc,
-                        decoded.tail.len() as u64,
-                    ));
-                    for part in [head, decoded.tail] {
-                        if !part.is_empty() && sender.send(Ok(part)).is_err() {
-                            return Ok(false);
-                        }
-                    }
-                    next_send += 1;
-                    *resolving -= 1;
+            let (i, head_crc, head_len, decoded) = item;
+            resolved_pending.insert(i, (head_crc, head_len, decoded));
+            while let Some((head_crc, head_len, decoded)) = resolved_pending.remove(next_send) {
+                let head_crc: u32 = head_crc?;
+                let decoded: Decoded = decoded;
+                crc.combine(&crc32fast::Hasher::new_with_initial_len(
+                    head_crc,
+                    head_len as u64,
+                ));
+                crc.combine(&crc32fast::Hasher::new_with_initial_len(
+                    decoded.tail_crc,
+                    (decoded.out.len() - head_len) as u64,
+                ));
+                if decoded.out.is_empty() {
+                    pool.give_output(decoded.out);
+                } else if sender.send(Ok(decoded.out)).is_err() {
+                    return Ok(false);
                 }
+                *next_send += 1;
             }
+            Ok(true)
         };
+        macro_rules! deliver {
+            ($item:expr) => {
+                if !deliver($item, &mut next_send, &mut resolved_pending, &mut crc)? {
+                    stop();
+                    return Ok(());
+                }
+            };
+        }
+        // At most `ahead` regions are in flight, from queued to sent: queued
+        // from `k` on, and taken but not yet sent. Regions decoded out of
+        // order wait in `decoded_pending` within that bound.
+        macro_rules! top_up {
+            () => {
+                while queued < regions && queued - k + dispatched - next_send < ahead {
+                    jobs.send(Job::Decode(queued)).ok();
+                    queued += 1;
+                }
+            };
+        }
         while k < regions && finished.is_none() {
+            top_up!();
+            if queued == k {
+                // Every slot is taken by regions being resolved.
+                deliver!(resolved_rx.recv().map_err(|_| workers_stopped())?);
+                continue;
+            }
             let result = loop {
                 if let Some(r) = decoded_pending.remove(&k) {
                     break r;
                 }
-                let (i, r) = decoded_rx
-                    .recv()
-                    .map_err(|_| invalid("Decompression workers stopped"))?;
-                decoded_pending.insert(i, r);
+                crossbeam_channel::select! {
+                    recv(decoded_rx) -> r => {
+                        let (i, r) = r.map_err(|_| workers_stopped())?;
+                        decoded_pending.insert(i, r);
+                    }
+                    recv(resolved_rx) -> r => {
+                        deliver!(r.map_err(|_| workers_stopped())?);
+                        top_up!();
+                    }
+                }
             };
-            if queued < regions {
-                jobs.send(Job::Decode(queued)).ok();
-                queued += 1;
-            }
             let region_end = (deflate / 8 + (k + 1) * size).min(len) * 8;
             if pos >= region_end {
                 // An earlier region's last block covered this one.
+                if let Ok(Some(d)) = result {
+                    pool.give_words(d.head);
+                    pool.give_output(d.out);
+                }
                 k += 1;
                 continue;
             }
             let decoded = match result {
                 Ok(Some(d)) if d.start == pos => d,
-                _ => region(src, size, k, deflate, Some(pos), pool)?.unwrap(),
+                other => {
+                    // A false start: its buffers are reused for the redo.
+                    if let Ok(Some(d)) = other {
+                        pool.give_words(d.head);
+                        pool.give_output(d.out);
+                    }
+                    region(src, size, k, deflate, Some(pos), pool)?
+                        .expect("a region decoded from a known start always has a block")
+                }
             };
             // The next region's window is this region's last 32 KiB. Only that
             // much of the head is resolved here; workers resolve the rest.
-            let need = WINDOW.saturating_sub(decoded.tail.len());
-            let head_end = resolve(
-                &decoded.head[decoded.head.len().saturating_sub(need)..],
-                &window,
-                Vec::with_capacity(need),
-            )?;
+            let need = WINDOW.saturating_sub(decoded.tail().len());
+            let head_end = &decoded.head[decoded.head.len().saturating_sub(need)..];
+            let mut head_bytes = vec![0; head_end.len()];
+            resolve(head_end, &window, &mut head_bytes)?;
             let this_window = std::sync::Arc::new(window.clone());
-            for part in [&head_end[..], &decoded.tail[..]] {
+            for part in [&head_bytes[..], decoded.tail()] {
                 window.extend_from_slice(&part[part.len().saturating_sub(WINDOW)..]);
                 if window.len() > WINDOW {
                     window.drain(..window.len() - WINDOW);
                 }
             }
-            total += (decoded.head.len() + decoded.tail.len()) as u64;
+            total += decoded.len() as u64;
             pos = decoded.end;
             if decoded.last {
                 finished = Some(pos);
             }
-            jobs.send(Job::Resolve(dispatched, decoded, this_window))
+            resolves
+                .send(Job::Resolve(dispatched, decoded, this_window))
                 .ok();
             dispatched += 1;
-            resolving += 1;
-            if !flush(
-                resolving > ahead,
-                &mut resolving,
-                &mut resolved_pending,
-                &mut crc,
-            )? {
-                stopped.store(true, std::sync::atomic::Ordering::Relaxed);
-                return Ok(());
-            }
             k += 1;
-        }
-        while resolving > 0 {
-            if !flush(true, &mut resolving, &mut resolved_pending, &mut crc)? {
-                stopped.store(true, std::sync::atomic::Ordering::Relaxed);
-                return Ok(());
+            while let Ok(item) = resolved_rx.try_recv() {
+                deliver!(item);
             }
         }
-        stopped.store(true, std::sync::atomic::Ordering::Relaxed);
-        drop(jobs);
+        while next_send < dispatched {
+            deliver!(resolved_rx.recv().map_err(|_| workers_stopped())?);
+        }
+        stop();
+        drop((jobs, resolves));
         let end = finished.ok_or_else(|| invalid("Truncated gzip input"))?;
         let trailer_at = end.div_ceil(8);
         if trailer_at + 8 > len {
@@ -1058,7 +1229,8 @@ fn run(
             let mut decoder =
                 flate2::bufread::MultiGzDecoder::new(io::BufReader::with_capacity(1 << 20, rest));
             loop {
-                let mut chunk = vec![0; 1 << 20];
+                let mut chunk = pool.output.1.try_recv().unwrap_or_default();
+                chunk.resize(1 << 20, 0);
                 let mut filled = 0;
                 while filled < chunk.len() {
                     match decoder.read(&mut chunk[filled..]) {
@@ -1117,7 +1289,7 @@ mod tests {
             file.path().to_str().unwrap(),
             threads,
             sender,
-            crossbeam_channel::never(),
+            crossbeam_channel::bounded(1),
         );
         let mut out = Vec::new();
         for part in receiver {
@@ -1168,7 +1340,7 @@ mod tests {
             let (sender, receiver) = crossbeam_channel::bounded(4);
             let p = path.clone();
             let worker = std::thread::spawn(move || {
-                decompress(&p, threads, sender, crossbeam_channel::never())
+                decompress(&p, threads, sender, crossbeam_channel::bounded(1))
             });
             let mut total = 0;
             for part in receiver {

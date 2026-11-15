@@ -933,12 +933,16 @@ pub(crate) fn open_input(path: &str) -> Result<Box<dyn BufRead + Send>> {
                 // One large member: decode regions of it in parallel.
                 drop(buffered);
                 let threads = num_cpus::get().div_ceil(2).clamp(2, 8);
-                let (sender, receiver) = crossbeam_channel::bounded(4);
-                // Finished buffers go back to the decoder for reuse.
-                let (recycle, returned) = crossbeam_channel::bounded::<Vec<u8>>(4);
+                let (sender, receiver) = crossbeam_channel::bounded(crate::pgzip::OUTPUT_DEPTH);
+                // Finished buffers go back to the decoder for reuse; the
+                // channel holds every buffer that can exist, so none is freed.
+                let (recycle, returned) = crossbeam_channel::bounded::<Vec<u8>>(
+                    crate::pgzip::output_buffers(threads + 2),
+                );
+                let pool = (recycle.clone(), returned);
                 let path = path.to_string();
                 let worker = std::thread::spawn(move || {
-                    crate::pgzip::decompress(&path, threads, sender, returned)
+                    crate::pgzip::decompress(&path, threads, sender, pool)
                 });
                 return Ok(Box::new(PrefetchInput {
                     receiver: Some(receiver),

@@ -26,7 +26,7 @@ pub fn pgzip(gz: &[u8], region: usize, threads: usize) -> io::Result<Vec<u8>> {
                 region.max(1),
                 threads.max(1),
                 sender,
-                crossbeam_channel::never(),
+                crossbeam_channel::bounded(1),
             )
         });
         let mut out = Vec::new();
