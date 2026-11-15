@@ -158,6 +158,47 @@ fn write_fixtures(root: &Path) {
         .map(|(a, b)| a.concat() + &b.concat())
         .collect();
     write("interleaved.fq", interleaved.as_bytes());
+    // fastp skips blank and whitespace-only lines where a header is expected.
+    let blanks = |data: &str, every: usize, blanks: &[&str]| -> String {
+        let records: Vec<String> = data
+            .split_inclusive('\n')
+            .collect::<Vec<_>>()
+            .chunks(4)
+            .map(|lines| lines.concat())
+            .collect();
+        records
+            .iter()
+            .enumerate()
+            .map(|(i, record)| {
+                let blank = if i % every == 0 {
+                    blanks[i / every % blanks.len()]
+                } else {
+                    ""
+                };
+                format!("{blank}{record}")
+            })
+            .collect()
+    };
+    write("blank_trailing.fq", (r1.clone() + "\n\n").as_bytes());
+    write("blank_leading.fq", format!("\n\n{r1}").as_bytes());
+    write(
+        "blank_between.fq",
+        blanks(r1, 37, &["\n", "\n\n", "\r\n"]).as_bytes(),
+    );
+    let whitespace = ["   \n", "\t\n", " \t \r\n", "\n  \n"];
+    write(
+        "blank_whitespace.fq",
+        (blanks(r1, 29, &whitespace) + "   ").as_bytes(),
+    );
+    write("blank_pe1.fq", blanks(r1, 41, &whitespace).as_bytes());
+    write(
+        "blank_pe2.fq",
+        (blanks(r2, 53, &["\n"]) + "\n \n").as_bytes(),
+    );
+    write(
+        "blank_interleaved.fq",
+        (blanks(&interleaved, 19, &whitespace) + "\n").as_bytes(),
+    );
     // Three gzip members (one empty), split mid-record.
     let half = r1.len() / 2;
     let mut multi = gzip(&r1.as_bytes()[..half]);
@@ -417,6 +458,13 @@ cases! {
     phred64: Case::se("phred64", &["-6"]).inputs("phred64.fq", None);
     empty: Case::se("empty", &[]).inputs("empty.fq", None);
     interleaved: Case::pe("interleaved", &["--interleaved_in"]).interleaved("interleaved.fq");
+    blank_trailing: Case::se("blank_trailing", &[]).inputs("blank_trailing.fq", None);
+    blank_leading: Case::se("blank_leading", &[]).inputs("blank_leading.fq", None);
+    blank_between: Case::se("blank_between", &[]).inputs("blank_between.fq", None);
+    blank_whitespace: Case::se("blank_whitespace", &[]).inputs("blank_whitespace.fq", None);
+    blank_pe: Case::pe("blank_pe", &[]).inputs("blank_pe1.fq", Some("blank_pe2.fq"));
+    blank_interleaved: Case::pe("blank_interleaved", &["--interleaved_in"]).interleaved("blank_interleaved.fq");
+    blank_stdin_interleaved: Case::pe("blank_stdin_interleaved", &["--stdin", "--stdout", "--interleaved_in"]).interleaved("blank_interleaved.fq");
     stdout_pe: Case::pe("stdout_pe", &["--stdout"]);
     stdout_se: Case::se("stdout_se", &["--stdout"]);
     stdout_merge: Case::pe("stdout_merge", &["--stdout", "-m"]);
