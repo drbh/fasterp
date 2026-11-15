@@ -3,15 +3,26 @@
 //! including skipping blank lines between records.
 mod newlines;
 
-use super::{Read, Reader};
-use anyhow::{ensure, Result};
+use super::{library, InputError, Read, Reader};
+use anyhow::Result;
+use readkit_batch::{Batch as RkBatch, Segments};
 use std::borrow::Cow;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 #[derive(Default)]
 pub(super) struct Records {
     data: Vec<u8>,
     ends: Vec<[usize; 4]>,
+    /// Records of one segment of a readkit batch instead of FASTQ text.
+    columns: Option<ColumnSlice>,
+}
+
+/// Records `start..end` of segment `segment` of a shared column batch.
+pub(super) struct ColumnSlice {
+    pub(super) batch: Arc<RkBatch<Segments>>,
+    pub(super) segment: usize,
+    pub(super) start: usize,
+    pub(super) end: usize,
 }
 
 /// Buffers of dropped batches, reused by later batches so their pages stay
@@ -32,7 +43,11 @@ impl Drop for Records {
             let mut ends = std::mem::take(&mut self.ends);
             data.clear();
             ends.clear();
-            spare.push(Records { data, ends });
+            spare.push(Records {
+                data,
+                ends,
+                columns: None,
+            });
         }
     }
 }
@@ -43,8 +58,19 @@ impl Records {
         spare.unwrap_or_default()
     }
 
+    pub(super) fn from_columns(slice: ColumnSlice) -> Self {
+        Self {
+            data: Vec::new(),
+            ends: Vec::new(),
+            columns: Some(slice),
+        }
+    }
+
     pub(super) fn len(&self) -> usize {
-        self.ends.len()
+        match &self.columns {
+            Some(c) => c.end - c.start,
+            None => self.ends.len(),
+        }
     }
 
     fn field(&self, index: usize, field: usize) -> &[u8] {
@@ -61,13 +87,27 @@ impl Records {
     }
 
     pub(super) fn sequence(&self, index: usize) -> &[u8] {
-        self.field(index, 1)
+        match &self.columns {
+            Some(c) => c.batch.segment(c.segment).seqs().get(c.start + index),
+            None => self.field(index, 1),
+        }
     }
     pub(super) fn name(&self, index: usize) -> &[u8] {
-        self.field(index, 0)
+        match &self.columns {
+            Some(c) => c
+                .batch
+                .segment(c.segment)
+                .names()
+                .map_or(&[][..], |n| n.get(c.start + index)),
+            None => self.field(index, 0),
+        }
     }
 
     pub(super) fn truncate(&mut self, count: usize) {
+        if let Some(c) = &mut self.columns {
+            c.end = c.end.min(c.start + count);
+            return;
+        }
         if count < self.len() {
             self.data.truncate(if count == 0 {
                 0
@@ -79,6 +119,11 @@ impl Records {
     }
 
     pub(super) fn read(&self, index: usize, ordinal: usize, phred64: bool) -> Result<Read<'_>> {
+        if let Some(c) = &self.columns {
+            let mut read = library::read_at(&c.batch, c.segment, c.start + index);
+            read.check_quality(ordinal + 1, phred64)?;
+            return Ok(read);
+        }
         let mut start = if index == 0 {
             0
         } else {
@@ -116,7 +161,9 @@ impl Records {
             if n == 0 && line == 0 {
                 return Ok(false);
             }
-            ensure!(n > 0, "Truncated FASTQ record {}", reader.record + 1);
+            if n == 0 {
+                return Err(InputError::truncated(reader.record + 1).into());
+            }
             *end = self.data.len();
         }
         self.ends.push(ends);
@@ -296,18 +343,14 @@ fn read_slow<const INTERLEAVED: bool>(
     second: Option<&mut Reader>,
 ) -> Result<bool> {
     let has_first = blocks[0].read_one(first)?;
-    if INTERLEAVED && has_first {
-        ensure!(
-            blocks[0].read_one(first)?,
-            "Odd read count in interleaved FASTQ"
-        );
+    if INTERLEAVED && has_first && !blocks[0].read_one(first)? {
+        return Err(InputError::odd_interleaved().into());
     }
     if let Some(r) = second {
         let has_second = blocks[1].read_one(r)?;
-        ensure!(
-            has_first == has_second,
-            "Paired input files have different read counts"
-        );
+        if has_first != has_second {
+            return Err(InputError::mate_counts().into());
+        }
     }
     Ok(has_first)
 }

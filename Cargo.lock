@@ -1107,6 +1107,8 @@ dependencies = [
  "predicates",
  "rand 0.8.5",
  "rayon",
+ "readkit-batch",
+ "readkit-io",
  "rustc-hash",
  "serde",
  "serde_json",
@@ -2240,6 +2242,17 @@ checksum = "22e18b0f0062d30d4230b2e85ff77fdfe4326feb054b9783a3460d8435c8ab91"
 dependencies = [
  "crossbeam-deque",
  "crossbeam-utils",
+]
+
+[[package]]
+name = "readkit-batch"
+version = "0.1.0"
+
+[[package]]
+name = "readkit-io"
+version = "0.1.0"
+dependencies = [
+ "readkit-batch",
 ]
 
 [[package]]
