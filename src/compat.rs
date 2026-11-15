@@ -12,6 +12,7 @@ use std::borrow::Cow;
 use std::collections::{BTreeMap, VecDeque};
 use std::io::{BufRead, BufWriter, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 mod block;
 
@@ -2592,709 +2593,944 @@ fn load_sequences(path: Option<&str>, fasta: bool) -> Result<Vec<Vec<u8>>> {
     Ok(seqs)
 }
 
-pub fn run(mut a: Args) -> Result<()> {
+pub fn run(a: Args) -> Result<()> {
     let start = Instant::now();
-    if a.stdin || a.input == "/dev/stdin" {
-        a.input = "-".into();
-    }
-    if a.output == "/dev/stdout" {
-        a.output = "-".into();
-    }
-    if a.output == "-" {
-        a.stdout = true;
-    }
-    if let (Some(first), Some(second)) = (&a.unpaired1, &a.unpaired2) {
-        if !first.contains("://")
-            && !second.contains("://")
-            && same_file(&normalized_path(first)?, &normalized_path(second)?)
-        {
-            a.unpaired2 = Some(first.clone());
+    let mut engine = Engine::new(a)?;
+    while engine.step()? {}
+    let done = engine.finish()?;
+    write_reports(&done.args, &done.report, start)?;
+    eprintln!(
+        "Processed {} {}; passed {} reads. Compatibility target: fastp {FASTP_VERSION}",
+        done.count,
+        if done.pe { "pairs" } else { "reads" },
+        done.passed
+    );
+    Ok(())
+}
+
+struct Finished {
+    args: Args,
+    report: Value,
+    count: usize,
+    passed: usize,
+    pe: bool,
+}
+
+/// Where the main and merged reads go; `-` is stdout.
+struct Targets {
+    main1: Option<String>,
+    main2: Option<String>,
+    merged: Option<String>,
+}
+
+/// Counts and profiles accumulated in input order.
+struct Stats {
+    before: [Sample; 2],
+    after: [Sample; 2],
+    failures: [usize; 7],
+    adapter_reads: usize,
+    adapter_bases: usize,
+    corrected_reads: usize,
+    corrected_bases: usize,
+    poly_reads: [usize; 4],
+    poly_bases: [usize; 4],
+    histogram: Vec<usize>,
+    unknown: usize,
+    duplicates: usize,
+    count: usize,
+    merged_pairs: usize,
+}
+
+impl Default for Stats {
+    fn default() -> Self {
+        Self {
+            before: Default::default(),
+            after: Default::default(),
+            failures: [0; 7],
+            adapter_reads: 0,
+            adapter_bases: 0,
+            corrected_reads: 0,
+            corrected_bases: 0,
+            poly_reads: [0; 4],
+            poly_bases: [0; 4],
+            histogram: vec![0; 513],
+            unknown: 0,
+            duplicates: 0,
+            count: 0,
+            merged_pairs: 0,
         }
     }
-    a.umi_loc.make_ascii_lowercase();
-    if a.merge {
-        a.correction = true;
-        if a.merged_out.is_none() && !a.stdout && !a.output.is_empty() && a.output2.is_none() {
-            a.merged_out = Some(std::mem::take(&mut a.output));
-        }
-        if a.include_unmerged {
-            a.output.clear();
-            a.output2 = None;
-            a.unpaired1 = None;
-            a.unpaired2 = None;
-        }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+type PoolHandle = rayon::ThreadPool;
+#[cfg(target_arch = "wasm32")]
+type PoolHandle = &'static rayon::ThreadPool;
+
+/// Read-only state shared with the pipeline threads.
+struct Shared {
+    config: Config,
+    pool: PoolHandle,
+    /// Empty before/after profiles that each chunk starts from.
+    templates: [[Sample; 2]; 2],
+    hasher: Option<DuplicationHash>,
+    recycle_limit: usize,
+}
+
+impl Shared {
+    fn pool(&self) -> &rayon::ThreadPool {
+        &self.pool
     }
-    if a.stdout {
-        a.output.clear();
-        a.output2 = None;
-    }
-    if a.input2.is_none() && !a.interleaved_in {
-        a.unpaired1 = None;
-        a.unpaired2 = None;
-        a.overlapped_out = None;
-    }
-    if !a.merge {
-        a.merged_out = None;
-    }
-    validate(&a)?;
-    // The in-memory file system has no symlinks or directories to check.
-    #[cfg(feature = "native")]
-    validate_paths(&a)?;
-    let pe = a.input2.is_some() || a.interleaved_in;
-    let total_for_split = if a.split.is_some() {
-        let mut reader = Reader::open(&a.input, a.phred64)?;
-        let mut n = 0;
-        while reader.next()?.is_some() {
-            n += 1;
-        }
-        if a.interleaved_in {
-            ensure!(n % 2 == 0, "Odd read count in interleaved FASTQ");
-            n /= 2;
-        }
-        if a.reads_to_process > 0 {
-            n = n.min(a.reads_to_process);
-        }
-        Some(n)
-    } else {
-        None
-    };
-    // Decoding one large member in parallel costs about 2.5 times zlib's CPU
-    // per byte, so it pays off only when decoding limits the run: a single
-    // input (a second brings its own decoder and the compressors need the
-    // cores) whose output is not gzip, or whose qualities are binned, which
-    // makes compressing the output cheap. Otherwise the extra CPU comes out
-    // of processing and compression.
-    let gzip_out = io::CompressionFormat::from_path(&a.output) == io::CompressionFormat::Gzip;
-    io::set_split_decoding(a.input2.is_none() && (!gzip_out || io::binned_gzip_input(&a.input)));
-    let mut reader1 = Reader::open(&a.input, a.phred64)?;
-    let mut reader2 = a
-        .input2
-        .as_ref()
-        .map(|s| Reader::open(s, a.phred64))
-        .transpose()?;
-    let mut sampled = Vec::new();
-    let mut sampled_raw = VecDeque::new();
-    // Compact-output jobs retain evaluation data in the same blocks used
-    // by processing. The sample is read once without allocating four fields per
-    // record, and each block is released as soon as processing consumes it.
-    let pipelined = cfg!(feature = "native")
-        && a.max_backlog != Some(1)
-        && std::iter::once(a.input.as_str())
-            .chain(a.input2.as_deref())
-            .all(|path| std::fs::metadata(path).is_ok_and(|m| m.is_file()));
-    // Borrowed parsing also works synchronously. Only reading ahead requires
-    // regular files; pipes must stay on this thread for prompt cancellation.
-    // Interleaved stdin has no evaluation prefix. Keep local interleaved
-    // sampling on the owned path until that separate path is generalized.
-    let raw_input = pack_main_output(&a) && (!a.interleaved_in || a.input == "-");
-    // Read once and retain the sample: this works for pipes, HTTP, and S3 too.
-    let auto = |seq: &Option<String>| seq.as_deref().is_none_or(|s| s == "auto");
-    let needs_adapter_sample = !a.disable_adapter_trimming
-        && !a.disable_adapter_detection
-        && if pe {
-            a.detect_adapter_for_pe && (auto(&a.adapter_sequence) || auto(&a.adapter_sequence_r2))
-        } else {
-            auto(&a.adapter_sequence)
-        };
-    // Otherwise only the first header is needed for instrument/polyG detection.
-    let sample_limit = if a.input == "-" {
-        0
-    } else if needs_adapter_sample || a.overrepresentation_analysis {
-        256 * 1024
-    } else {
-        1
-    };
-    let mut sample_bases = 0;
-    let mut sample_count = 0;
-    if raw_input {
-        while sample_count < sample_limit && sample_bases < 151 * 256 * 1024 {
-            let Some(blocks) = block::read_sample_batch(
-                &mut reader1,
-                reader2.as_mut(),
-                a.batch_bytes.min(2 * 1024 * 1024),
-                sample_limit - sample_count,
-                151 * 256 * 1024 - sample_bases,
-            )?
-            else {
-                break;
-            };
-            for index in 0..blocks[0].len() {
-                // Preserve validation of the entire evaluation sample, including
-                // when --reads_to_process subsequently processes only its prefix.
-                for mate in &blocks {
-                    if mate.len() > 0 {
-                        mate.read(index, sample_count + index, a.phred64)?;
-                    }
+}
+
+type ProcessedBatch = Result<Vec<Chunk<'static>>>;
+
+/// Where processed batches come from: this thread, or the read-ahead,
+/// processing and duplicate-marking threads.
+enum Source {
+    Serial(Box<BatchReader>),
+    Pipelined(Pipeline),
+}
+
+/// Pipeline threads and their channels. Dropping it stops the threads: the
+/// processing thread finds its output closed, and the reader stops after its
+/// current read.
+struct Pipeline {
+    processed: Option<crossbeam_channel::Receiver<ProcessedBatch>>,
+    recycle: crossbeam_channel::Sender<Vec<ReadPool>>,
+    threads: Vec<std::thread::JoinHandle<()>>,
+}
+
+impl Pipeline {
+    fn start(
+        mut reader: BatchReader,
+        shared: &Arc<Shared>,
+        mut duplication: Option<Duplication>,
+    ) -> Self {
+        // One queued batch per stage bounds both memory and reordering.
+        let (recycle, recycle_rx) = crossbeam_channel::bounded::<Vec<ReadPool>>(2);
+        let (input_tx, input_rx) = crossbeam_channel::bounded(1);
+        let (processed_tx, processed) = crossbeam_channel::bounded::<ProcessedBatch>(1);
+        let mut threads = vec![std::thread::spawn(move || loop {
+            while let Ok(recycled) = recycle_rx.try_recv() {
+                for recycled in recycled {
+                    reader.pool.absorb(recycled);
                 }
-                sample_bases += blocks[0].sequence(index).len();
             }
-            sample_count += blocks[0].len();
-            sampled_raw.push_back(ReadBatch {
-                raw: Some(blocks),
-                reads: Vec::new(),
-                start: 0,
-            });
-        }
-    } else {
-        for _ in 0..sample_limit {
-            let Some(r1) = reader1.next()? else {
-                break;
-            };
-            let r2 = if a.interleaved_in {
-                Some(
-                    reader1
-                        .next()?
-                        .context("Odd read count in interleaved FASTQ")?,
-                )
-            } else if let Some(reader2) = reader2.as_mut() {
-                Some(
-                    reader2
-                        .next()?
-                        .context("Paired input files have different read counts")?,
-                )
-            } else {
-                None
-            };
-            sample_bases += r1.seq.len();
-            sampled.push((r1, r2));
-            if sample_bases >= 151 * 256 * 1024 {
-                break;
-            }
-        }
-        sample_count = sampled.len();
-    }
-    let manual = |s: &Option<String>| {
-        s.as_ref().filter(|s| s.as_str() != "auto").map(|s| {
-            s.as_bytes()
-                .iter()
-                .map(u8::to_ascii_uppercase)
-                .collect::<Vec<_>>()
-        })
-    };
-    let mut adapters = [manual(&a.adapter_sequence), manual(&a.adapter_sequence_r2)];
-    for seq in adapters.iter().flatten() {
-        ensure!(
-            seq.len() >= 4 && seq.iter().all(|b| b"ATCG".contains(b)),
-            "Adapter sequences must contain at least four A/T/C/G bases"
-        );
-    }
-    let sample_sequences = |mate: usize| -> Vec<&[u8]> {
-        if raw_input {
-            sampled_raw
-                .iter()
-                .flat_map(|b| {
-                    let records = &b.raw.as_ref().unwrap()[mate];
-                    (0..records.len()).map(|i| records.sequence(i))
-                })
-                .collect()
-        } else {
-            sampled
-                .iter()
-                .filter_map(|(r1, r2)| {
-                    if mate == 0 {
-                        Some(r1.seq.as_ref())
-                    } else {
-                        r2.as_ref().map(|r| r.seq.as_ref())
-                    }
-                })
-                .collect()
-        }
-    };
-    let threads = worker_threads(&a);
-    #[cfg(not(target_arch = "wasm32"))]
-    let owned_pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(threads)
-        .build()?;
-    #[cfg(not(target_arch = "wasm32"))]
-    let pool = &owned_pool;
-    #[cfg(target_arch = "wasm32")]
-    let pool = wasm_pool()?;
-    // Detection scans the whole sample; it runs on the worker pool.
-    let detect =
-        |mate: usize| pool.install(|| auto_adapter::detect(&sample_sequences(mate), a.trim_tail1));
-    if !a.disable_adapter_trimming && !a.disable_adapter_detection && sample_count >= 10000 {
-        if !pe && adapters[0].is_none() {
-            adapters[0] = detect(0);
-        } else if pe && a.detect_adapter_for_pe {
-            if adapters[0].is_none() {
-                adapters[0] = detect(0);
-            }
-            if adapters[1].is_none() {
-                adapters[1] = detect(1);
-            }
-        }
-    }
-    if pe && adapters[1].is_none() && !a.detect_adapter_for_pe {
-        adapters[1] = adapters[0].clone();
-    }
-    let first_name = sampled.first().map(|(r, _)| r.name.as_ref()).or_else(|| {
-        sampled_raw
-            .front()
-            .map(|batch| batch.raw.as_ref().unwrap()[0].name(0))
-    });
-    let poly_g = !a.disable_trim_poly_g
-        && (a.trim_poly_g
-            || first_name.is_some_and(|name| {
-                [
-                    "@FS", "@MN", "@SH", "@NS", "@NB", "@NDX", "@VL", "@VH", "@A", "@NA", "@LH",
-                ]
-                .iter()
-                .any(|s| name.starts_with(s.as_bytes()))
-            }));
-    let fasta = load_sequences(a.adapter_fasta.as_deref(), true)?;
-    let blacklist = [
-        load_sequences(a.filter_by_index1.as_deref(), false)?,
-        load_sequences(a.filter_by_index2.as_deref(), false)?,
-    ];
-    let max_bytes = if let Some(mb) = a.max_memory {
-        ensure!(mb >= 16, "--max_memory must be at least 16 MB");
-        a.batch_bytes.min(mb.saturating_mul(1024 * 1024) / 8).max(1)
-    } else {
-        a.batch_bytes
-    };
-    let config = Config {
-        args: a,
-        adapters,
-        fasta,
-        blacklist,
-        poly_g,
-    };
-    let a = &config.args;
-    let split = split::SplitConfig {
-        mode: if let Some(n) = a.split {
-            split::SplitMode::ByFiles(n)
-        } else if let Some(n) = a.split_by_lines {
-            split::SplitMode::ByLines(n)
-        } else {
-            split::SplitMode::None
-        },
-        prefix_digits: a.split_prefix_digits,
-    };
-    let mut out = Output::new(a);
-    for path in [Some(a.output.as_str()), a.output2.as_deref()]
-        .into_iter()
-        .flatten()
-    {
-        out.open(path, a, split.clone())?;
-    }
-    for path in [
-        a.merged_out.as_deref(),
-        a.unpaired1.as_deref(),
-        a.unpaired2.as_deref(),
-        a.failed_out.as_deref(),
-        a.overlapped_out.as_deref(),
-    ]
-    .into_iter()
-    .flatten()
-    {
-        out.open(path, a, split::SplitConfig::default())?;
-    }
-    if a.stdout || a.output == "-" {
-        out.open("-", a, split::SplitConfig::default())?;
-    }
-    if let Some(total) = total_for_split {
-        for w in out.writers.values_mut() {
-            w.set_total_reads(total)?;
-        }
-    }
-    let main1 = if (a.stdout || a.output == "-") && !a.merge {
-        Some("-")
-    } else {
-        Some(a.output.as_str())
-    };
-    let main2 = if (a.stdout || a.output == "-") && !a.merge {
-        Some("-")
-    } else {
-        a.output2.as_deref()
-    };
-    let merged_out = if a.stdout {
-        Some("-")
-    } else {
-        a.merged_out.as_deref()
-    };
-    let mut before = [Sample::default(), Sample::default()];
-    let mut after = [Sample::default(), Sample::default()];
-    let mut failures = [0usize; 7];
-    let mut adapter_reads = 0;
-    let mut adapter_bases = 0;
-    let mut corrected_reads = 0;
-    let mut corrected_bases = 0;
-    let mut poly_reads = [0usize; 4];
-    let mut poly_bases = [0usize; 4];
-    let mut histogram = vec![0usize; 513];
-    let mut unknown = 0;
-    let mut duplication = if a.dedup || !a.dont_eval_duplication {
-        Some(Duplication::new(if a.dup_calc_accuracy > 0 {
-            a.dup_calc_accuracy
-        } else if a.dedup {
-            3
-        } else {
-            1
-        }))
-    } else {
-        None
-    };
-    let mut duplicates = 0;
-    let mut count = 0;
-    let mut merged_pairs = 0;
-    if a.overrepresentation_analysis {
-        for i in 0..if pe { 2 } else { 1 } {
-            let reads: Vec<_> = sampled
-                .iter()
-                .filter_map(|(r1, r2)| if i == 0 { Some(r1) } else { r2.as_ref() })
-                .collect();
-            let len = reads
-                .iter()
-                .take(1000)
-                .map(|r| r.seq.len())
-                .max()
-                .unwrap_or(0);
-            let candidates = Overrep::candidates(reads.iter().copied(), len);
-            before[i].overrep = Some(Overrep::new(
-                &candidates,
-                len,
-                a.overrepresentation_sampling,
-            ));
-            after[i].overrep = Some(Overrep::new(
-                &candidates,
-                len,
-                a.overrepresentation_sampling,
-            ));
-        }
-    }
-    // Only regular local files are read ahead. Pipes and remote streams retain
-    // synchronous reads so a failed output cannot leave a reader blocked while
-    // scoped threads are being joined.
-    // Compact synchronous jobs use the same batch ceiling as the pipeline,
-    // limiting serial parsing work before each parallel processing step.
-    // Smaller batches leave the worker pool waiting between them.
-    let max_bytes = if pipelined || pack_main_output(a) {
-        max_bytes.min(8 * 1024 * 1024)
-    } else {
-        max_bytes
-    };
-    // Capacity includes separators and modest Vec growth beyond FASTQ payload.
-    let recycle_limit = max_bytes.saturating_add(max_bytes / 4);
-    let batch_reader = BatchReader {
-        raw: raw_input,
-        reader1,
-        reader2,
-        sampled: sampled.into_iter(),
-        sampled_raw,
-        pool: ReadPool {
-            limit: recycle_limit,
-            ..ReadPool::default()
-        },
-        interleaved: a.interleaved_in,
-        max_bytes,
-        limit: a.reads_to_process,
-        count: 0,
-        eof: false,
-    };
-    let before_templates = std::array::from_fn(|i| before[i].empty_like());
-    let after_templates = std::array::from_fn(|i| after[i].empty_like());
-    let hasher = duplication.as_ref().map(Duplication::hasher);
-    std::thread::scope(|scope| -> Result<()> {
-        let mut serial_reader = Some(batch_reader);
-        let (recycle_tx, recycle_rx) = crossbeam_channel::bounded::<Vec<ReadPool>>(2);
-        let processed_rx = if pipelined {
-            // One queued batch per stage bounds both memory and reordering.
-            let (input_tx, input_rx) = crossbeam_channel::bounded(1);
-            let (processed_tx, processed_rx) = crossbeam_channel::bounded(1);
-            let mut reader = serial_reader.take().unwrap();
-            scope.spawn(move || loop {
-                while let Ok(recycled) = recycle_rx.try_recv() {
-                    for recycled in recycled {
-                        reader.pool.absorb(recycled);
-                    }
-                }
-                match reader.next_batch() {
-                    Ok(Some(batch)) => {
-                        if input_tx.send(Ok(batch)).is_err() {
-                            break;
-                        }
-                    }
-                    Ok(None) => break,
-                    Err(error) => {
-                        let _ = input_tx.send(Err(error));
+            match reader.next_batch() {
+                Ok(Some(batch)) => {
+                    if input_tx.send(Ok(batch)).is_err() {
                         break;
                     }
                 }
-            });
-            let config = &config;
-            let before = &before_templates;
-            let after = &after_templates;
-            let hasher = hasher.as_ref();
-            let mut worker_duplication = duplication.take();
-            let processed_tx = if worker_duplication.is_some() {
-                let (duplicate_tx, duplicate_rx) =
-                    crossbeam_channel::bounded::<Result<Vec<Chunk<'static>>>>(1);
-                scope.spawn(move || {
-                    for result in duplicate_rx {
-                        let result = result.map(|mut chunks| {
-                            mark_duplicates(&mut chunks, worker_duplication.as_mut());
-                            chunks
-                        });
-                        let failed = result.is_err();
-                        if processed_tx.send(result).is_err() || failed {
-                            break;
-                        }
-                    }
-                });
-                duplicate_tx
-            } else {
-                processed_tx
-            };
-            scope.spawn(move || {
-                for batch in input_rx {
-                    let result = batch.and_then(|b| {
-                        process_batch(b, pool, config, before, after, hasher, recycle_limit)
+                Ok(None) => break,
+                Err(error) => {
+                    let _ = input_tx.send(Err(error));
+                    break;
+                }
+            }
+        })];
+        let processed_tx = if duplication.is_some() {
+            let (duplicate_tx, duplicate_rx) = crossbeam_channel::bounded::<ProcessedBatch>(1);
+            threads.push(std::thread::spawn(move || {
+                for result in duplicate_rx {
+                    let result = result.map(|mut chunks| {
+                        mark_duplicates(&mut chunks, duplication.as_mut());
+                        chunks
                     });
                     let failed = result.is_err();
                     if processed_tx.send(result).is_err() || failed {
                         break;
                     }
                 }
-            });
-            Some(processed_rx)
+            }));
+            duplicate_tx
         } else {
-            None
+            processed_tx
         };
-        loop {
-            let mut chunks = if let Some(receiver) = &processed_rx {
-                match receiver.recv() {
-                    Ok(result) => result?,
-                    Err(_) => break,
-                }
-            } else {
-                match serial_reader.as_mut().unwrap().next_batch()? {
-                    Some(batch) => process_batch(
-                        batch,
-                        pool,
-                        &config,
-                        &before_templates,
-                        &after_templates,
-                        hasher.as_ref(),
-                        recycle_limit,
-                    )?,
-                    None => break,
-                }
-            };
-            if processed_rx.is_none() {
-                mark_duplicates(&mut chunks, duplication.as_mut());
-            }
-            let mut read_pool = ReadPool {
-                reads: Vec::with_capacity(chunks.iter().map(|c| c.processed.len()).sum()),
-                limit: max_bytes,
-                ..ReadPool::default()
-            };
-            let mut read_pools = Vec::with_capacity(chunks.len() + 1);
-            let profile_after_in_worker = !a.dedup && !a.overrepresentation_analysis;
-            // Bloom decisions remain ordered. Determine global after-filter indices
-            // before parallel profiling so sampling is independent of chunk boundaries.
-            let mut offsets = std::array::from_fn(|i| after[i].simple.total_reads);
-            for chunk in &mut chunks {
-                chunk.after_offset = offsets;
-                for p in &mut chunk.processed {
-                    duplicates += usize::from(p.duplicate);
-                    if !profile_after_in_worker {
-                        for (i, _) in p.passing_reads(a).into_iter().flatten() {
-                            offsets[i] += 1;
-                        }
-                    }
-                }
-            }
-            if !profile_after_in_worker {
-                pool.install(|| {
-                    chunks.par_iter_mut().for_each(|chunk| {
-                        let mut offsets = chunk.after_offset;
-                        for p in &chunk.processed {
-                            for (i, r) in p.passing_reads(a).into_iter().flatten() {
-                                chunk.after[i].add_at(r, a.no_kmer, offsets[i]);
-                                offsets[i] += 1;
-                            }
-                        }
-                    })
+        let shared = Arc::clone(shared);
+        threads.push(std::thread::spawn(move || {
+            for batch in input_rx {
+                let result = batch.and_then(|b| {
+                    let [before, after] = &shared.templates;
+                    process_batch(
+                        b,
+                        shared.pool(),
+                        &shared.config,
+                        before,
+                        after,
+                        shared.hasher.as_ref(),
+                        shared.recycle_limit,
+                    )
                 });
-            }
-            for chunk in chunks {
-                for (dst, src) in before.iter_mut().zip(chunk.before) {
-                    dst.merge(src);
-                }
-                for (dst, src) in after.iter_mut().zip(chunk.after) {
-                    dst.merge(src);
-                }
-                if let Some(mut packed) = chunk.packed {
-                    out.write_packed(main1, &packed.output[0])?;
-                    out.write_packed(main2, &packed.output[1])?;
-                    out.write_packed(merged_out, &packed.output[2])?;
-                    count += packed.count;
-                    merged_pairs += packed.merged_pairs;
-                    duplicates += packed.duplicates;
-                    adapter_reads += packed.adapter_reads;
-                    adapter_bases += packed.adapter_bases;
-                    corrected_reads += packed.corrected_reads;
-                    corrected_bases += packed.corrected_bases;
-                    unknown += packed.unknown;
-                    for (dst, src) in failures.iter_mut().zip(packed.failures) {
-                        *dst += src;
-                    }
-                    for (dst, src) in histogram.iter_mut().zip(&packed.histogram) {
-                        *dst += src;
-                    }
-                    for (dst, src) in poly_reads.iter_mut().zip(packed.poly_reads) {
-                        *dst += src;
-                    }
-                    for (dst, src) in poly_bases.iter_mut().zip(packed.poly_bases) {
-                        *dst += src;
-                    }
-                    read_pools.push(std::mem::take(&mut packed.recycled));
-                    continue;
-                }
-                for p in chunk.processed {
-                    let p = RecycleRead {
-                        processed: p,
-                        pool: &mut read_pool,
-                    };
-                    count += 1;
-                    let duplicate = p.duplicate;
-                    if p.skipped {
-                        continue;
-                    }
-                    corrected_reads += p.corrected_reads;
-                    corrected_bases += p.corrected_bases;
-                    adapter_reads += p.adapter_reads;
-                    adapter_bases += p.adapter_bases;
-                    for &(base, n) in &p.poly_x {
-                        poly_reads[base] += 1;
-                        poly_bases[base] += n;
-                    }
-                    if pe {
-                        if let Some(size) = p.insert {
-                            histogram[size.min(512)] += 1;
-                        } else {
-                            unknown += 1;
-                        }
-                    }
-                    if let Some(r) = &p.overlapped {
-                        out.write(a.overlapped_out.as_deref(), r, None)?;
-                    }
-                    if let Some(r) = &p.merged {
-                        failures[p.failures[0] as usize] += 2;
-                        if p.failures[0] == Failure::Pass && !(a.dedup && duplicate) {
-                            out.write(merged_out, r, None)?;
-                            merged_pairs += 1;
-                        }
-                        continue;
-                    }
-                    if a.merge && a.include_unmerged {
-                        for i in 0..2 {
-                            if let Some(r) = &p.reads[i] {
-                                failures[p.failures[i] as usize] += 1;
-                                if p.failures[i] == Failure::Pass && !(a.dedup && duplicate) {
-                                    out.write(merged_out, r, None)?;
-                                }
-                            }
-                        }
-                        continue;
-                    }
-                    let f = if pe {
-                        p.failures[0].max(p.failures[1])
-                    } else {
-                        p.failures[0]
-                    };
-                    failures[f as usize] += if pe { 2 } else { 1 };
-                    if a.dedup && duplicate {
-                        continue;
-                    }
-                    if f == Failure::Pass {
-                        if let Some(r) = &p.reads[0] {
-                            out.write(main1, r, None)?;
-                        }
-                        if let Some(r) = &p.reads[1] {
-                            out.write(main2, r, None)?;
-                        }
-                    } else {
-                        // fastp writes failed paired reads only when the mate passes.
-                        if pe && p.failures.iter().all(|f| *f != Failure::Pass) {
-                            continue;
-                        }
-                        for i in 0..if pe { 2 } else { 1 } {
-                            let Some(r) = &p.reads[i] else {
-                                continue;
-                            };
-                            let unpaired = if i == 0 {
-                                a.unpaired1.as_deref()
-                            } else {
-                                a.unpaired2.as_deref().or(a.unpaired1.as_deref())
-                            };
-                            if pe && p.failures[i] == Failure::Pass && unpaired.is_some() {
-                                out.write(unpaired, r, None)?;
-                            } else {
-                                out.write(
-                                    a.failed_out.as_deref(),
-                                    p.failed_reads[i].as_ref().unwrap_or(r),
-                                    Some(p.failures[i].tag()),
-                                )?;
-                            }
-                        }
-                    }
+                let failed = result.is_err();
+                if processed_tx.send(result).is_err() || failed {
+                    break;
                 }
             }
-            if a.verbose {
-                eprintln!(
-                    "Processed {count} {}",
-                    if pe { "read pairs" } else { "reads" }
-                );
-            }
-            read_pools.push(read_pool);
-            if processed_rx.is_some() {
-                let _ = recycle_tx.try_send(read_pools);
-            } else {
-                for read_pool in read_pools {
-                    serial_reader.as_mut().unwrap().pool.absorb(read_pool);
+        }));
+        Self {
+            processed: Some(processed),
+            recycle,
+            threads,
+        }
+    }
+
+    /// The next processed batch, or `None` once the threads have finished.
+    fn next(&mut self) -> Option<ProcessedBatch> {
+        let received = self.processed.as_ref()?.recv().ok();
+        if received.is_none() {
+            self.processed = None;
+            // A thread that panicked closed its channel early; surface the
+            // panic as `thread::scope` would instead of ending quietly.
+            for thread in self.threads.drain(..) {
+                if let Err(panic) = thread.join() {
+                    std::panic::resume_unwind(panic);
                 }
             }
         }
-        Ok(())
-    })?;
-    out.finish()?;
-    for sample in before.iter_mut().chain(&mut after) {
-        sample.finish_summary();
+        received
     }
-    let mut report = make_report(&before, &after, pe, a.merge);
-    report["filtering_result"] = json!({"passed_filter_reads":failures[0],"low_quality_reads":failures[4],"too_many_N_reads":failures[1],"too_short_reads":failures[2],"too_long_reads":failures[3],"low_complexity_reads":failures[5],"adapter_dimer_reads":failures[6]});
-    if a.correction {
-        report["filtering_result"]["corrected_reads"] = json!(corrected_reads);
-        report["filtering_result"]["corrected_bases"] = json!(corrected_bases);
+}
+
+impl Drop for Pipeline {
+    fn drop(&mut self) {
+        self.processed = None;
+        for thread in self.threads.drain(..) {
+            let _ = thread.join();
+        }
     }
-    if !a.dont_eval_duplication || a.dedup {
-        report["duplication"] =
-            json!({"rate":if count>0 {duplicates as f64/count as f64} else {0.0}});
+}
+
+/// The processing engine: set up by `new`, advanced one batch at a time by
+/// `step`, and turned into the report by `finish`.
+struct Engine {
+    shared: Arc<Shared>,
+    source: Source,
+    /// Duplicate marking on this thread when not pipelined.
+    duplication: Option<Duplication>,
+    out: Output,
+    targets: Targets,
+    stats: Stats,
+    pe: bool,
+    max_bytes: usize,
+    done: bool,
+    /// A step failed, so the counts are incomplete.
+    failed: bool,
+}
+
+impl Engine {
+    fn new(mut a: Args) -> Result<Self> {
+        if a.stdin || a.input == "/dev/stdin" {
+            a.input = "-".into();
+        }
+        if a.output == "/dev/stdout" {
+            a.output = "-".into();
+        }
+        if a.output == "-" {
+            a.stdout = true;
+        }
+        if let (Some(first), Some(second)) = (&a.unpaired1, &a.unpaired2) {
+            if !first.contains("://")
+                && !second.contains("://")
+                && same_file(&normalized_path(first)?, &normalized_path(second)?)
+            {
+                a.unpaired2 = Some(first.clone());
+            }
+        }
+        a.umi_loc.make_ascii_lowercase();
+        if a.merge {
+            a.correction = true;
+            if a.merged_out.is_none() && !a.stdout && !a.output.is_empty() && a.output2.is_none() {
+                a.merged_out = Some(std::mem::take(&mut a.output));
+            }
+            if a.include_unmerged {
+                a.output.clear();
+                a.output2 = None;
+                a.unpaired1 = None;
+                a.unpaired2 = None;
+            }
+        }
+        if a.stdout {
+            a.output.clear();
+            a.output2 = None;
+        }
+        if a.input2.is_none() && !a.interleaved_in {
+            a.unpaired1 = None;
+            a.unpaired2 = None;
+            a.overlapped_out = None;
+        }
+        if !a.merge {
+            a.merged_out = None;
+        }
+        validate(&a)?;
+        // The in-memory file system has no symlinks or directories to check.
+        #[cfg(feature = "native")]
+        validate_paths(&a)?;
+        let pe = a.input2.is_some() || a.interleaved_in;
+        let total_for_split = if a.split.is_some() {
+            let mut reader = Reader::open(&a.input, a.phred64)?;
+            let mut n = 0;
+            while reader.next()?.is_some() {
+                n += 1;
+            }
+            if a.interleaved_in {
+                ensure!(n % 2 == 0, "Odd read count in interleaved FASTQ");
+                n /= 2;
+            }
+            if a.reads_to_process > 0 {
+                n = n.min(a.reads_to_process);
+            }
+            Some(n)
+        } else {
+            None
+        };
+        // Decoding one large member in parallel costs about 2.5 times zlib's CPU
+        // per byte, so it pays off only when decoding limits the run: a single
+        // input (a second brings its own decoder and the compressors need the
+        // cores) whose output is not gzip, or whose qualities are binned, which
+        // makes compressing the output cheap. Otherwise the extra CPU comes out
+        // of processing and compression.
+        let gzip_out = io::CompressionFormat::from_path(&a.output) == io::CompressionFormat::Gzip;
+        io::set_split_decoding(
+            a.input2.is_none() && (!gzip_out || io::binned_gzip_input(&a.input)),
+        );
+        let mut reader1 = Reader::open(&a.input, a.phred64)?;
+        let mut reader2 = a
+            .input2
+            .as_ref()
+            .map(|s| Reader::open(s, a.phred64))
+            .transpose()?;
+        let mut sampled = Vec::new();
+        let mut sampled_raw = VecDeque::new();
+        // Compact-output jobs retain evaluation data in the same blocks used
+        // by processing. The sample is read once without allocating four fields per
+        // record, and each block is released as soon as processing consumes it.
+        let pipelined = cfg!(feature = "native")
+            && a.max_backlog != Some(1)
+            && std::iter::once(a.input.as_str())
+                .chain(a.input2.as_deref())
+                .all(|path| std::fs::metadata(path).is_ok_and(|m| m.is_file()));
+        // Borrowed parsing also works synchronously. Only reading ahead requires
+        // regular files; pipes must stay on this thread for prompt cancellation.
+        // Interleaved stdin has no evaluation prefix. Keep local interleaved
+        // sampling on the owned path until that separate path is generalized.
+        let raw_input = pack_main_output(&a) && (!a.interleaved_in || a.input == "-");
+        // Read once and retain the sample: this works for pipes, HTTP, and S3 too.
+        let auto = |seq: &Option<String>| seq.as_deref().is_none_or(|s| s == "auto");
+        let needs_adapter_sample = !a.disable_adapter_trimming
+            && !a.disable_adapter_detection
+            && if pe {
+                a.detect_adapter_for_pe
+                    && (auto(&a.adapter_sequence) || auto(&a.adapter_sequence_r2))
+            } else {
+                auto(&a.adapter_sequence)
+            };
+        // Otherwise only the first header is needed for instrument/polyG detection.
+        let sample_limit = if a.input == "-" {
+            0
+        } else if needs_adapter_sample || a.overrepresentation_analysis {
+            256 * 1024
+        } else {
+            1
+        };
+        let mut sample_bases = 0;
+        let mut sample_count = 0;
+        if raw_input {
+            while sample_count < sample_limit && sample_bases < 151 * 256 * 1024 {
+                let Some(blocks) = block::read_sample_batch(
+                    &mut reader1,
+                    reader2.as_mut(),
+                    a.batch_bytes.min(2 * 1024 * 1024),
+                    sample_limit - sample_count,
+                    151 * 256 * 1024 - sample_bases,
+                )?
+                else {
+                    break;
+                };
+                for index in 0..blocks[0].len() {
+                    // Preserve validation of the entire evaluation sample, including
+                    // when --reads_to_process subsequently processes only its prefix.
+                    for mate in &blocks {
+                        if mate.len() > 0 {
+                            mate.read(index, sample_count + index, a.phred64)?;
+                        }
+                    }
+                    sample_bases += blocks[0].sequence(index).len();
+                }
+                sample_count += blocks[0].len();
+                sampled_raw.push_back(ReadBatch {
+                    raw: Some(blocks),
+                    reads: Vec::new(),
+                    start: 0,
+                });
+            }
+        } else {
+            for _ in 0..sample_limit {
+                let Some(r1) = reader1.next()? else {
+                    break;
+                };
+                let r2 = if a.interleaved_in {
+                    Some(
+                        reader1
+                            .next()?
+                            .context("Odd read count in interleaved FASTQ")?,
+                    )
+                } else if let Some(reader2) = reader2.as_mut() {
+                    Some(
+                        reader2
+                            .next()?
+                            .context("Paired input files have different read counts")?,
+                    )
+                } else {
+                    None
+                };
+                sample_bases += r1.seq.len();
+                sampled.push((r1, r2));
+                if sample_bases >= 151 * 256 * 1024 {
+                    break;
+                }
+            }
+            sample_count = sampled.len();
+        }
+        let manual = |s: &Option<String>| {
+            s.as_ref().filter(|s| s.as_str() != "auto").map(|s| {
+                s.as_bytes()
+                    .iter()
+                    .map(u8::to_ascii_uppercase)
+                    .collect::<Vec<_>>()
+            })
+        };
+        let mut adapters = [manual(&a.adapter_sequence), manual(&a.adapter_sequence_r2)];
+        for seq in adapters.iter().flatten() {
+            ensure!(
+                seq.len() >= 4 && seq.iter().all(|b| b"ATCG".contains(b)),
+                "Adapter sequences must contain at least four A/T/C/G bases"
+            );
+        }
+        let sample_sequences = |mate: usize| -> Vec<&[u8]> {
+            if raw_input {
+                sampled_raw
+                    .iter()
+                    .flat_map(|b| {
+                        let records = &b.raw.as_ref().unwrap()[mate];
+                        (0..records.len()).map(|i| records.sequence(i))
+                    })
+                    .collect()
+            } else {
+                sampled
+                    .iter()
+                    .filter_map(|(r1, r2)| {
+                        if mate == 0 {
+                            Some(r1.seq.as_ref())
+                        } else {
+                            r2.as_ref().map(|r| r.seq.as_ref())
+                        }
+                    })
+                    .collect()
+            }
+        };
+        let threads = worker_threads(&a);
+        #[cfg(not(target_arch = "wasm32"))]
+        let owned_pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()?;
+        #[cfg(not(target_arch = "wasm32"))]
+        let pool = &owned_pool;
+        #[cfg(target_arch = "wasm32")]
+        let owned_pool = wasm_pool()?;
+        #[cfg(target_arch = "wasm32")]
+        let pool = owned_pool;
+        // Detection scans the whole sample; it runs on the worker pool.
+        let detect = |mate: usize| {
+            pool.install(|| auto_adapter::detect(&sample_sequences(mate), a.trim_tail1))
+        };
+        if !a.disable_adapter_trimming && !a.disable_adapter_detection && sample_count >= 10000 {
+            if !pe && adapters[0].is_none() {
+                adapters[0] = detect(0);
+            } else if pe && a.detect_adapter_for_pe {
+                if adapters[0].is_none() {
+                    adapters[0] = detect(0);
+                }
+                if adapters[1].is_none() {
+                    adapters[1] = detect(1);
+                }
+            }
+        }
+        if pe && adapters[1].is_none() && !a.detect_adapter_for_pe {
+            adapters[1] = adapters[0].clone();
+        }
+        let first_name = sampled.first().map(|(r, _)| r.name.as_ref()).or_else(|| {
+            sampled_raw
+                .front()
+                .map(|batch| batch.raw.as_ref().unwrap()[0].name(0))
+        });
+        let poly_g = !a.disable_trim_poly_g
+            && (a.trim_poly_g
+                || first_name.is_some_and(|name| {
+                    [
+                        "@FS", "@MN", "@SH", "@NS", "@NB", "@NDX", "@VL", "@VH", "@A", "@NA", "@LH",
+                    ]
+                    .iter()
+                    .any(|s| name.starts_with(s.as_bytes()))
+                }));
+        let fasta = load_sequences(a.adapter_fasta.as_deref(), true)?;
+        let blacklist = [
+            load_sequences(a.filter_by_index1.as_deref(), false)?,
+            load_sequences(a.filter_by_index2.as_deref(), false)?,
+        ];
+        let max_bytes = if let Some(mb) = a.max_memory {
+            ensure!(mb >= 16, "--max_memory must be at least 16 MB");
+            a.batch_bytes.min(mb.saturating_mul(1024 * 1024) / 8).max(1)
+        } else {
+            a.batch_bytes
+        };
+        let config = Config {
+            args: a,
+            adapters,
+            fasta,
+            blacklist,
+            poly_g,
+        };
+        let a = &config.args;
+        let split = split::SplitConfig {
+            mode: if let Some(n) = a.split {
+                split::SplitMode::ByFiles(n)
+            } else if let Some(n) = a.split_by_lines {
+                split::SplitMode::ByLines(n)
+            } else {
+                split::SplitMode::None
+            },
+            prefix_digits: a.split_prefix_digits,
+        };
+        let mut out = Output::new(a);
+        for path in [Some(a.output.as_str()), a.output2.as_deref()]
+            .into_iter()
+            .flatten()
+        {
+            out.open(path, a, split.clone())?;
+        }
+        for path in [
+            a.merged_out.as_deref(),
+            a.unpaired1.as_deref(),
+            a.unpaired2.as_deref(),
+            a.failed_out.as_deref(),
+            a.overlapped_out.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            out.open(path, a, split::SplitConfig::default())?;
+        }
+        if a.stdout || a.output == "-" {
+            out.open("-", a, split::SplitConfig::default())?;
+        }
+        if let Some(total) = total_for_split {
+            for w in out.writers.values_mut() {
+                w.set_total_reads(total)?;
+            }
+        }
+        let to_stdout = (a.stdout || a.output == "-") && !a.merge;
+        let targets = Targets {
+            main1: Some(if to_stdout {
+                "-".into()
+            } else {
+                a.output.clone()
+            }),
+            main2: if to_stdout {
+                Some("-".into())
+            } else {
+                a.output2.clone()
+            },
+            merged: if a.stdout {
+                Some("-".into())
+            } else {
+                a.merged_out.clone()
+            },
+        };
+        let mut stats = Stats::default();
+        let mut duplication = if a.dedup || !a.dont_eval_duplication {
+            Some(Duplication::new(if a.dup_calc_accuracy > 0 {
+                a.dup_calc_accuracy
+            } else if a.dedup {
+                3
+            } else {
+                1
+            }))
+        } else {
+            None
+        };
+        if a.overrepresentation_analysis {
+            for i in 0..if pe { 2 } else { 1 } {
+                let reads: Vec<_> = sampled
+                    .iter()
+                    .filter_map(|(r1, r2)| if i == 0 { Some(r1) } else { r2.as_ref() })
+                    .collect();
+                let len = reads
+                    .iter()
+                    .take(1000)
+                    .map(|r| r.seq.len())
+                    .max()
+                    .unwrap_or(0);
+                let candidates = Overrep::candidates(reads.iter().copied(), len);
+                stats.before[i].overrep = Some(Overrep::new(
+                    &candidates,
+                    len,
+                    a.overrepresentation_sampling,
+                ));
+                stats.after[i].overrep = Some(Overrep::new(
+                    &candidates,
+                    len,
+                    a.overrepresentation_sampling,
+                ));
+            }
+        }
+        // Only regular local files are read ahead. Pipes and remote streams retain
+        // synchronous reads so a failed output cannot leave a reader blocked while
+        // the pipeline threads are being joined.
+        // Compact synchronous jobs use the same batch ceiling as the pipeline,
+        // limiting serial parsing work before each parallel processing step.
+        // Smaller batches leave the worker pool waiting between them.
+        let max_bytes = if pipelined || pack_main_output(a) {
+            max_bytes.min(8 * 1024 * 1024)
+        } else {
+            max_bytes
+        };
+        // Capacity includes separators and modest Vec growth beyond FASTQ payload.
+        let recycle_limit = max_bytes.saturating_add(max_bytes / 4);
+        let batch_reader = BatchReader {
+            raw: raw_input,
+            reader1,
+            reader2,
+            sampled: sampled.into_iter(),
+            sampled_raw,
+            pool: ReadPool {
+                limit: recycle_limit,
+                ..ReadPool::default()
+            },
+            interleaved: a.interleaved_in,
+            max_bytes,
+            limit: a.reads_to_process,
+            count: 0,
+            eof: false,
+        };
+        let templates = [
+            std::array::from_fn(|i| stats.before[i].empty_like()),
+            std::array::from_fn(|i| stats.after[i].empty_like()),
+        ];
+        let hasher = duplication.as_ref().map(Duplication::hasher);
+        let shared = Arc::new(Shared {
+            config,
+            pool: owned_pool,
+            templates,
+            hasher,
+            recycle_limit,
+        });
+        let source = if pipelined {
+            Source::Pipelined(Pipeline::start(batch_reader, &shared, duplication.take()))
+        } else {
+            Source::Serial(Box::new(batch_reader))
+        };
+        Ok(Self {
+            shared,
+            source,
+            duplication,
+            out,
+            targets,
+            stats,
+            pe,
+            max_bytes,
+            done: false,
+            failed: false,
+        })
     }
-    if !a.disable_adapter_trimming {
-        report["adapter_cutting"] =
-            json!({"adapter_trimmed_reads":adapter_reads,"adapter_trimmed_bases":adapter_bases});
+
+    /// Process the next batch. Returns `false` once the input is exhausted;
+    /// after an error it returns the error once and then `false`.
+    fn step(&mut self) -> Result<bool> {
+        if self.done {
+            return Ok(false);
+        }
+        let result = self.process_next();
+        self.done = !matches!(result, Ok(true));
+        self.failed = result.is_err();
+        result
     }
-    if a.trim_poly_x {
-        report["polyx_trimming"] = json!({"total_polyx_trimmed_reads":poly_reads.iter().sum::<usize>(),"total_polyx_trimmed_bases":poly_bases.iter().sum::<usize>(),"polyx_trimmed_reads":poly_reads,"polyx_trimmed_bases":poly_bases});
+
+    fn process_next(&mut self) -> Result<bool> {
+        let shared = Arc::clone(&self.shared);
+        let a = &shared.config.args;
+        let pe = self.pe;
+        let max_bytes = self.max_bytes;
+        let mut chunks = match &mut self.source {
+            Source::Pipelined(pipeline) => match pipeline.next() {
+                Some(result) => result?,
+                None => return Ok(false),
+            },
+            Source::Serial(reader) => match reader.next_batch()? {
+                Some(batch) => {
+                    let [before, after] = &shared.templates;
+                    process_batch(
+                        batch,
+                        shared.pool(),
+                        &shared.config,
+                        before,
+                        after,
+                        shared.hasher.as_ref(),
+                        shared.recycle_limit,
+                    )?
+                }
+                None => return Ok(false),
+            },
+        };
+        let Self {
+            out,
+            stats,
+            targets,
+            ..
+        } = self;
+        let (main1, main2, merged) = (
+            targets.main1.as_deref(),
+            targets.main2.as_deref(),
+            targets.merged.as_deref(),
+        );
+        if let Source::Serial(..) = self.source {
+            mark_duplicates(&mut chunks, self.duplication.as_mut());
+        }
+        let mut read_pool = ReadPool {
+            reads: Vec::with_capacity(chunks.iter().map(|c| c.processed.len()).sum()),
+            limit: max_bytes,
+            ..ReadPool::default()
+        };
+        let mut read_pools = Vec::with_capacity(chunks.len() + 1);
+        let profile_after_in_worker = !a.dedup && !a.overrepresentation_analysis;
+        // Bloom decisions remain ordered. Determine global after-filter indices
+        // before parallel profiling so sampling is independent of chunk boundaries.
+        let mut offsets = std::array::from_fn(|i| stats.after[i].simple.total_reads);
+        for chunk in &mut chunks {
+            chunk.after_offset = offsets;
+            for p in &mut chunk.processed {
+                stats.duplicates += usize::from(p.duplicate);
+                if !profile_after_in_worker {
+                    for (i, _) in p.passing_reads(a).into_iter().flatten() {
+                        offsets[i] += 1;
+                    }
+                }
+            }
+        }
+        if !profile_after_in_worker {
+            shared.pool().install(|| {
+                chunks.par_iter_mut().for_each(|chunk| {
+                    let mut offsets = chunk.after_offset;
+                    for p in &chunk.processed {
+                        for (i, r) in p.passing_reads(a).into_iter().flatten() {
+                            chunk.after[i].add_at(r, a.no_kmer, offsets[i]);
+                            offsets[i] += 1;
+                        }
+                    }
+                })
+            });
+        }
+        for chunk in chunks {
+            for (dst, src) in stats.before.iter_mut().zip(chunk.before) {
+                dst.merge(src);
+            }
+            for (dst, src) in stats.after.iter_mut().zip(chunk.after) {
+                dst.merge(src);
+            }
+            if let Some(mut packed) = chunk.packed {
+                out.write_packed(main1, &packed.output[0])?;
+                out.write_packed(main2, &packed.output[1])?;
+                out.write_packed(merged, &packed.output[2])?;
+                stats.count += packed.count;
+                stats.merged_pairs += packed.merged_pairs;
+                stats.duplicates += packed.duplicates;
+                stats.adapter_reads += packed.adapter_reads;
+                stats.adapter_bases += packed.adapter_bases;
+                stats.corrected_reads += packed.corrected_reads;
+                stats.corrected_bases += packed.corrected_bases;
+                stats.unknown += packed.unknown;
+                for (dst, src) in stats.failures.iter_mut().zip(packed.failures) {
+                    *dst += src;
+                }
+                for (dst, src) in stats.histogram.iter_mut().zip(&packed.histogram) {
+                    *dst += src;
+                }
+                for (dst, src) in stats.poly_reads.iter_mut().zip(packed.poly_reads) {
+                    *dst += src;
+                }
+                for (dst, src) in stats.poly_bases.iter_mut().zip(packed.poly_bases) {
+                    *dst += src;
+                }
+                read_pools.push(std::mem::take(&mut packed.recycled));
+                continue;
+            }
+            for p in chunk.processed {
+                let p = RecycleRead {
+                    processed: p,
+                    pool: &mut read_pool,
+                };
+                stats.count += 1;
+                let duplicate = p.duplicate;
+                if p.skipped {
+                    continue;
+                }
+                stats.corrected_reads += p.corrected_reads;
+                stats.corrected_bases += p.corrected_bases;
+                stats.adapter_reads += p.adapter_reads;
+                stats.adapter_bases += p.adapter_bases;
+                for &(base, n) in &p.poly_x {
+                    stats.poly_reads[base] += 1;
+                    stats.poly_bases[base] += n;
+                }
+                if pe {
+                    if let Some(size) = p.insert {
+                        stats.histogram[size.min(512)] += 1;
+                    } else {
+                        stats.unknown += 1;
+                    }
+                }
+                if let Some(r) = &p.overlapped {
+                    out.write(a.overlapped_out.as_deref(), r, None)?;
+                }
+                if let Some(r) = &p.merged {
+                    stats.failures[p.failures[0] as usize] += 2;
+                    if p.failures[0] == Failure::Pass && !(a.dedup && duplicate) {
+                        out.write(merged, r, None)?;
+                        stats.merged_pairs += 1;
+                    }
+                    continue;
+                }
+                if a.merge && a.include_unmerged {
+                    for i in 0..2 {
+                        if let Some(r) = &p.reads[i] {
+                            stats.failures[p.failures[i] as usize] += 1;
+                            if p.failures[i] == Failure::Pass && !(a.dedup && duplicate) {
+                                out.write(merged, r, None)?;
+                            }
+                        }
+                    }
+                    continue;
+                }
+                let f = if pe {
+                    p.failures[0].max(p.failures[1])
+                } else {
+                    p.failures[0]
+                };
+                stats.failures[f as usize] += if pe { 2 } else { 1 };
+                if a.dedup && duplicate {
+                    continue;
+                }
+                if f == Failure::Pass {
+                    if let Some(r) = &p.reads[0] {
+                        out.write(main1, r, None)?;
+                    }
+                    if let Some(r) = &p.reads[1] {
+                        out.write(main2, r, None)?;
+                    }
+                } else {
+                    // fastp writes failed paired reads only when the mate passes.
+                    if pe && p.failures.iter().all(|f| *f != Failure::Pass) {
+                        continue;
+                    }
+                    for i in 0..if pe { 2 } else { 1 } {
+                        let Some(r) = &p.reads[i] else {
+                            continue;
+                        };
+                        let unpaired = if i == 0 {
+                            a.unpaired1.as_deref()
+                        } else {
+                            a.unpaired2.as_deref().or(a.unpaired1.as_deref())
+                        };
+                        if pe && p.failures[i] == Failure::Pass && unpaired.is_some() {
+                            out.write(unpaired, r, None)?;
+                        } else {
+                            out.write(
+                                a.failed_out.as_deref(),
+                                p.failed_reads[i].as_ref().unwrap_or(r),
+                                Some(p.failures[i].tag()),
+                            )?;
+                        }
+                    }
+                }
+            }
+        }
+        if a.verbose {
+            eprintln!(
+                "Processed {} {}",
+                stats.count,
+                if pe { "read pairs" } else { "reads" }
+            );
+        }
+        read_pools.push(read_pool);
+        match &mut self.source {
+            Source::Pipelined(pipeline) => {
+                let _ = pipeline.recycle.try_send(read_pools);
+            }
+            Source::Serial(reader) => {
+                for read_pool in read_pools {
+                    reader.pool.absorb(read_pool);
+                }
+            }
+        }
+        Ok(true)
     }
-    if pe {
-        let peak = (0..512).max_by_key(|&i| (histogram[i], 512 - i)).unwrap();
-        report["insert_size"] =
-            json!({"peak":peak,"unknown":unknown+histogram[512],"histogram":&histogram[..512]});
+
+    /// Process any remaining input, close the outputs and build the report.
+    /// Fails if a step failed: the report would cover only part of the input.
+    fn finish(mut self) -> Result<Finished> {
+        while self.step()? {}
+        ensure!(!self.failed, "Processing stopped after an error");
+        drop(self.source);
+        let Self {
+            shared,
+            out,
+            mut stats,
+            pe,
+            ..
+        } = self;
+        let a = &shared.config.args;
+        out.finish()?;
+        for sample in stats.before.iter_mut().chain(&mut stats.after) {
+            sample.finish_summary();
+        }
+        let mut report = make_report(&stats.before, &stats.after, pe, a.merge);
+        report["filtering_result"] = json!({"passed_filter_reads":stats.failures[0],"low_quality_reads":stats.failures[4],"too_many_N_reads":stats.failures[1],"too_short_reads":stats.failures[2],"too_long_reads":stats.failures[3],"low_complexity_reads":stats.failures[5],"adapter_dimer_reads":stats.failures[6]});
+        if a.correction {
+            report["filtering_result"]["corrected_reads"] = json!(stats.corrected_reads);
+            report["filtering_result"]["corrected_bases"] = json!(stats.corrected_bases);
+        }
+        if !a.dont_eval_duplication || a.dedup {
+            report["duplication"] = json!({"rate":if stats.count>0 {stats.duplicates as f64/stats.count as f64} else {0.0}});
+        }
+        if !a.disable_adapter_trimming {
+            report["adapter_cutting"] = json!({"adapter_trimmed_reads":stats.adapter_reads,"adapter_trimmed_bases":stats.adapter_bases});
+        }
+        if a.trim_poly_x {
+            report["polyx_trimming"] = json!({"total_polyx_trimmed_reads":stats.poly_reads.iter().sum::<usize>(),"total_polyx_trimmed_bases":stats.poly_bases.iter().sum::<usize>(),"polyx_trimmed_reads":stats.poly_reads,"polyx_trimmed_bases":stats.poly_bases});
+        }
+        if pe {
+            let peak = (0..512)
+                .max_by_key(|&i| (stats.histogram[i], 512 - i))
+                .unwrap();
+            report["insert_size"] = json!({"peak":peak,"unknown":stats.unknown+stats.histogram[512],"histogram":&stats.histogram[..512]});
+        }
+        if a.merge {
+            report["merged_and_filtered"] = stats.after[0].details();
+            report["merged_pairs"] = json!(stats.merged_pairs);
+        }
+        let passed = stats.failures[0];
+        let count = stats.count;
+        drop(stats);
+        let shared = Arc::into_inner(shared).context("pipeline threads still running")?;
+        Ok(Finished {
+            report,
+            count,
+            passed,
+            pe,
+            args: shared.config.args,
+        })
     }
-    if a.merge {
-        report["merged_and_filtered"] = after[0].details();
-        report["merged_pairs"] = json!(merged_pairs);
-    }
-    write_reports(a, &report, start)?;
-    eprintln!(
-        "Processed {count} {}; passed {} reads. Compatibility target: fastp {FASTP_VERSION}",
-        if pe { "pairs" } else { "reads" },
-        failures[0]
-    );
-    Ok(())
 }
 
 fn make_report(before: &[Sample; 2], after: &[Sample; 2], pe: bool, merge: bool) -> Value {
@@ -3729,5 +3965,84 @@ mod tests {
             // Addresses wrap modulo the same upstream bit count.
             assert!(duplication.check_positions([duplication.bits; 8]));
         }
+    }
+
+    const RECORD: &[u8] =
+        b"@r\nACGTACGTACGTACGTACGTACGTACGTAC\n+\nIIIIIIIIIIIIIIIIIIIIIIIIIIIIII\n";
+
+    /// Run `f` on an engine over `fastq`, read in small batches so a run takes
+    /// many steps. Natively the input is a regular file, which is read ahead.
+    fn with_engine(fastq: Vec<u8>, f: impl FnOnce(Engine)) {
+        use clap::Parser;
+        let engine = |input: &str| {
+            let args = Args::parse_from([
+                "fasterp",
+                "-i",
+                input,
+                "--disable_adapter_trimming",
+                "--batch_bytes",
+                "4096",
+            ]);
+            Engine::new(args).unwrap()
+        };
+        #[cfg(feature = "native")]
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("in.fq");
+            std::fs::write(&path, fastq).unwrap();
+            f(engine(path.to_str().unwrap()));
+        }
+        #[cfg(not(feature = "native"))]
+        io::with_files(vec![("in.fq".into(), fastq)], || {
+            f(engine("in.fq"));
+            Ok(())
+        })
+        .0
+        .unwrap();
+    }
+
+    /// Dropping an engine mid-run stops and joins the read-ahead threads,
+    /// which then release the shared state.
+    #[test]
+    fn dropping_a_running_engine_joins_its_threads() {
+        // About 2 MB, so one step covers well under 1% of the input.
+        with_engine(RECORD.repeat(32_000), |mut engine| {
+            assert_eq!(
+                matches!(engine.source, Source::Pipelined(_)),
+                cfg!(feature = "native")
+            );
+            assert!(engine.step().unwrap());
+            assert!((1..1000).contains(&engine.stats.count));
+            let shared = Arc::clone(&engine.shared);
+            drop(engine);
+            assert_eq!(Arc::strong_count(&shared), 1);
+        });
+    }
+
+    /// A failed step reports its error once; the engine then stops, refuses
+    /// to report partial counts, and drops cleanly.
+    #[test]
+    fn a_failed_step_stops_the_engine() {
+        let mut fastq = RECORD.repeat(1000);
+        fastq.extend_from_slice(b"r\nACGT\n+\nIIII\n");
+        with_engine(fastq, |mut engine| {
+            let mut steps = 0;
+            let error = loop {
+                match engine.step() {
+                    Ok(more) => assert!(more, "input ended without its error"),
+                    Err(error) => break error,
+                }
+                steps += 1;
+            };
+            assert!(steps > 1);
+            assert!(
+                format!("{error:#}").contains("Invalid FASTQ header at record 1001"),
+                "{error:#}"
+            );
+            assert!(!engine.step().unwrap());
+            let shared = Arc::clone(&engine.shared);
+            assert!(engine.finish().is_err());
+            assert_eq!(Arc::strong_count(&shared), 1);
+        });
     }
 }
