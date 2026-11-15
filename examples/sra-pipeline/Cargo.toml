@@ -1,0 +1,29 @@
+[package]
+name = "fasterp-sra-pipeline"
+version = "0.0.0"
+publish = false
+edition = "2021"
+description = "Example: an .sra run decoded by readkit-sra straight into fasterp"
+
+# A crate of its own rather than an example of fasterp: readkit-sra pulls in
+# reqwest, whose wasm32 dependencies need a newer js-sys than fasterp's wasm
+# build pins (=0.3.69). Cargo resolves the lockfile for every target and
+# feature, so even an optional dependency would break fasterp's resolution.
+# Here it has its own lockfile and touches no fasterp build.
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "sra_pipeline"
+path = "src/main.rs"
+
+[dependencies]
+fasterp = {path = "../.."}
+# Must be the readkit fasterp uses (see fasterp's Cargo.toml).
+readkit-sra = {path = "../../../../readkit-worktrees/batch-parts/crates/readkit-sra", features = ["ngs"]}
+
+[profile.release]
+codegen-units = 1
+lto = "fat"
+opt-level = 3
+panic = "abort"

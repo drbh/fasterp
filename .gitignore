@@ -32,3 +32,4 @@ book/book
 node_modules
 *.pyc
 *.so
+examples/sra-pipeline/target
