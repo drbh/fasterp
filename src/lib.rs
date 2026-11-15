@@ -5,6 +5,10 @@
 //! # Features
 //! - `native` (default): Full functionality with threading, file I/O, S3, HTTP
 //! - `wasm`: WebAssembly support with buffer-based processing
+//!
+//! As a library, [`Run`] processes readers or readkit batch sources and
+//! returns readkit batches that downstream code reads without copying; see
+//! the `library` documentation on [`Run`] and the `zero_copy` example.
 
 #[cfg(feature = "python")]
 use pyo3::prelude::*;
@@ -50,6 +54,15 @@ pub mod pipeline;
 pub mod testing;
 
 pub use args::Args;
+
+// The library API: runs on readers or readkit batch sources that return
+// readkit batches.
+mod library;
+pub use library::{Batch, Error, ErrorKind, Failure, Options, Progress, Report, Run};
+/// The batch layouts, from readkit.
+pub use readkit_batch::{Layout, Paired, Segments, Single};
+/// readkit's batch and stage crates, for matching versions.
+pub use {readkit_batch, readkit_io};
 
 // WASM module
 #[cfg(feature = "wasm")]

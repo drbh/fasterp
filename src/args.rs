@@ -3,7 +3,7 @@
 use clap::Parser;
 
 #[allow(clippy::struct_excessive_bools)]
-#[derive(Parser, Debug)]
+#[derive(Parser, Debug, Clone)]
 #[command(
     author,
     version,
