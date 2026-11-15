@@ -10,8 +10,9 @@ use std::io::{BufRead, Write};
 use std::marker::PhantomData;
 
 /// Idle buffers the run's pool keeps per kind: enough for every buffer in
-/// flight (worker chunks, queued batches, the batch the caller holds), so
-/// the steady state reuses buffers instead of allocating.
+/// flight (queued batches, the batch the caller holds), so the steady state
+/// reuses buffers instead of allocating. Worker chunks draw from a pool of
+/// their own, so the run's pool holds only whole batches' buffers.
 const POOL_IDLE: usize = 1024;
 
 /// One processing run over one input: fastp 1.4.0's trimming and filtering,

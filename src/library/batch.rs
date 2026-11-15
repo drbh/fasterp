@@ -1,7 +1,6 @@
 //! Processed batches: the passing reads plus fasterp's own record sets.
 use crate::compat::library::Collected;
 use readkit_batch::{Batch as Records, Column, Layout, Paired, Read, Segments, Single};
-use std::any::Any;
 
 /// Why a read failed, as carried in the low byte of the tags of
 /// [`Batch::failed`].
@@ -212,15 +211,9 @@ impl<L: Layout> std::fmt::Debug for Batch<L> {
 }
 
 /// The engine builds runtime-`k` batches of the run's segment count; give
-/// them the run's layout. readkit converts only to fixed layouts, so the
-/// layout is matched through `Any`.
-pub(crate) fn relabel<L: Layout>(batch: Records<Segments>) -> Records<L> {
-    let any: Box<dyn Any> = match L::SEGMENTS {
-        None => Box::new(batch),
-        Some(1) => Box::new(batch.try_into_layout::<Single>().expect("one segment")),
-        Some(2) => Box::new(batch.try_into_layout::<Paired>().expect("two segments")),
-        Some(k) => unreachable!("no layout has {k} segments"),
-    };
-    *any.downcast::<Records<L>>()
-        .expect("the layout's own batch type")
+/// them the run's layout.
+fn relabel<L: Layout>(batch: Records<Segments>) -> Records<L> {
+    batch
+        .try_into_layout()
+        .unwrap_or_else(|_| unreachable!("the run's batches have its segment count"))
 }

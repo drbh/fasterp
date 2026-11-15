@@ -1704,6 +1704,9 @@ struct PackedChunk {
     output: [Vec<u8>; 3],
     /// Library mode: passing and merged reads as columns instead of text.
     columns: Option<library::ChunkColumns>,
+    /// Library mode, first chunk of a batch: every chunk's columns, joined
+    /// on the worker pool.
+    joined: Option<library::StepColumns>,
     positions: Vec<u64>,
     duplicates: usize,
     recycled: ReadPool,
@@ -1764,6 +1767,7 @@ impl PackedChunk {
                 std::array::from_fn(|_| spare_output())
             },
             columns: columns.map(|c| library::ChunkColumns::new(c, records)),
+            joined: None,
             positions: Vec::with_capacity(records * hashes),
             duplicates: 0,
             recycled: ReadPool {
@@ -2625,7 +2629,20 @@ fn process_batch(
     });
     // Collect in input order so malformed input always reports the earliest
     // failing worker chunk, independent of scheduling.
-    results.into_iter().collect()
+    let mut chunks: Vec<Chunk<'static>> = results.into_iter().collect::<Result<_>>()?;
+    // Library mode: join the chunks' columns into the batch's here, on the
+    // workers, so the consumer thread only moves the result.
+    let columns: Vec<_> = chunks
+        .iter_mut()
+        .filter_map(|c| c.packed.as_mut()?.columns.take())
+        .collect();
+    if !columns.is_empty() {
+        let joined = pool.install(|| library::StepColumns::join(columns));
+        if let Some(packed) = chunks.first_mut().and_then(|c| c.packed.as_mut()) {
+            packed.joined = Some(joined);
+        }
+    }
+    Ok(chunks)
 }
 
 struct Output {
@@ -3998,6 +4015,8 @@ impl Engine {
         };
         let columns_config = library.as_ref().map(|l| library::Columns {
             pool: l.pool.clone(),
+            // Up to 4 chunks per worker, each with a few buffers per segment.
+            scratch: readkit_batch::Pool::with_max_idle(1024),
             segments: l.segments,
             names: l.names,
             strip_at: !bare_names,
@@ -4267,9 +4286,11 @@ impl Engine {
                 dst.merge(src);
             }
             if let Some(mut packed) = chunk.packed {
-                if let Some(columns) = packed.columns.take() {
-                    if let Some(destination) = &mut out.library {
-                        destination.append(columns);
+                if shared.config.columns.is_some() {
+                    if let (Some(joined), Some(destination)) =
+                        (packed.joined.take(), &mut out.library)
+                    {
+                        destination.put(joined);
                     }
                 } else {
                     let [first, second, third] = &mut packed.output;

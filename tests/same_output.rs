@@ -300,18 +300,9 @@ fn batches<L: Layout>(mates: &[&[u8]], per_batch: usize) -> Vec<Result<Batch<L>,
             b.push(&record).unwrap();
         }
         let batch = b.finish();
-        out.push(Ok(match L::SEGMENTS {
-            Some(1) => relabel(batch.try_into_layout::<Single>().ok().unwrap()),
-            _ => relabel(batch.try_into_layout::<Paired>().ok().unwrap()),
-        }));
+        out.push(Ok(batch.try_into_layout::<L>().ok().unwrap()));
     }
     out
-}
-
-fn relabel<A: 'static, B: 'static>(batch: Batch<A>) -> Batch<B> {
-    *(Box::new(batch) as Box<dyn std::any::Any>)
-        .downcast::<Batch<B>>()
-        .unwrap()
 }
 
 /// FASTQ texts of a library run, keyed by the command line option that
