@@ -1053,8 +1053,7 @@ fn run(
                         // A failure here may only be a false block start, so
                         // the coordinator decides; it re-decodes from known output.
                         Job::Decode(k) => {
-                            let _ = decoded_tx
-                                .send((k, region(src, size, k, deflate, None, pool)));
+                            let _ = decoded_tx.send((k, region(src, size, k, deflate, None, pool)));
                         }
                         Job::Resolve(k, mut decoded, window) => {
                             let n = decoded.head.len();
