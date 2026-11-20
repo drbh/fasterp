@@ -15,8 +15,12 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 mod block;
+#[cfg(feature = "native")]
+mod direct_writer;
 #[cfg(target_arch = "aarch64")]
 mod duplication_neon;
+#[cfg(feature = "native")]
+mod paired_gzip;
 
 pub const FASTP_VERSION: &str = "1.4.0";
 
@@ -1563,15 +1567,21 @@ fn spare_output() -> Vec<u8> {
     spare.unwrap_or_default()
 }
 
+/// Return a written output buffer for a later chunk to reuse.
+fn recycle_output(mut out: Vec<u8>) {
+    if out.capacity() > 0 {
+        let mut spare = SPARE_OUTPUT.lock().unwrap_or_else(|e| e.into_inner());
+        if spare.len() < SPARE_OUTPUTS {
+            out.clear();
+            spare.push(out);
+        }
+    }
+}
+
 impl Drop for PackedChunk {
     fn drop(&mut self) {
-        let mut spare = SPARE_OUTPUT.lock().unwrap_or_else(|e| e.into_inner());
         for out in &mut self.output {
-            if out.capacity() > 0 && spare.len() < SPARE_OUTPUTS {
-                let mut out = std::mem::take(out);
-                out.clear();
-                spare.push(out);
-            }
+            recycle_output(std::mem::take(out));
         }
     }
 }
@@ -2034,15 +2044,16 @@ impl BatchReader {
         if self.eof || (self.limit != 0 && self.count >= self.limit) {
             return Ok(None);
         }
+        let stride = if self.interleaved { 2 } else { 1 };
         if let Some(mut batch) = self.sampled_raw.pop_front() {
             let raw = batch.raw.as_mut().unwrap();
             if self.limit != 0 {
-                for mate in raw.iter_mut() {
-                    mate.truncate(self.limit - self.count);
-                }
+                let remaining = self.limit - self.count;
+                raw[0].truncate(remaining.saturating_mul(stride));
+                raw[1].truncate(remaining);
             }
             batch.start = self.count;
-            self.count += raw[0].len();
+            self.count += raw[0].len() / stride;
             return Ok(Some(batch));
         }
         if self.raw && self.sampled.len() == 0 {
@@ -2066,7 +2077,7 @@ impl BatchReader {
                 return Ok(None);
             };
             let start = self.count;
-            self.count += raw[0].len() / if self.interleaved { 2 } else { 1 };
+            self.count += raw[0].len() / stride;
             return Ok(Some(ReadBatch {
                 duplicate_flags: None,
                 raw: Some(raw),
@@ -2334,6 +2345,11 @@ fn process_batch(
 }
 
 struct Output {
+    #[cfg(feature = "native")]
+    paired_gzip: Option<paired_gzip::PairedGzip>,
+    /// Uncompressed local files that are not split, written on their own threads.
+    #[cfg(feature = "native")]
+    direct: BTreeMap<String, direct_writer::DirectWriter>,
     writers: BTreeMap<String, split::SplitWriter>,
     scratch: Vec<u8>,
     compression_threads: usize,
@@ -2360,12 +2376,60 @@ impl Output {
         .collect::<std::collections::BTreeSet<_>>()
         .len();
         Self {
+            #[cfg(feature = "native")]
+            paired_gzip: None,
+            #[cfg(feature = "native")]
+            direct: BTreeMap::new(),
             writers: BTreeMap::new(),
             scratch: Vec::new(),
             compression_threads: crate::io::threads_per_output(gzip_outputs),
         }
     }
+    fn open_main(&mut self, a: &Args, split: &split::SplitConfig) -> Result<()> {
+        #[cfg(feature = "native")]
+        if let Some(second) = a.output2.as_deref() {
+            let paths = [a.output.as_str(), second];
+            if a.parallel_compression
+                && !a.merge
+                && pack_main_output(a)
+                && paths.iter().all(|p| {
+                    !io::is_s3_path(p)
+                        && io::CompressionFormat::from_path(p) == io::CompressionFormat::Gzip
+                })
+            {
+                self.paired_gzip = Some(paired_gzip::PairedGzip::new(
+                    paths,
+                    a.compression_level.unwrap_or(4),
+                    2 * self.compression_threads,
+                )?);
+                return Ok(());
+            }
+        }
+        for path in [Some(a.output.as_str()), a.output2.as_deref()]
+            .into_iter()
+            .flatten()
+        {
+            self.open(path, a, split.clone())?;
+        }
+        Ok(())
+    }
     fn open(&mut self, path: &str, a: &Args, config: split::SplitConfig) -> Result<()> {
+        #[cfg(feature = "native")]
+        if self.direct.contains_key(path) {
+            return Ok(());
+        }
+        #[cfg(feature = "native")]
+        if !path.is_empty()
+            && path != "-"
+            && !self.writers.contains_key(path)
+            && matches!(config.mode, split::SplitMode::None)
+            && !io::is_s3_path(path)
+            && io::CompressionFormat::from_path(path) == io::CompressionFormat::None
+        {
+            let writer = direct_writer::DirectWriter::create(path, recycle_output)?;
+            self.direct.insert(path.into(), writer);
+            return Ok(());
+        }
         if !path.is_empty() && !self.writers.contains_key(path) {
             self.writers.insert(
                 path.into(),
@@ -2381,6 +2445,12 @@ impl Output {
         Ok(())
     }
     fn write(&mut self, path: Option<&str>, read: &Read, tag: Option<&str>) -> Result<()> {
+        #[cfg(feature = "native")]
+        if let Some(writer) = path.and_then(|p| self.direct.get_mut(p)) {
+            self.scratch.clear();
+            read.write(&mut self.scratch, tag)?;
+            return writer.write(&self.scratch);
+        }
         if let Some(writer) = path.and_then(|p| self.writers.get_mut(p)) {
             self.scratch.clear();
             read.write(&mut self.scratch, tag)?;
@@ -2388,13 +2458,40 @@ impl Output {
         }
         Ok(())
     }
-    fn write_packed(&mut self, path: Option<&str>, bytes: &[u8]) -> Result<()> {
+    fn write_packed_mates(
+        &mut self,
+        paths: [Option<&str>; 2],
+        data: [&mut Vec<u8>; 2],
+    ) -> Result<()> {
+        #[cfg(feature = "native")]
+        if let Some(pair) = &mut self.paired_gzip {
+            pair.write(0, data[0])?;
+            return pair.write(1, data[1]);
+        }
+        let [first, second] = data;
+        self.write_packed(paths[0], first)?;
+        self.write_packed(paths[1], second)
+    }
+    /// A direct writer takes the buffer itself; the chunk recycles an empty one.
+    fn write_packed(&mut self, path: Option<&str>, bytes: &mut Vec<u8>) -> Result<()> {
+        #[cfg(feature = "native")]
+        if let Some(writer) = path.and_then(|p| self.direct.get_mut(p)) {
+            return writer.write_owned(std::mem::take(bytes));
+        }
         if let Some(writer) = path.and_then(|p| self.writers.get_mut(p)) {
             writer.write_all(bytes)?;
         }
         Ok(())
     }
     fn finish(self) -> Result<()> {
+        #[cfg(feature = "native")]
+        if let Some(pair) = self.paired_gzip {
+            pair.finish()?;
+        }
+        #[cfg(feature = "native")]
+        for (_, w) in self.direct {
+            w.finish()?;
+        }
         for (_, w) in self.writers {
             w.finish()?;
         }
@@ -3096,15 +3193,23 @@ impl Engine {
             None
         };
         // Decoding one large member in parallel costs about 2.5 times zlib's CPU
-        // per byte, so it pays off only when decoding limits the run: a single
-        // input (a second brings its own decoder and the compressors need the
-        // cores) whose output is not gzip, or whose qualities are binned, which
-        // makes compressing the output cheap. Otherwise the extra CPU comes out
-        // of processing and compression.
-        let gzip_out = io::CompressionFormat::from_path(&a.output) == io::CompressionFormat::Gzip;
-        io::set_split_decoding(
-            a.input2.is_none() && (!gzip_out || io::binned_gzip_input(&a.input)),
-        );
+        // per byte and holds the regions in flight in memory, so it pays off
+        // only when decoding limits the run. For a single input that is output
+        // that is not gzip, or binned qualities, which make compressing the
+        // output cheap. Paired inputs share the decoding threads and need
+        // uncompressed output: any compression limits the run before two
+        // sequential decoders do.
+        let output = io::CompressionFormat::from_path(&a.output);
+        let split = if a.input2.is_none() {
+            output != io::CompressionFormat::Gzip || io::binned_gzip_input(&a.input)
+        } else {
+            output == io::CompressionFormat::None
+        };
+        io::set_split_decoding(if split {
+            1 + usize::from(a.input2.is_some())
+        } else {
+            0
+        });
         let mut reader1 = Reader::open(&a.input, a.phred64)?;
         let mut reader2 = a
             .input2
@@ -3123,9 +3228,7 @@ impl Engine {
                 .all(|path| std::fs::metadata(path).is_ok_and(|m| m.is_file()));
         // Borrowed parsing also works synchronously. Only reading ahead requires
         // regular files; pipes must stay on this thread for prompt cancellation.
-        // Interleaved stdin has no evaluation prefix. Keep local interleaved
-        // sampling on the owned path until that separate path is generalized.
-        let raw_input = pack_main_output(&a) && (!a.interleaved_in || a.input == "-");
+        let raw_input = pack_main_output(&a);
         // Read once and retain the sample: this works for pipes, HTTP, and S3 too.
         let auto = |seq: &Option<String>| seq.as_deref().is_none_or(|s| s == "auto");
         let needs_adapter_sample = !a.disable_adapter_trimming
@@ -3148,27 +3251,34 @@ impl Engine {
         let mut sample_count = 0;
         if raw_input {
             while sample_count < sample_limit && sample_bases < 151 * 256 * 1024 {
-                let Some(blocks) = block::read_sample_batch(
-                    &mut reader1,
-                    reader2.as_mut(),
-                    a.batch_bytes.min(2 * 1024 * 1024),
-                    sample_limit - sample_count,
-                    151 * 256 * 1024 - sample_bases,
-                )?
-                else {
-                    break;
+                let budget = a.batch_bytes.min(2 * 1024 * 1024);
+                let remaining = sample_limit - sample_count;
+                let base_limit = 151 * 256 * 1024 - sample_bases;
+                let block = if a.interleaved_in {
+                    block::read_sample_batch::<true>(&mut reader1, None, budget, remaining, base_limit)?
+                } else {
+                    block::read_sample_batch::<false>(
+                        &mut reader1,
+                        reader2.as_mut(),
+                        budget,
+                        remaining,
+                        base_limit,
+                    )?
                 };
+                let Some(blocks) = block else { break };
+                let stride = if a.interleaved_in { 2 } else { 1 };
+                // Validate the entire evaluation sample even when a read limit
+                // later selects only its prefix. The base budget counts R1 only.
                 for index in 0..blocks[0].len() {
-                    // Preserve validation of the entire evaluation sample, including
-                    // when --reads_to_process subsequently processes only its prefix.
-                    for mate in &blocks {
-                        if mate.len() > 0 {
-                            mate.read(index, sample_count + index, a.phred64)?;
-                        }
+                    blocks[0].read(index, sample_count * stride + index, a.phred64)?;
+                    if blocks[1].len() > 0 {
+                        blocks[1].read(index, sample_count + index, a.phred64)?;
                     }
-                    sample_bases += blocks[0].sequence(index).len();
+                    if index % stride == 0 {
+                        sample_bases += blocks[0].sequence(index).len();
+                    }
                 }
-                sample_count += blocks[0].len();
+                sample_count += blocks[0].len() / stride;
                 sampled_raw.push_back(ReadBatch {
                     duplicate_flags: None,
                     raw: Some(blocks),
@@ -3222,10 +3332,17 @@ impl Engine {
         let sample_sequences = |mate: usize| -> Vec<&[u8]> {
             if raw_input {
                 sampled_raw
-                    .iter()
-                    .flat_map(|b| {
-                        let records = &b.raw.as_ref().unwrap()[mate];
-                        (0..records.len()).map(|i| records.sequence(i))
+                    .par_iter()
+                    .flat_map_iter(|b| {
+                        let blocks = b.raw.as_ref().unwrap();
+                        let (records, start, stride) = if a.interleaved_in {
+                            (&blocks[0], mate, 2)
+                        } else {
+                            (&blocks[mate], 0, 1)
+                        };
+                        (start..records.len())
+                            .step_by(stride)
+                            .map(|i| records.sequence(i))
                     })
                     .collect()
             } else {
@@ -3319,12 +3436,7 @@ impl Engine {
             prefix_digits: a.split_prefix_digits,
         };
         let mut out = Output::new(a);
-        for path in [Some(a.output.as_str()), a.output2.as_deref()]
-            .into_iter()
-            .flatten()
-        {
-            out.open(path, a, split.clone())?;
-        }
+        out.open_main(a, &split)?;
         for path in [
             a.merged_out.as_deref(),
             a.unpaired1.as_deref(),
@@ -3560,9 +3672,9 @@ impl Engine {
                 dst.merge(src);
             }
             if let Some(mut packed) = chunk.packed {
-                out.write_packed(main1, &packed.output[0])?;
-                out.write_packed(main2, &packed.output[1])?;
-                out.write_packed(merged, &packed.output[2])?;
+                let [first, second, third] = &mut packed.output;
+                out.write_packed_mates([main1, main2], [first, second])?;
+                out.write_packed(merged, third)?;
                 stats.count += packed.count;
                 stats.merged_pairs += packed.merged_pairs;
                 stats.duplicates += packed.duplicates;

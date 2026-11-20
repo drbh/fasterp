@@ -35,12 +35,16 @@ fn with_member_size(member: Vec<u8>) -> Vec<u8> {
 }
 
 pub(crate) fn threads_per_output(outputs: usize) -> usize {
-    // Share the compression budget across files, leaving room for decoding and
-    // processing. A single output can use the whole budget.
-    num_cpus::get()
-        .div_ceil(2)
-        .clamp(1, 8)
-        .div_ceil(outputs.max(1))
+    // Share the compression budget across files. A single output can use the
+    // whole budget.
+    compression_budget(num_cpus::get()).div_ceil(outputs.max(1))
+}
+
+/// Compression is the slowest stage when writing gzip, so it gets every core
+/// except four, which stay free for decoding, the workers and the writer.
+/// Small machines keep at least half of their cores for compression.
+fn compression_budget(cpus: usize) -> usize {
+    cpus.saturating_sub(4).max(cpus.div_ceil(2)).clamp(1, 12)
 }
 
 impl FormatSpec for Gzip {
@@ -99,6 +103,12 @@ mod tests {
     use super::*;
     use gzp::{par::compress::ParCompressBuilder, ZWriter};
     use std::io::{Read, Write};
+
+    #[test]
+    fn compression_budget_leaves_cores_for_processing() {
+        let budgets: Vec<_> = [1, 2, 4, 8, 10, 14, 16, 32].map(compression_budget).into();
+        assert_eq!(budgets, [1, 1, 2, 4, 6, 10, 12, 12]);
+    }
 
     #[test]
     fn parallel_members_roundtrip_levels_boundaries_and_empty_output() {

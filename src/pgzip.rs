@@ -991,11 +991,13 @@ pub(crate) fn decompress_source(
     }
 }
 
-/// Region size for files: `REGION`, unless tests asked for smaller regions
-/// so that small inputs cross many of them.
+/// Region size for files: `REGION` shared between the inputs being decoded,
+/// unless tests asked for smaller regions so that small inputs cross many of
+/// them. Two inputs with full regions each ran no faster and held twice the
+/// decoded output in memory.
 fn region_size() -> usize {
     match crate::io::forced_split_region() {
-        0 => REGION,
+        0 => REGION / crate::io::split_decoding_inputs().max(1),
         size => size,
     }
 }

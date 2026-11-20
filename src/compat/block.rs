@@ -1,6 +1,8 @@
 //! Bounded FASTQ batches. Fields borrow their batch until worker output is packed.
 //! The slow boundary path accepts the same strict four-line format as Reader,
 //! including skipping blank lines between records.
+mod newlines;
+
 use super::{Read, Reader};
 use anyhow::{ensure, Result};
 use std::borrow::Cow;
@@ -144,14 +146,14 @@ pub(super) fn read_interleaved_batch(
     read_batch_inner::<false, true>(first, None, budget, pairs, usize::MAX)
 }
 
-pub(super) fn read_sample_batch(
+pub(super) fn read_sample_batch<const INTERLEAVED: bool>(
     first: &mut Reader,
     second: Option<&mut Reader>,
     budget: usize,
     limit: usize,
     base_limit: usize,
 ) -> Result<Option<[Records; 2]>> {
-    read_batch_inner::<true, false>(first, second, budget, limit, base_limit)
+    read_batch_inner::<true, INTERLEAVED>(first, second, budget, limit, base_limit)
 }
 
 fn read_batch_inner<const SAMPLE: bool, const INTERLEAVED: bool>(
@@ -162,6 +164,15 @@ fn read_batch_inner<const SAMPLE: bool, const INTERLEAVED: bool>(
     base_limit: usize,
 ) -> Result<Option<[Records; 2]>> {
     let mut blocks: [Records; 2] = std::array::from_fn(|_| Records::reused());
+    // A new buffer grown by doubling copies itself several times before it
+    // holds a batch, so give it the byte budget it is expected to fill.
+    // Reused buffers already have about that capacity.
+    let share = if second.is_some() { budget / 2 } else { budget };
+    for block in &mut blocks[..1 + usize::from(second.is_some())] {
+        if block.data.capacity() == 0 {
+            block.data.reserve_exact(share.min(16 << 20));
+        }
+    }
     let mut bases = 0;
     let stride = if INTERLEAVED { 2 } else { 1 };
     while blocks[0].len() / stride < limit
@@ -177,8 +188,8 @@ fn read_batch_inner<const SAMPLE: bool, const INTERLEAVED: bool>(
             Some(r) => Some(r.inner.fill_buf()?),
             None => None,
         };
-        let mut newlines1 = memchr::memchr_iter(b'\n', b1);
-        let mut newlines2 = b2.map(|b| memchr::memchr_iter(b'\n', b));
+        let mut newlines1 = newlines::offsets(b1);
+        let mut newlines2 = b2.map(newlines::offsets);
         let base = [blocks[0].data.len(), blocks[1].data.len()];
         let used = base[0] + base[1];
         let mut count = 0;
@@ -392,6 +403,20 @@ mod tests {
     }
 
     #[test]
+    fn interleaved_sample_budget_counts_first_mates_and_keeps_whole_pairs() {
+        let data = b"@a/1\nAC\n+\nII\n@a/2\nAAAAA\n+\nIIIII\n@b/1\nGT\n+\nII\n@b/2\nC\n+\nI\n@c/1\nA\n+\nI\n@c/2\nC\n+\nI\n";
+        for capacity in 1..=data.len() {
+            let mut source = reader(data, capacity, false);
+            let block = read_sample_batch::<true>(&mut source, None, 1024, 99, 4)
+                .unwrap()
+                .unwrap();
+            assert_eq!(block[0].len(), 4);
+            assert_eq!(block[0].name(3), b"@b/2");
+            assert_eq!(source.next().unwrap().unwrap().name.as_ref(), b"@c/1");
+        }
+    }
+
+    #[test]
     fn sample_base_limit_matches_owned_prefix_without_consuming_extra_records() {
         let data = b"@a\r\nAC\r\n+\r\nII\r\n@b\nACGTA\n+\nIIIII\n@c\nT\n+\nI";
         for capacity in 1..=data.len() + 1 {
@@ -407,7 +432,7 @@ mod tests {
                     names.push(r.name.into_owned());
                 }
                 let mut source = reader(data, capacity, false);
-                let batch = read_sample_batch(&mut source, None, 1024, 99, base_limit)
+                let batch = read_sample_batch::<false>(&mut source, None, 1024, 99, base_limit)
                     .unwrap()
                     .unwrap();
                 assert_eq!(
@@ -526,7 +551,7 @@ mod tests {
                 assert_eq!(interleaved, all, "capacity={capacity}");
 
                 let mut source = reader(messy.as_bytes(), capacity, false);
-                let batch = read_sample_batch(&mut source, None, 20000, 99, 3)
+                let batch = read_sample_batch::<false>(&mut source, None, 20000, 99, 3)
                     .unwrap()
                     .unwrap();
                 assert_eq!(batch_names(&batch)[0], names(&["@a", "@b"]));

@@ -846,12 +846,25 @@ impl Drop for PrefetchInput {
 }
 
 /// Open input file, URL, S3, or stdin with automatic decompression.
-static SPLIT_DECODING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Inputs that share the parallel decoding threads, or 0 when large
+/// single-member gzip inputs are decoded sequentially.
+static SPLIT_DECODING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
-/// Whether large single-member gzip inputs opened from now on are decoded in
-/// parallel regions (`pgzip`) rather than by one sequential decoder.
-pub(crate) fn set_split_decoding(enabled: bool) {
-    SPLIT_DECODING.store(enabled, std::sync::atomic::Ordering::Relaxed);
+/// Decode the large single-member gzip inputs opened from now on in parallel
+/// regions (`pgzip`), sharing the decoding threads between `inputs` of them,
+/// or by one sequential decoder each when `inputs` is 0.
+pub(crate) fn set_split_decoding(inputs: usize) {
+    SPLIT_DECODING.store(inputs, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub(crate) fn split_decoding_inputs() -> usize {
+    SPLIT_DECODING.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Decoding threads for each of `inputs` inputs. Two inputs with the full
+/// count each were slower than sharing it, and held more regions in memory.
+fn split_decoding_threads(cpus: usize, inputs: usize) -> usize {
+    cpus.div_ceil(2).clamp(2, 8).div_ceil(inputs.max(1)).max(2)
 }
 
 /// Compressed bytes per region when tests force parallel decoding, or 0.
@@ -926,13 +939,14 @@ pub(crate) fn open_input(path: &str) -> Result<Box<dyn BufRead + Send>> {
                     hashed: 0,
                 }));
             }
+            let inputs = split_decoding_inputs();
             let split = forced_split_region() > 0
-                || SPLIT_DECODING.load(std::sync::atomic::Ordering::Relaxed)
+                || inputs > 0
                     && std::fs::metadata(path).is_ok_and(|m| crate::pgzip::worth_it(m.len()));
             if local && split {
                 // One large member: decode regions of it in parallel.
                 drop(buffered);
-                let threads = num_cpus::get().div_ceil(2).clamp(2, 8);
+                let threads = split_decoding_threads(num_cpus::get(), inputs);
                 let (sender, receiver) = crossbeam_channel::bounded(crate::pgzip::OUTPUT_DEPTH);
                 // Finished buffers go back to the decoder for reuse; the
                 // channel holds every buffer that can exist, so none is freed.
@@ -994,6 +1008,16 @@ fn buffer_input(raw: Box<dyn Read + Send>) -> std::io::Result<BufReader<Box<dyn 
 #[cfg(test)]
 mod input_tests {
     use super::*;
+
+    #[test]
+    fn paired_inputs_share_the_decoding_threads() {
+        for (cpus, one, two) in [(1, 2, 2), (4, 2, 2), (8, 4, 2), (14, 7, 4), (32, 8, 4)] {
+            assert_eq!(split_decoding_threads(cpus, 1), one);
+            assert_eq!(split_decoding_threads(cpus, 2), two);
+            // Tests can force parallel decoding while it is otherwise off.
+            assert_eq!(split_decoding_threads(cpus, 0), one);
+        }
+    }
 
     fn read_all(path: &std::path::Path) -> std::io::Result<Vec<u8>> {
         let mut out = Vec::new();
