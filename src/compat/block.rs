@@ -84,6 +84,7 @@ impl Records {
         } else {
             self.ends[index - 1][3]
         };
+        let record_start = start;
         let fields = self.ends[index].map(|end| {
             let line = &self.data[start..end];
             start = end;
@@ -91,7 +92,12 @@ impl Records {
             Cow::Borrowed(line.strip_suffix(b"\r").unwrap_or(line))
         });
         let [name, seq, plus, qual] = fields;
+        let record = &self.data[record_start..start];
+        let verbatim = (record.ends_with(b"\n")
+            && record.len() == name.len() + seq.len() + plus.len() + qual.len() + 4)
+            .then_some(record);
         let mut read = Read {
+            verbatim,
             name,
             seq,
             plus,
@@ -349,6 +355,38 @@ mod tests {
             read.write(&mut out, None).unwrap();
         }
         out
+    }
+
+    #[test]
+    fn verbatim_records_require_matching_fields_and_all_four_newlines() {
+        for (data, eligible) in [
+            (&b"@a\nACGT\n+a\nIIII\n"[..], true),
+            (b"@a\r\nACGT\n+a\nIIII\n", false),
+            (b"@a\r\nACGT\n+a\nIIII", false),
+        ] {
+            let mut source = reader(data, 64, false);
+            let records = read_batch(&mut source, None, 1024, 1).unwrap().unwrap();
+            let r = records[0].read(0, 0, false).unwrap();
+            assert_eq!(r.verbatim.is_some(), eligible);
+            for (mut r, tag, expected) in [
+                (r.clone(), None, &b"@a\nACG\n+a\nIII\n"[..]),
+                (r.clone(), Some("tag"), b"@a tag\nACG\n+a\nIII\n"),
+            ] {
+                r.resize(3);
+                let mut out = Vec::new();
+                r.write(&mut out, tag).unwrap();
+                assert_eq!(out, expected);
+            }
+            let mut renamed = r.clone();
+            renamed.name_mut().push(b'b');
+            let mut out = Vec::new();
+            renamed.write(&mut out, None).unwrap();
+            assert_eq!(out, b"@ab\nACGT\n+a\nIIII\n");
+            let mut out = Vec::new();
+            r.write(&mut out, Some("tag")).unwrap();
+            assert_eq!(out, b"@a tag\nACGT\n+a\nIIII\n");
+            assert!(records[0].read(0, 0, true).unwrap().verbatim.is_none());
+        }
     }
 
     #[test]

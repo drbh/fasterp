@@ -26,12 +26,12 @@ pub const FASTP_VERSION: &str = "1.4.0";
 
 #[derive(Clone, Debug, Default)]
 struct Read<'a> {
+    // Canonical LF-delimited input, while all four fields still match it.
+    verbatim: Option<&'a [u8]>,
     name: Cow<'a, [u8]>,
     seq: Cow<'a, [u8]>,
     plus: Cow<'a, [u8]>,
     qual: Cow<'a, [u8]>,
-    original: Option<Box<(Cow<'a, [u8]>, Cow<'a, [u8]>)>>,
-    track_changes: bool,
 }
 
 impl<'a> Read<'a> {
@@ -59,22 +59,24 @@ impl<'a> Read<'a> {
             record
         );
         if phred64 {
+            self.verbatim = None;
             self.qual.to_mut().iter_mut().for_each(|q| *q -= 31);
         }
         Ok(())
     }
 
+    fn name_mut(&mut self) -> &mut Vec<u8> {
+        self.verbatim = None;
+        self.name.to_mut()
+    }
+
     fn into_owned(self) -> Read<'static> {
         Read {
+            verbatim: None,
             name: Cow::Owned(self.name.into_owned()),
             seq: Cow::Owned(self.seq.into_owned()),
             plus: Cow::Owned(self.plus.into_owned()),
             qual: Cow::Owned(self.qual.into_owned()),
-            original: self.original.map(|b| {
-                let (seq, qual) = *b;
-                Box::new((Cow::Owned(seq.into_owned()), Cow::Owned(qual.into_owned())))
-            }),
-            track_changes: self.track_changes,
         }
     }
 
@@ -89,7 +91,7 @@ impl<'a> Read<'a> {
     }
     fn resize(&mut self, len: usize) {
         if len < self.seq.len() {
-            self.save_original();
+            self.verbatim = None;
         }
         for field in [&mut self.seq, &mut self.qual] {
             match field {
@@ -102,7 +104,7 @@ impl<'a> Read<'a> {
     fn trim_front(&mut self, len: usize) {
         let len = len.min(self.seq.len());
         if len > 0 {
-            self.save_original();
+            self.verbatim = None;
         }
         for field in [&mut self.seq, &mut self.qual] {
             match field {
@@ -114,13 +116,18 @@ impl<'a> Read<'a> {
         }
     }
 
-    fn save_original(&mut self) {
-        if self.track_changes && self.original.is_none() {
-            self.original = Some(Box::new((self.seq.clone(), self.qual.clone())));
+    fn borrowed_bases(&self) -> Option<(&'a [u8], &'a [u8])> {
+        match (&self.seq, &self.qual) {
+            (Cow::Borrowed(seq), Cow::Borrowed(qual)) => Some((seq, qual)),
+            _ => None,
         }
     }
 
     fn write(&self, writer: &mut impl Write, tag: Option<&str>) -> Result<()> {
+        if let (Some(bytes), None) = (self.verbatim, tag) {
+            writer.write_all(bytes)?;
+            return Ok(());
+        }
         writer.write_all(&self.name)?;
         if let Some(tag) = tag {
             writer.write_all(b" ")?;
@@ -188,8 +195,7 @@ impl Reader {
     }
 
     fn read_into(&mut self, read: &mut Read) -> Result<bool> {
-        read.original = None;
-        read.track_changes = false;
+        read.verbatim = None;
         let mut lines = [
             read.name.to_mut(),
             read.seq.to_mut(),
@@ -251,50 +257,57 @@ fn valid_quality(qual: &[u8], offset: u8) -> bool {
     }) == 0
 }
 
-/// 5-mer codes A=0 C=1 G=2 T=3 (either case); 4 for anything else.
-const KMER_CODE: [u8; 256] = {
-    let mut lut = [4u8; 256];
-    let bases = *b"ACGTacgt";
-    let mut i = 0;
-    while i < 8 {
-        lut[bases[i] as usize] = (i % 4) as u8;
-        i += 1;
-    }
-    lut
-};
+// A, C, G, T, and all other bytes. One observation touches only one adjacent
+// pair of counters; totals including ambiguous bases are derived at reporting.
+#[derive(Clone, Copy, Default)]
+struct BaseStats {
+    count: u64,
+    quality_sum: u64,
+}
+type Cycle = [BaseStats; 5];
 
-// Keep the counters touched for one cycle together. The reporting structure
-// stores each counter in a separate vector, which is expensive in this hot loop.
-#[derive(Clone, Default)]
-struct Cycle {
-    total_sum: u64,
-    total_cnt: u64,
-    base_sum: [u64; 4],
-    base_cnt: [u64; 4],
+#[derive(Default)]
+struct KmerWindow {
+    code: usize,
+    valid: usize,
 }
 
-/// Per-cycle counters for the reads added since the last flush, in narrow
-/// integers and one array per counter, so the per-base loop is a handful of
-/// independent vector adds. Totals per cycle come from the read lengths.
-/// Flushed into `Sample::cycles` every 255 reads, before a u8 count or a u16
-/// quality sum (at most 255 * 93) can overflow.
-#[derive(Clone, Default)]
-struct Pending {
-    reads: u32,
-    lengths: Vec<u32>,
-    count: [Vec<u8>; 4],
-    sum: [Vec<u16>; 5],
-    /// Reads per (cycle, quality), 94 qualities per cycle. Consecutive bases
-    /// land in different counters even when their qualities repeat, so the
-    /// increments do not wait on each other like a single histogram's do.
-    quals: Vec<u8>,
+impl KmerWindow {
+    fn add(&mut self, base: u8, counts: &mut [usize; 1024]) {
+        if base < 4 {
+            self.code = ((self.code << 2) | usize::from(base)) & 1023;
+            self.valid += 1;
+            if self.valid >= 5 {
+                counts[self.code] += 1;
+            }
+        } else {
+            self.valid = 0;
+            self.code = 0;
+        }
+    }
+
+    fn add_four(&mut self, bases: [u8; 4], counts: &mut [usize; 1024]) {
+        let [a, b, c, d] = bases;
+        if self.valid >= 4 && (a | b | c | d) < 4 {
+            // The previous four bases and these four contain four overlapping
+            // 5-mers. Extract each independently from the packed eight bases.
+            let next = (a << 6) | (b << 4) | (c << 2) | d;
+            self.code = ((self.code & 255) << 8) | usize::from(next);
+            for shift in [6, 4, 2, 0] {
+                counts[(self.code >> shift) & 1023] += 1;
+            }
+        } else {
+            for base in bases {
+                self.add(base, counts);
+            }
+        }
+    }
 }
 
 #[derive(Clone)]
 struct Sample {
     simple: stats::SimpleStats,
     cycles: Vec<Cycle>,
-    pending: Pending,
     // Separate adjacent updates so long runs of one quality score do not form
     // a dependency chain on a single histogram counter.
     qual_hist: [[usize; 94]; 4],
@@ -308,7 +321,6 @@ impl Default for Sample {
         Self {
             simple: stats::SimpleStats::default(),
             cycles: Vec::new(),
-            pending: Pending::default(),
             qual_hist: [[0; 94]; 4],
             kmers: [0; 1024],
             max_len: 0,
@@ -329,9 +341,7 @@ impl Sample {
         }
     }
 
-    fn merge(&mut self, mut other: Self) {
-        self.flush();
-        other.flush();
+    fn merge(&mut self, other: Self) {
         self.simple.total_reads += other.simple.total_reads;
         self.simple.total_bases += other.simple.total_bases;
         self.simple.q20_bases += other.simple.q20_bases;
@@ -346,11 +356,9 @@ impl Sample {
             self.cycles.resize(other.cycles.len(), Cycle::default());
         }
         for (dst, src) in self.cycles.iter_mut().zip(other.cycles) {
-            dst.total_sum += src.total_sum;
-            dst.total_cnt += src.total_cnt;
-            for base in 0..4 {
-                dst.base_sum[base] += src.base_sum[base];
-                dst.base_cnt[base] += src.base_cnt[base];
+            for (dst, src) in dst.iter_mut().zip(src) {
+                dst.count += src.count;
+                dst.quality_sum += src.quality_sum;
             }
         }
         for (dst, src) in self.qual_hist.iter_mut().zip(other.qual_hist) {
@@ -377,112 +385,79 @@ impl Sample {
                 ora.add(seq);
             }
         }
-        let n = seq.len().min(qual.len());
-        let (seq, qual) = (&seq[..n], &qual[..n]);
-        self.simple.total_reads += 1;
-        self.simple.total_bases += seq.len();
-        self.max_len = self.max_len.max(n);
-        let p = &mut self.pending;
-        if p.lengths.len() <= n {
-            p.lengths.resize(n + 1, 0);
-            for count in &mut p.count {
-                count.resize(n, 0);
-            }
-            for sum in &mut p.sum {
-                sum.resize(n, 0);
-            }
-            p.quals.resize(n * 94, 0);
-        }
-        p.lengths[n] += 1;
-        cycle_counts(p, seq, qual);
-        quality_cycles(&mut p.quals, qual);
-        p.reads += 1;
-        if p.reads == 255 {
-            self.flush();
-        }
-        if !no_kmer {
-            count_kmers(&mut self.kmers, seq);
-        }
-    }
-
-    /// The straightforward per-base version `add_parts` must match.
-    #[cfg(test)]
-    fn add_parts_reference(&mut self, seq: &[u8], qual: &[u8], no_kmer: bool, index: usize) {
-        if let Some(ora) = self.overrep.as_mut() {
-            if index % ora.sampling == 0 {
-                ora.add(seq);
-            }
-        }
         self.simple.total_reads += 1;
         self.simple.total_bases += seq.len();
         self.max_len = self.max_len.max(seq.len());
         if self.cycles.len() < seq.len() {
             self.cycles.resize(seq.len(), Cycle::default());
         }
-        let mut kmer_code = 0usize;
-        let mut valid = 0usize;
-        for (index, ((&b, &q), cycle)) in seq.iter().zip(qual).zip(&mut self.cycles).enumerate() {
+        let mut window = KmerWindow::default();
+        let (bases, remaining_bases) = seq.as_chunks::<4>();
+        let (qualities, remaining_qualities) = qual.as_chunks::<4>();
+        let (cycles, remaining_cycles) = self.cycles[..seq.len()].as_chunks_mut::<4>();
+        let base_index = |b| crate::kmer::base_to_2bit(b).unwrap_or(4) as u8;
+
+        for ((bases, qualities), cycles) in bases.iter().zip(qualities).zip(cycles) {
+            let codes = bases.map(base_index);
+            for i in 0..4 {
+                let q = usize::from(qualities[i] - 33);
+                let base = &mut cycles[i][usize::from(codes[i])];
+                base.count += 1;
+                base.quality_sum += q as u64;
+                self.qual_hist[i][q] += 1;
+            }
+            if !no_kmer {
+                window.add_four(codes, &mut self.kmers);
+            }
+        }
+        for (i, ((&b, &q), cycle)) in remaining_bases
+            .iter()
+            .zip(remaining_qualities)
+            .zip(remaining_cycles)
+            .enumerate()
+        {
+            let code = base_index(b);
             let q = usize::from(q - 33);
-            cycle.total_sum += q as u64;
-            cycle.total_cnt += 1;
-            self.qual_hist[index & 3][q] += 1;
-            if let Some(base) = crate::kmer::base_idx(b) {
-                cycle.base_sum[base] += q as u64;
-                cycle.base_cnt[base] += 1;
-                if !no_kmer {
-                    kmer_code = ((kmer_code << 2) | [0, 3, 1, 2][base]) & 1023;
-                    valid += 1;
-                    if valid >= 5 {
-                        self.kmers[kmer_code] += 1;
-                    }
-                }
-            } else {
-                kmer_code = 0;
-                valid = 0;
+            let base = &mut cycle[usize::from(code)];
+            base.count += 1;
+            base.quality_sum += q as u64;
+            self.qual_hist[i][q] += 1;
+            if !no_kmer {
+                window.add(code, &mut self.kmers);
             }
         }
     }
 
-    /// Move the pending narrow counters into the per-cycle totals.
-    fn flush(&mut self) {
-        let p = &mut self.pending;
-        if p.reads == 0 {
-            return;
+    // A passing prefix contributes to both reports via the shared sample.
+    // Only the removed suffix still needs to be counted before filtering.
+    fn add_removed_tail(&mut self, seq: &[u8], qual: &[u8], kept: usize, no_kmer: bool) {
+        self.simple.total_bases += seq.len() - kept;
+        self.max_len = self.max_len.max(seq.len());
+        if self.cycles.len() < seq.len() {
+            self.cycles.resize(seq.len(), Cycle::default());
         }
-        let cycles = p.lengths.len().saturating_sub(1);
-        if self.cycles.len() < cycles {
-            self.cycles.resize(cycles, Cycle::default());
-        }
-        // Reads longer than cycle i, counted from the longest down.
-        let mut longer = 0u64;
-        for i in (0..cycles).rev() {
-            longer += u64::from(p.lengths[i + 1]);
-            let cycle = &mut self.cycles[i];
-            cycle.total_cnt += longer;
-            cycle.total_sum += u64::from(p.sum[4][i]);
-            for base in 0..4 {
-                cycle.base_cnt[base] += u64::from(p.count[base][i]);
-                cycle.base_sum[base] += u64::from(p.sum[base][i]);
+        let mut window = KmerWindow::default();
+        let code = |b| crate::kmer::base_to_2bit(b).unwrap_or(4) as u8;
+        if !no_kmer {
+            // Seed the window without counting any 5-mer from the prefix.
+            for &b in &seq[kept.saturating_sub(4)..kept] {
+                window.add(code(b), &mut self.kmers);
             }
         }
-        for row in p.quals.chunks_exact(94) {
-            for (dst, &src) in self.qual_hist[0].iter_mut().zip(row) {
-                *dst += usize::from(src);
+        for pos in kept..seq.len() {
+            let b = code(seq[pos]);
+            let q = usize::from(qual[pos] - 33);
+            let base = &mut self.cycles[pos][usize::from(b)];
+            base.count += 1;
+            base.quality_sum += q as u64;
+            self.qual_hist[pos & 3][q] += 1;
+            if !no_kmer {
+                window.add(b, &mut self.kmers);
             }
-        }
-        p.quals.fill(0);
-        p.reads = 0;
-        p.lengths.fill(0);
-        for count in &mut p.count {
-            count.fill(0);
-        }
-        for sum in &mut p.sum {
-            sum.fill(0);
         }
     }
 
     fn finish_summary(&mut self) {
-        self.flush();
         // Derive totals from the histograms instead of rescanning reads.
         self.simple.q20_bases = self
             .qual_hist
@@ -502,7 +477,7 @@ impl Sample {
         self.simple.gc_bases = self
             .cycles
             .iter()
-            .map(|c| (c.base_cnt[2] + c.base_cnt[3]) as usize)
+            .map(|cycle| (cycle[1].count + cycle[2].count) as usize)
             .sum();
     }
 
@@ -511,11 +486,12 @@ impl Sample {
         p.ensure_capacity(self.cycles.len());
         p.qual_hist = std::array::from_fn(|q| self.qual_hist.iter().map(|h| h[q]).sum());
         for (i, cycle) in self.cycles.iter().enumerate() {
-            p.total_sum[i] = cycle.total_sum;
-            p.total_cnt[i] = cycle.total_cnt;
-            for base in 0..4 {
-                p.base_sum[base][i] = cycle.base_sum[base];
-                p.base_cnt[base][i] = cycle.base_cnt[base];
+            p.total_sum[i] = cycle.iter().map(|base| base.quality_sum).sum();
+            p.total_cnt[i] = cycle.iter().map(|base| base.count).sum();
+            // PositionStats uses A, T, C, G order.
+            for (dst, src) in [0, 3, 1, 2].into_iter().enumerate() {
+                p.base_sum[dst][i] = cycle[src].quality_sum;
+                p.base_cnt[dst][i] = cycle[src].count;
             }
         }
         let mut content = p.to_content_curves();
@@ -547,62 +523,6 @@ impl Sample {
             "quality_curves":p.to_quality_curves(), "content_curves":content,
             "qual_hist":p.to_qual_hist(), "kmer_count":kmers,
             "overrepresented_sequences":self.overrep.as_ref().map(Overrep::report).unwrap_or_default()})
-    }
-}
-
-/// Base counts and quality sums per cycle. Branch-free: every lane adds 0 or 1
-/// and its quality or 0, so this vectorizes across cycles. `| 0x20` folds
-/// lowercase bases onto uppercase.
-fn cycle_counts(p: &mut Pending, seq: &[u8], qual: &[u8]) {
-    let n = seq.len();
-    let [a, t, c, g] = &mut p.count;
-    let (a, t, c, g) = (&mut a[..n], &mut t[..n], &mut c[..n], &mut g[..n]);
-    let [sa, st, sc, sg, all] = &mut p.sum;
-    let (sa, st, sc, sg, all) = (
-        &mut sa[..n],
-        &mut st[..n],
-        &mut sc[..n],
-        &mut sg[..n],
-        &mut all[..n],
-    );
-    for i in 0..n {
-        let b = seq[i] | 0x20;
-        let q = qual[i].wrapping_sub(33);
-        let is = [b == b'a', b == b't', b == b'c', b == b'g'].map(u8::from);
-        a[i] += is[0];
-        t[i] += is[1];
-        c[i] += is[2];
-        g[i] += is[3];
-        sa[i] += u16::from(q & is[0].wrapping_neg());
-        st[i] += u16::from(q & is[1].wrapping_neg());
-        sc[i] += u16::from(q & is[2].wrapping_neg());
-        sg[i] += u16::from(q & is[3].wrapping_neg());
-        all[i] += u16::from(q);
-    }
-}
-
-fn quality_cycles(quals: &mut [u8], qual: &[u8]) {
-    // Qualities are validated to 33..=126, so `min` only removes the bounds check.
-    for (row, &q) in quals.chunks_exact_mut(94).zip(qual) {
-        row[usize::from(q - 33).min(93)] += 1;
-    }
-}
-
-fn count_kmers(kmers: &mut [usize; 1024], seq: &[u8]) {
-    let mut kmer_code = 0usize;
-    let mut valid = 0usize;
-    for &b in seq {
-        let code = KMER_CODE[usize::from(b)];
-        if code < 4 {
-            kmer_code = ((kmer_code << 2) | usize::from(code)) & 1023;
-            valid += 1;
-            if valid >= 5 {
-                kmers[kmer_code] += 1;
-            }
-        } else {
-            kmer_code = 0;
-            valid = 0;
-        }
     }
 }
 
@@ -985,7 +905,7 @@ fn add_umi(r: &mut Read, umi: &[u8], a: &Args) {
         tag.push(b'_');
     }
     tag.extend_from_slice(umi);
-    r.name.to_mut().splice(pos..pos, tag);
+    r.name_mut().splice(pos..pos, tag);
 }
 
 fn umi(r1: &mut Read, r2: Option<&mut Read>, a: &Args) {
@@ -1681,11 +1601,7 @@ impl PackedChunk {
         }
         if self.recycled.limit > 0 {
             if let Some(first) = p.reads[0].take() {
-                let mut pair = (first, p.reads[1].take());
-                for read in std::iter::once(&mut pair.0).chain(pair.1.iter_mut()) {
-                    read.original = None;
-                    read.track_changes = false;
-                }
+                let pair = (first, p.reads[1].take());
                 self.recycled
                     .put((pair.0.into_owned(), pair.1.map(Read::into_owned)));
             }
@@ -1794,7 +1710,7 @@ fn process<'a>(
         for r in std::iter::once(&mut r1).chain(r2.iter_mut()) {
             if r.name.ends_with(b"/1") || r.name.ends_with(b"/2") {
                 let pos = r.name.len() - 2;
-                r.name.to_mut().insert(pos, b' ');
+                r.name_mut().insert(pos, b' ');
             }
         }
     }
@@ -1844,8 +1760,8 @@ fn process<'a>(
     // Exact overlaps need no correction or mutable copies.
     if a.correction && ov.as_ref().is_some_and(|o| o.diff > 0) {
         if let (Some(r2), Some(ov)) = (r2.as_mut(), ov.as_ref()) {
-            r1.save_original();
-            r2.save_original();
+            r1.verbatim = None;
+            r2.verbatim = None;
             let seq1 = r1.seq.clone();
             let seq2 = r2.seq.clone();
             let correction = overlap::correct_by_overlap(
@@ -2181,17 +2097,17 @@ fn process_chunk<'a>(
     };
     let mut overlap_scratch = Vec::new();
     for (index, pair) in pairs.enumerate() {
-        let (mut r1, mut r2) = pair?;
+        let (r1, r2) = pair?;
         let ordinal = start + index;
-        if shared_stats {
-            r1.track_changes = true;
-            if let Some(r2) = &mut r2 {
-                r2.track_changes = true;
-            }
-        } else {
-            chunk.before[0].add_at(&r1, a.no_kmer, ordinal);
-            if let Some(r2) = &r2 {
-                chunk.before[1].add_at(r2, a.no_kmer, ordinal);
+        let mut original = [None; 2];
+        for (i, r) in [Some(&r1), r2.as_ref()].into_iter().enumerate() {
+            if let Some(r) = r {
+                if shared_stats {
+                    original[i] = r.borrowed_bases();
+                }
+                if original[i].is_none() {
+                    chunk.before[i].add_at(r, a.no_kmer, ordinal);
+                }
             }
         }
         let positions = duplication
@@ -2209,19 +2125,21 @@ fn process_chunk<'a>(
                 .enumerate()
                 .filter_map(|(i, r)| r.as_ref().map(|r| (i, r)))
             {
-                if passing && r.original.is_none() {
-                    // The same bases and qualities contribute to both
-                    // reports. Count them once, then merge the totals.
-                    shared[i].add_at(r, a.no_kmer, ordinal);
-                } else {
-                    if let Some(original) = &r.original {
-                        chunk.before[i].add_parts(&original.0, &original.1, a.no_kmer, ordinal);
-                    } else {
-                        chunk.before[i].add_at(r, a.no_kmer, ordinal);
+                if let Some((seq, qual)) = original[i] {
+                    // A borrowed slice with the same start is an unchanged
+                    // prefix, even when trimming has shortened its tail.
+                    if passing && r.seq.as_ptr() == seq.as_ptr() && r.qual.as_ptr() == qual.as_ptr()
+                    {
+                        shared[i].add_at(r, a.no_kmer, ordinal);
+                        if r.seq.len() < seq.len() {
+                            chunk.before[i].add_removed_tail(seq, qual, r.seq.len(), a.no_kmer);
+                        }
+                        continue;
                     }
-                    if passing {
-                        chunk.after[i].add_at(r, a.no_kmer, 0);
-                    }
+                    chunk.before[i].add_parts(seq, qual, a.no_kmer, ordinal);
+                }
+                if passing {
+                    chunk.after[i].add_at(r, a.no_kmer, 0);
                 }
             }
         } else if profile_after_in_worker {
@@ -4061,9 +3979,12 @@ mod tests {
 
     #[test]
     fn vectorized_sample_matches_per_base_reference() {
+        // Lengths up to 300 cover every tail of the four-base loop, and
+        // one-read samples merged in exercise flush and merge.
         let mut fast = Sample::default();
-        let mut reference = Sample::default();
         let mut merged = Sample::default();
+        let mut kmers = [0; 1024];
+        let mut cycles = vec![[(0u64, 0u64); 5]; 301];
         let mut state = 140u64;
         for ordinal in 0..2000 {
             let mut seq = Vec::new();
@@ -4074,26 +3995,65 @@ mod tests {
                 qual.push(33 + ((state >> 24) % 94) as u8);
             }
             fast.add_parts(&seq, &qual, false, ordinal);
-            reference.add_parts_reference(&seq, &qual, false, ordinal);
-            // One-read samples merged in exercise flush and merge.
             let mut part = Sample::default();
             part.add_parts(&seq, &qual, false, ordinal);
             merged.merge(part);
+            crate::kmer::count_k5_2bit(&seq, &mut kmers);
+            for (i, (&b, &q)) in seq.iter().zip(&qual).enumerate() {
+                let base = b"ACGT"
+                    .iter()
+                    .position(|&c| c == b.to_ascii_uppercase())
+                    .unwrap_or(4);
+                cycles[i][base].0 += 1;
+                cycles[i][base].1 += u64::from(q - 33);
+            }
         }
-        for sample in [&mut fast, &mut reference, &mut merged] {
+        for sample in [&mut fast, &mut merged] {
             sample.finish_summary();
         }
+        assert_eq!(merged.details(), fast.details());
         for sample in [&fast, &merged] {
-            assert_eq!(sample.details(), reference.details());
-            assert_eq!(sample.cycles.len(), reference.cycles.len());
-            for (x, y) in sample.cycles.iter().zip(&reference.cycles) {
-                assert_eq!(
-                    (x.total_sum, x.total_cnt, x.base_sum, x.base_cnt),
-                    (y.total_sum, y.total_cnt, y.base_sum, y.base_cnt)
-                );
+            assert_eq!(sample.kmers, kmers);
+            for (i, expected) in cycles.iter().enumerate() {
+                let actual = sample
+                    .cycles
+                    .get(i)
+                    .map_or([(0, 0); 5], |cycle| cycle.map(|b| (b.count, b.quality_sum)));
+                assert_eq!(actual, *expected, "cycle {i}");
             }
-            assert_eq!(sample.kmers, reference.kmers);
-            assert_eq!(sample.simple.gc_bases, reference.simple.gc_bases);
+        }
+    }
+
+    #[test]
+    fn shared_prefix_and_removed_tail_reconstruct_full_read_statistics() {
+        let seq: Vec<_> = b"gggACGTcacgtNXaTACGA"
+            .iter()
+            .copied()
+            .cycle()
+            .take(105)
+            .collect();
+        let qual: Vec<_> = (33..=126).cycle().take(seq.len()).collect();
+        for no_kmer in [false, true] {
+            for kept in 0..=seq.len() {
+                let mut expected = Sample::default();
+                expected.add_parts(&seq, &qual, no_kmer, 0);
+                let mut prefix = Sample::default();
+                prefix.add_parts(&seq[..kept], &qual[..kept], no_kmer, 0);
+                let mut before = Sample::default();
+                before.add_removed_tail(&seq, &qual, kept, no_kmer);
+                before.merge(prefix);
+                assert_eq!(before.simple.total_reads, expected.simple.total_reads);
+                assert_eq!(before.simple.total_bases, expected.simple.total_bases);
+                assert_eq!(before.max_len, expected.max_len);
+                assert_eq!(before.kmers, expected.kmers);
+                assert_eq!(before.qual_hist, expected.qual_hist);
+                for (actual, expected) in before.cycles.iter().zip(&expected.cycles) {
+                    assert_eq!(
+                        actual.map(|b| (b.count, b.quality_sum)),
+                        expected.map(|b| (b.count, b.quality_sum))
+                    );
+                }
+            }
         }
     }
 
@@ -4103,6 +4063,7 @@ mod tests {
         let mut simple = stats::SimpleStats::default();
         let mut kmers = [0; 1024];
         let mut qualities = [0; 94];
+        let mut cycles = vec![[(0u64, 0u64); 5]; 256];
         let mut state = 140u64;
         for ordinal in 0..1000 {
             let mut read = Read::default();
@@ -4123,8 +4084,14 @@ mod tests {
                 metrics.gc,
             );
             crate::kmer::count_k5_2bit(&read.seq, &mut kmers);
-            for &q in read.qual.iter() {
+            for (i, (&b, &q)) in read.seq.iter().zip(read.qual.iter()).enumerate() {
                 qualities[usize::from(q - 33)] += 1;
+                let base = b"ACGT"
+                    .iter()
+                    .position(|&c| c == b.to_ascii_uppercase())
+                    .unwrap_or(4);
+                cycles[i][base].0 += 1;
+                cycles[i][base].1 += u64::from(q - 33);
             }
         }
         sample.finish_summary();
@@ -4133,6 +4100,9 @@ mod tests {
             serde_json::to_value(simple.to_read_stats()).unwrap()
         );
         assert_eq!(sample.kmers, kmers);
+        for (cycle, expected) in sample.cycles.iter().zip(cycles) {
+            assert_eq!(cycle.map(|base| (base.count, base.quality_sum)), expected);
+        }
         for (q, expected) in qualities.into_iter().enumerate() {
             assert_eq!(
                 sample.qual_hist.iter().map(|h| h[q]).sum::<usize>(),
