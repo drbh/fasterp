@@ -15,6 +15,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 mod block;
+#[cfg(target_arch = "aarch64")]
+mod duplication_neon;
 
 pub const FASTP_VERSION: &str = "1.4.0";
 
@@ -625,7 +627,7 @@ impl Overrep {
         steps.sort_unstable();
         for group in steps.chunk_by(|a, b| a == b) {
             let step = group[0];
-            let threshold = match step {
+            let threshold: usize = match step {
                 n if n >= len.saturating_sub(1) => 3,
                 100.. => 5,
                 40.. => 20,
@@ -633,11 +635,39 @@ impl Overrep {
                 10.. => 500,
                 _ => continue,
             };
+            // fastp excludes the window ending exactly at the read end.
+            let windows = || {
+                reads[..sampled]
+                    .iter()
+                    .flat_map(|read| read.seq[..read.seq.len().saturating_sub(1)].windows(step))
+            };
+            let window_count: usize = reads[..sampled]
+                .iter()
+                .map(|read| read.seq.len().saturating_sub(step))
+                .sum();
             let mut frequencies = FxHashMap::default();
-            for read in &reads[..sampled] {
-                // fastp excludes the window ending exactly at the read end.
-                let sequence = &read.seq[..read.seq.len().saturating_sub(1)];
-                for window in sequence.windows(step) {
+            if step >= 8 && window_count >= 4096 {
+                // Every occurrence of a sequence increments the same bucket.
+                // Collisions can only admit extra windows to the exact count.
+                let buckets = window_count.min(1 << 20).next_power_of_two() * 2;
+                let shift = 64 - buckets.trailing_zeros();
+                let bucket = |w: &[u8]| {
+                    let prefix = u64::from_le_bytes(w[..8].try_into().unwrap());
+                    let suffix = u64::from_le_bytes(w[w.len() - 8..].try_into().unwrap());
+                    ((prefix ^ suffix.rotate_left(29)).wrapping_mul(0x9e3779b97f4a7c15) >> shift)
+                        as usize
+                };
+                let mut estimates = vec![0u16; buckets];
+                let cutoff = threshold.div_ceil(group.len()) as u16;
+                for window in windows() {
+                    let count = &mut estimates[bucket(window)];
+                    *count = count.saturating_add(1);
+                }
+                for window in windows().filter(|w| estimates[bucket(w)] >= cutoff) {
+                    *frequencies.entry(window).or_insert(0usize) += group.len();
+                }
+            } else {
+                for window in windows() {
                     *frequencies.entry(window).or_insert(0usize) += group.len();
                 }
             }
@@ -667,12 +697,18 @@ impl Overrep {
     fn new(candidates: &BTreeMap<Vec<u8>, usize>, len: usize, sampling: usize) -> Self {
         Self {
             counts: candidates.keys().cloned().map(|s| (s, 0)).collect(),
-            steps: [10, 20, 40, 100, 150.min(len.saturating_sub(2)).max(1)],
+            steps: [10, 20, 40, 100, 150.min(len.saturating_sub(2)).max(1)].map(|step| {
+                if candidates.keys().any(|seq| seq.len() == step) {
+                    step
+                } else {
+                    0
+                }
+            }),
             sampling,
         }
     }
     fn add(&mut self, seq: &[u8]) {
-        for step in self.steps {
+        for step in self.steps.into_iter().filter(|&step| step != 0) {
             let mut i = 0;
             while i < seq.len().saturating_sub(step) {
                 if let Some(n) = self.counts.get_mut(&seq[i..i + step]) {
@@ -1018,8 +1054,8 @@ struct Duplication {
 }
 
 enum BloomPages {
-    Dense(Vec<BloomPage>),
-    Sparse(FxHashMap<u64, BloomPage>),
+    Dense(BucketTable),
+    Sparse(SparseBuckets),
 }
 
 // Keep small sets of exact offsets inline. Spill to a short vector for
@@ -1104,11 +1140,124 @@ impl BloomPage {
     }
 }
 
+// Pack fixed-width offsets in a word, using zero as the empty-slot marker.
+// The top bit records membership of offset zero.
+#[derive(Default)]
+struct Bucket<const WIDTH: u32 = 11>(u64);
+
+impl<const WIDTH: u32> Bucket<WIDTH> {
+    const MASK: u64 = (1 << WIDTH) - 1;
+    const LANES: u32 = 63 / WIDTH;
+    const ONES: u64 = ((1 << (WIDTH * Self::LANES)) - 1) / Self::MASK;
+
+    /// A full bucket returns None for an unseen nonzero offset.
+    fn check_and_set(&mut self, offset: u16) -> Option<bool> {
+        const ZERO: u64 = 1 << 63;
+        if offset == 0 {
+            let seen = self.0 & ZERO != 0;
+            self.0 |= ZERO;
+            return Some(seen);
+        }
+        let value = u64::from(offset);
+        let diff = self.0 ^ (value * Self::ONES);
+        // Subtract one in every lane. A zero lane borrows into its high bit.
+        if diff.wrapping_sub(Self::ONES) & !diff & (Self::ONES << (WIDTH - 1)) != 0 {
+            return Some(true);
+        }
+        if self.0 & (Self::MASK << (WIDTH * (Self::LANES - 1))) != 0 {
+            return None;
+        }
+        self.0 = (self.0 & ZERO) | (self.0 << WIDTH) | value;
+        Some(false)
+    }
+}
+
+struct BucketTable {
+    buckets: Vec<Bucket>,
+    overflow: Vec<Option<Box<BloomPage>>>,
+}
+
+impl BucketTable {
+    // Default-level hashes use 32 address bits. Reversing the bytes spreads
+    // clustered hashes across buckets while preserving every bit identity.
+    #[inline]
+    fn address(pos: u64) -> u64 {
+        u64::from((pos as u32).swap_bytes())
+    }
+
+    fn new(pages: usize) -> Self {
+        Self {
+            buckets: std::iter::repeat_with(Bucket::default)
+                .take(pages * 16)
+                .collect(),
+            overflow: std::iter::repeat_with(|| None).take(pages).collect(),
+        }
+    }
+
+    #[inline]
+    fn prefetch(&self, bit: u64) {
+        let ptr = self.buckets.as_ptr().wrapping_add((bit >> 11) as usize);
+        #[cfg(target_arch = "aarch64")]
+        // SAFETY: the hint does not dereference or modify memory.
+        unsafe {
+            std::arch::asm!("prfm pldl1keep, [{ptr}]", ptr = in(reg) ptr,
+                options(nostack, preserves_flags, readonly));
+        }
+        #[cfg(target_arch = "x86_64")]
+        // SAFETY: the pointer addresses an allocated bucket and this is a cache hint.
+        unsafe {
+            std::arch::x86_64::_mm_prefetch::<{ std::arch::x86_64::_MM_HINT_T0 }>(ptr.cast());
+        }
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        let _ = ptr;
+    }
+
+    fn check_and_set(&mut self, bit: u64) -> bool {
+        if let Some(seen) = self.buckets[(bit >> 11) as usize].check_and_set((bit & 2047) as u16) {
+            return seen;
+        }
+        self.overflow[(bit >> 15) as usize]
+            .get_or_insert_with(Default::default)
+            .check_and_set((bit & 32767) as u16)
+    }
+}
+
+// A sparse directory across each larger address space. Allocate the 256-byte
+// groups on first access. Four 13-bit offsets fit in a bucket, so most probes
+// finish there. Crowded buckets share an overflow page per 32768 bits.
+struct SparseBuckets {
+    groups: Vec<Option<Box<[Bucket<13>; 32]>>>,
+    overflow: FxHashMap<u64, BloomPage>,
+}
+
+impl SparseBuckets {
+    fn new(bits: u64) -> Self {
+        Self {
+            groups: std::iter::repeat_with(|| None)
+                .take((bits >> 18) as usize)
+                .collect(),
+            overflow: FxHashMap::default(),
+        }
+    }
+
+    fn check_and_set(&mut self, bit: u64) -> bool {
+        let group = self.groups[(bit >> 18) as usize]
+            .get_or_insert_with(|| Box::new(std::array::from_fn(|_| Bucket::default())));
+        if let Some(seen) = group[((bit >> 13) & 31) as usize].check_and_set((bit & 8191) as u16) {
+            return seen;
+        }
+        self.overflow
+            .entry(bit >> 15)
+            .or_default()
+            .check_and_set((bit & 32767) as u16)
+    }
+}
+
 impl BloomPages {
-    fn page(&mut self, index: u64) -> &mut BloomPage {
+    fn check_and_set(&mut self, bit: u64) -> bool {
         match self {
-            Self::Dense(pages) => &mut pages[index as usize],
-            Self::Sparse(pages) => pages.entry(index).or_default(),
+            Self::Dense(table) => table.check_and_set(BucketTable::address(bit)),
+            Self::Sparse(table) => table.check_and_set(bit),
         }
     }
 }
@@ -1142,19 +1291,15 @@ impl Duplication {
         let bits = (1u64 << 32) * scale;
         let pages = (bits / 8 / 4096) as usize;
         // Direct lookup for the default two directories. Higher accuracies
-        // allocate only the pages seen, including on very small inputs.
+        // allocate groups of buckets on demand.
         let dense = pages * n <= 2 * (1 << 17);
         Self {
             buffers: (0..n)
                 .map(|_| {
                     if dense {
-                        BloomPages::Dense(
-                            std::iter::repeat_with(BloomPage::default)
-                                .take(pages)
-                                .collect(),
-                        )
+                        BloomPages::Dense(BucketTable::new(pages))
                     } else {
-                        BloomPages::Sparse(FxHashMap::default())
+                        BloomPages::Sparse(SparseBuckets::new(bits))
                     }
                 })
                 .collect(),
@@ -1163,39 +1308,49 @@ impl Duplication {
         }
     }
     fn hasher(&self) -> DuplicationHash {
-        #[cfg(target_arch = "aarch64")]
-        let (pair_primes, pair_bias) = if self.buffers.len() == 2 {
-            // For two hashes every prime * nucleotide code fits in u32. The
-            // position-only term is independent of the read and is added once.
-            let primes: Vec<u32> = self.primes.iter().map(|&p| p as u32).collect();
-            assert!(primes.iter().all(|&p| p <= u32::MAX / 222));
-            let mut bias = vec![[0u64; 8]; 513];
-            for pos in 0..512 {
-                bias[pos + 1] = bias[pos];
-                for i in 0..2 {
-                    bias[pos + 1][i] += self.primes[pos * 2 + i] * pos as u64;
-                }
-            }
-            (primes, bias)
-        } else {
-            (Vec::new(), Vec::new())
-        };
         DuplicationHash {
             buffers: self.buffers.len(),
             primes: self.primes.clone(),
             #[cfg(target_arch = "aarch64")]
-            pair_primes,
-            #[cfg(target_arch = "aarch64")]
-            pair_bias,
+            pair: (self.buffers.len() == 2).then(|| duplication_neon::PairHash::new(&self.primes)),
         }
     }
 
-    fn check_positions(&mut self, positions: [u64; 8]) -> bool {
+    fn count_packed(&mut self, positions: &[u64]) -> usize {
+        // The two default hash directories fit in a flat table. Bring later
+        // buckets into cache while preserving the original check-and-set order.
+        if let [BloomPages::Dense(a), BloomPages::Dense(b)] = self.buffers.as_mut_slice() {
+            let (pairs, tail) = positions.as_chunks::<2>();
+            debug_assert!(tail.is_empty());
+            let check = |a: &mut BucketTable, b: &mut BucketTable, pair: &[u64; 2]| {
+                usize::from(
+                    a.check_and_set(BucketTable::address(pair[0]))
+                        & b.check_and_set(BucketTable::address(pair[1])),
+                )
+            };
+            const AHEAD: usize = 16;
+            let mut count = 0;
+            for (pair, later) in pairs.iter().zip(pairs.iter().skip(AHEAD)) {
+                a.prefetch(BucketTable::address(later[0]));
+                b.prefetch(BucketTable::address(later[1]));
+                count += check(a, b, pair);
+            }
+            for pair in &pairs[pairs.len().saturating_sub(AHEAD)..] {
+                count += check(a, b, pair);
+            }
+            return count;
+        }
+        positions
+            .chunks_exact(self.buffers.len())
+            .map(|pair| usize::from(self.check_positions(pair)))
+            .sum()
+    }
+
+    fn check_positions(&mut self, positions: &[u64]) -> bool {
         let mut duplicate = true;
         for (buf, pos) in self.buffers.iter_mut().zip(positions) {
             let bit = pos & (self.bits - 1);
-            let page = buf.page(bit / 32768);
-            duplicate &= page.check_and_set((bit % 32768) as u16);
+            duplicate &= buf.check_and_set(bit);
         }
         duplicate
     }
@@ -1205,18 +1360,16 @@ struct DuplicationHash {
     buffers: usize,
     primes: Vec<u64>,
     #[cfg(target_arch = "aarch64")]
-    pair_primes: Vec<u32>,
-    #[cfg(target_arch = "aarch64")]
-    pair_bias: Vec<[u64; 8]>,
+    pair: Option<Box<duplication_neon::PairHash>>,
 }
 
 impl DuplicationHash {
-    fn positions(&self, r1: &Read, r2: Option<&Read>) -> [u64; 8] {
+    fn positions(&self, r1: &[u8], r2: Option<&[u8]>) -> [u64; 8] {
         #[cfg(target_arch = "aarch64")]
-        if self.buffers == 2 && r1.seq.len() + r2.map_or(0, |r| r.seq.len()) <= 512 {
-            // NEON is part of the aarch64 baseline. Longer reads retain the
-            // wrapping scalar algorithm, including its repeated prime table.
-            return unsafe { self.positions_two_neon(r1, r2) };
+        if let Some(table) = &self.pair {
+            if r1.len() + r2.map_or(0, <[u8]>::len) <= 512 {
+                return table.positions(r1, r2, &self.primes);
+            }
         }
         match self.buffers {
             2 => self.positions_with::<2>(r1, r2),
@@ -1226,11 +1379,11 @@ impl DuplicationHash {
         }
     }
 
-    fn positions_with<const N: usize>(&self, r1: &Read, r2: Option<&Read>) -> [u64; 8] {
+    fn positions_with<const N: usize>(&self, r1: &[u8], r2: Option<&[u8]>) -> [u64; 8] {
         let mut positions = [0u64; 8];
         let mut offset = 0;
         for r in std::iter::once(r1).chain(r2) {
-            for (p, &b) in r.seq.iter().enumerate() {
+            for (p, &b) in r.iter().enumerate() {
                 let base = match b {
                     b'A' => 7,
                     b'T' => 222,
@@ -1243,77 +1396,29 @@ impl DuplicationHash {
                     *pos = pos.wrapping_add(prime.wrapping_mul(base + (p + offset) as u64));
                 }
             }
-            offset += r.seq.len();
+            offset += r.len();
         }
         positions
-    }
-
-    #[cfg(target_arch = "aarch64")]
-    unsafe fn positions_two_neon(&self, r1: &Read, r2: Option<&Read>) -> [u64; 8] {
-        use std::arch::aarch64::*;
-        // Each load is bounded by a full 16-byte sequence chunk; the prime
-        // table covers both reads combined (at most 512 bases). Widening sums
-        // preserve the exact u64 hash rather than wrapping intermediate u32s.
-        unsafe {
-            let mut sums = [vdupq_n_u64(0); 2];
-            let mut positions = self.pair_bias[r1.seq.len() + r2.map_or(0, |r| r.seq.len())];
-            let mut offset = 0;
-            for read in std::iter::once(r1).chain(r2) {
-                let mut p = 0;
-                while p + 16 <= read.seq.len() {
-                    let bytes = vld1q_u8(read.seq.as_ptr().add(p));
-                    let mut bases = vdupq_n_u8(13);
-                    for (letter, value) in [(b'A', 7), (b'T', 222), (b'C', 74), (b'G', 31)] {
-                        bases = vbslq_u8(
-                            vceqq_u8(bytes, vdupq_n_u8(letter)),
-                            vdupq_n_u8(value),
-                            bases,
-                        );
-                    }
-                    let low = vmovl_u8(vget_low_u8(bases));
-                    let high = vmovl_high_u8(bases);
-                    let groups = [
-                        vmovl_u16(vget_low_u16(low)),
-                        vmovl_high_u16(low),
-                        vmovl_u16(vget_low_u16(high)),
-                        vmovl_high_u16(high),
-                    ];
-                    for (group, codes) in groups.into_iter().enumerate() {
-                        let primes =
-                            vld2q_u32(self.pair_primes.as_ptr().add((offset + p + group * 4) * 2));
-                        sums[0] = vpadalq_u32(sums[0], vmulq_u32(codes, primes.0));
-                        sums[1] = vpadalq_u32(sums[1], vmulq_u32(codes, primes.1));
-                    }
-                    p += 16;
-                }
-                for (p, &base) in read.seq.iter().enumerate().skip(p) {
-                    let base = match base {
-                        b'A' => 7,
-                        b'T' => 222,
-                        b'C' => 74,
-                        b'G' => 31,
-                        _ => 13,
-                    };
-                    for i in 0..2 {
-                        positions[i] += u64::from(self.pair_primes[(offset + p) * 2 + i]) * base;
-                    }
-                }
-                offset += read.seq.len();
-            }
-            for i in 0..2 {
-                positions[i] = positions[i].wrapping_add(vaddvq_u64(sums[i]));
-            }
-            positions
-        }
     }
 }
 
 struct Config {
+    packed_output: bool,
     args: Args,
     adapters: [Option<adapter::AdapterMatcher>; 2],
     fasta: Vec<adapter::AdapterMatcher>,
     blacklist: [Vec<Vec<u8>>; 2],
     poly_g: bool,
+}
+
+impl Config {
+    fn dedup_before_filtering(&self) -> bool {
+        self.packed_output && self.args.dedup
+    }
+
+    fn profile_after_in_worker(&self) -> bool {
+        self.packed_output || (!self.args.dedup && !self.args.overrepresentation_analysis)
+    }
 }
 
 fn blacklisted(r: &Read, c: &Config, last: bool) -> bool {
@@ -1431,7 +1536,7 @@ struct Chunk<'a> {
 
 struct PackedChunk {
     output: [Vec<u8>; 3],
-    positions: Vec<[u64; 8]>,
+    positions: Vec<u64>,
     duplicates: usize,
     recycled: ReadPool,
     count: usize,
@@ -1472,10 +1577,10 @@ impl Drop for PackedChunk {
 }
 
 impl PackedChunk {
-    fn new(records: usize, recycle_limit: usize, duplication: bool) -> Self {
+    fn new(records: usize, recycle_limit: usize, hashes: usize) -> Self {
         Self {
             output: std::array::from_fn(|_| spare_output()),
-            positions: Vec::with_capacity(if duplication { records } else { 0 }),
+            positions: Vec::with_capacity(records * hashes),
             duplicates: 0,
             recycled: ReadPool {
                 reads: Vec::with_capacity(if recycle_limit == 0 { 0 } else { records }),
@@ -1496,11 +1601,9 @@ impl PackedChunk {
         }
     }
 
-    fn add(&mut self, mut p: Processed, a: &Args, duplication: bool) {
+    fn add(&mut self, mut p: Processed, a: &Args) {
         self.count += 1;
-        if duplication {
-            self.positions.push(p.duplicate_positions);
-        }
+        self.duplicates += usize::from(p.duplicate);
         if !p.skipped {
             self.adapter_reads += p.adapter_reads;
             self.adapter_bases += p.adapter_bases;
@@ -1520,7 +1623,7 @@ impl PackedChunk {
             }
             if let Some(merged) = &p.merged {
                 self.failures[p.failures[0] as usize] += 2;
-                if p.failures[0] == Failure::Pass {
+                if p.failures[0] == Failure::Pass && !p.duplicate {
                     self.merged_pairs += 1;
                     if a.stdout || a.merged_out.is_some() {
                         merged
@@ -1532,7 +1635,10 @@ impl PackedChunk {
                 for (i, read) in p.reads.iter().enumerate() {
                     if let Some(read) = read {
                         self.failures[p.failures[i] as usize] += 1;
-                        if p.failures[i] == Failure::Pass && (a.stdout || a.merged_out.is_some()) {
+                        if p.failures[i] == Failure::Pass
+                            && !p.duplicate
+                            && (a.stdout || a.merged_out.is_some())
+                        {
                             read.write(&mut self.output[2], None)
                                 .expect("writing to Vec cannot fail");
                         }
@@ -1545,7 +1651,7 @@ impl PackedChunk {
                     p.failures[0]
                 };
                 self.failures[failure as usize] += if paired { 2 } else { 1 };
-                if failure == Failure::Pass {
+                if failure == Failure::Pass && !p.duplicate {
                     for (i, read) in p.reads.iter().enumerate() {
                         if let Some(read) = read {
                             if (a.stdout && !a.merge)
@@ -1578,8 +1684,7 @@ impl PackedChunk {
 }
 
 fn pack_main_output(a: &Args) -> bool {
-    !a.dedup
-        && !a.overrepresentation_analysis
+    !a.overrepresentation_analysis
         && a.output != "-"
         && a.output2.as_deref() != Some("-")
         // Shared destinations (including the same S3 key) need interleaved
@@ -1600,12 +1705,10 @@ fn mark_duplicates(chunks: &mut [Chunk], duplication: Option<&mut Duplication>) 
     if let Some(duplication) = duplication {
         for chunk in chunks {
             if let Some(packed) = &mut chunk.packed {
-                for &positions in &packed.positions {
-                    packed.duplicates += usize::from(duplication.check_positions(positions));
-                }
+                packed.duplicates += duplication.count_packed(&packed.positions);
             } else {
                 for p in &mut chunk.processed {
-                    p.duplicate = duplication.check_positions(p.duplicate_positions);
+                    p.duplicate = duplication.check_positions(&p.duplicate_positions);
                 }
             }
         }
@@ -1868,9 +1971,48 @@ fn process<'a>(
 }
 
 struct ReadBatch {
+    duplicate_flags: Option<Vec<bool>>,
     raw: Option<[block::Records; 2]>,
     reads: Vec<(Read<'static>, Option<Read<'static>>)>,
     start: usize,
+}
+
+impl ReadBatch {
+    fn mark_duplicates(&mut self, shared: &Shared, filter: &mut Duplication) {
+        let raw = self
+            .raw
+            .as_ref()
+            .expect("packed output uses raw FASTQ batches");
+        let hasher = shared
+            .hasher
+            .as_ref()
+            .expect("deduplication requires hashes");
+        let interleaved = shared.config.args.interleaved_in;
+        let stride = if interleaved { 2 } else { 1 };
+        // Hash original sequences in parallel, then mark in input order so
+        // the first occurrence still wins across worker and batch boundaries.
+        let positions: Vec<_> = shared.pool().install(|| {
+            (0..raw[0].len() / stride)
+                .into_par_iter()
+                .map(|i| {
+                    let mate = if interleaved {
+                        Some(raw[0].sequence(2 * i + 1))
+                    } else if raw[1].len() > 0 {
+                        Some(raw[1].sequence(i))
+                    } else {
+                        None
+                    };
+                    hasher.positions(raw[0].sequence(i * stride), mate)
+                })
+                .collect()
+        });
+        self.duplicate_flags = Some(
+            positions
+                .iter()
+                .map(|pos| filter.check_positions(pos))
+                .collect(),
+        );
+    }
 }
 
 struct BatchReader {
@@ -1926,6 +2068,7 @@ impl BatchReader {
             let start = self.count;
             self.count += raw[0].len() / if self.interleaved { 2 } else { 1 };
             return Ok(Some(ReadBatch {
+                duplicate_flags: None,
                 raw: Some(raw),
                 reads: Vec::new(),
                 start,
@@ -1992,6 +2135,7 @@ impl BatchReader {
         let start = self.count;
         self.count += batch.len();
         Ok(Some(ReadBatch {
+            duplicate_flags: None,
             raw: None,
             reads: batch,
             start,
@@ -2007,11 +2151,12 @@ fn process_chunk<'a>(
     before: &[Sample; 2],
     after: &[Sample; 2],
     duplication: Option<&DuplicationHash>,
+    duplicate_flags: Option<&[bool]>,
     recycle_limit: usize,
 ) -> Result<Chunk<'a>> {
     let a = &config.args;
-    let profile_after_in_worker = !a.dedup && !a.overrepresentation_analysis;
-    let packed_output = pack_main_output(a);
+    let profile_after_in_worker = config.profile_after_in_worker();
+    let packed_output = config.packed_output;
     let shared_stats = packed_output && !a.merge;
     let mut shared: [Sample; 2] = std::array::from_fn(|_| Sample::default());
     let mut chunk = Chunk {
@@ -2019,8 +2164,9 @@ fn process_chunk<'a>(
         after: std::array::from_fn(|i| after[i].empty_like()),
         after_offset: [0; 2],
         processed: Vec::with_capacity(if packed_output { 0 } else { records }),
-        packed: packed_output
-            .then(|| PackedChunk::new(records, recycle_limit, duplication.is_some())),
+        packed: packed_output.then(|| {
+            PackedChunk::new(records, recycle_limit, duplication.map_or(0, |d| d.buffers))
+        }),
     };
     let mut overlap_scratch = Vec::new();
     for (index, pair) in pairs.enumerate() {
@@ -2039,12 +2185,13 @@ fn process_chunk<'a>(
         }
         let positions = duplication
             .as_ref()
-            .map(|d| d.positions(&r1, r2.as_ref()))
+            .map(|d| d.positions(&r1.seq, r2.as_ref().map(|r| r.seq.as_ref())))
             .unwrap_or([0; 8]);
         let mut p = process(r1, r2, &config, &mut overlap_scratch);
-        p.duplicate_positions = positions;
+        p.duplicate = duplicate_flags.is_some_and(|flags| flags[index]);
         if shared_stats {
-            let passing = !p.skipped && p.failures.iter().all(|f| *f == Failure::Pass);
+            let passing =
+                !p.duplicate && !p.skipped && p.failures.iter().all(|f| *f == Failure::Pass);
             for (i, r) in p
                 .reads
                 .iter()
@@ -2072,8 +2219,12 @@ fn process_chunk<'a>(
             }
         }
         if let Some(packed) = &mut chunk.packed {
-            packed.add(p, a, duplication.is_some());
+            if let Some(d) = duplication {
+                packed.positions.extend_from_slice(&positions[..d.buffers]);
+            }
+            packed.add(p, a);
         } else {
+            p.duplicate_positions = positions;
             chunk.processed.push(p);
         }
     }
@@ -2095,7 +2246,12 @@ fn process_batch(
     duplication: Option<&DuplicationHash>,
     recycle_limit: usize,
 ) -> Result<Vec<Chunk<'static>>> {
-    let ReadBatch { raw, reads, start } = batch;
+    let ReadBatch {
+        raw,
+        reads,
+        start,
+        duplicate_flags: flags,
+    } = batch;
     let threads = pool.current_num_threads();
     let interleaved = config.args.interleaved_in;
     let stride = if interleaved { 2 } else { 1 };
@@ -2107,6 +2263,7 @@ fn process_batch(
     // per-chunk overhead.
     let chunks = (count / 4000).clamp(threads, 4 * threads);
     let chunk_size = count.div_ceil(chunks).max(1);
+    let duplication = if flags.is_some() { None } else { duplication };
     let results: Vec<Result<Chunk<'static>>> = pool.install(|| {
         if let Some(raw) = raw {
             (0..count.div_ceil(chunk_size))
@@ -2134,6 +2291,7 @@ fn process_batch(
                         before,
                         after,
                         duplication,
+                        flags.as_ref().map(|flags| &flags[offset..end]),
                         0,
                     )?;
                     // Borrowed input is used only for packed output. All output
@@ -2163,6 +2321,7 @@ fn process_batch(
                         before,
                         after,
                         duplication,
+                        None,
                         recycle_limit / threads,
                     )
                 })
@@ -2761,6 +2920,26 @@ impl Pipeline {
                 }
             }
         })];
+        let input_rx = if shared.config.dedup_before_filtering() {
+            let mut filter = duplication.take().expect("deduplication requires a filter");
+            let shared = Arc::clone(shared);
+            let (ready, prepared) = crossbeam_channel::bounded(1);
+            threads.push(std::thread::spawn(move || {
+                for batch in input_rx {
+                    let result = batch.map(|mut b| {
+                        b.mark_duplicates(&shared, &mut filter);
+                        b
+                    });
+                    let failed = result.is_err();
+                    if ready.send(result).is_err() || failed {
+                        break;
+                    }
+                }
+            }));
+            prepared
+        } else {
+            input_rx
+        };
         let processed_tx = if duplication.is_some() {
             let (duplicate_tx, duplicate_rx) = crossbeam_channel::bounded::<ProcessedBatch>(1);
             threads.push(std::thread::spawn(move || {
@@ -2991,6 +3170,7 @@ impl Engine {
                 }
                 sample_count += blocks[0].len();
                 sampled_raw.push_back(ReadBatch {
+                    duplicate_flags: None,
                     raw: Some(blocks),
                     reads: Vec::new(),
                     start: 0,
@@ -3117,6 +3297,7 @@ impl Engine {
             a.batch_bytes
         };
         let config = Config {
+            packed_output: raw_input,
             args: a,
             adapters: adapters.map(|a| a.map(adapter::AdapterMatcher::new)),
             fasta: fasta
@@ -3225,7 +3406,7 @@ impl Engine {
         // Compact synchronous jobs use the same batch ceiling as the pipeline,
         // limiting serial parsing work before each parallel processing step.
         // Smaller batches leave the worker pool waiting between them.
-        let max_bytes = if pipelined || pack_main_output(a) {
+        let max_bytes = if pipelined || config.packed_output {
             max_bytes.min(8 * 1024 * 1024)
         } else {
             max_bytes
@@ -3302,9 +3483,16 @@ impl Engine {
                 None => return Ok(false),
             },
             Source::Serial(reader) => match reader.next_batch()? {
-                Some(batch) => {
+                Some(mut batch) => {
+                    let mut filter = self.duplication.as_mut();
+                    if shared.config.dedup_before_filtering() {
+                        batch.mark_duplicates(
+                            &shared,
+                            filter.take().expect("deduplication requires a filter"),
+                        );
+                    }
                     let [before, after] = &shared.templates;
-                    process_batch(
+                    let mut chunks = process_batch(
                         batch,
                         shared.pool(),
                         &shared.config,
@@ -3312,7 +3500,9 @@ impl Engine {
                         after,
                         shared.hasher.as_ref(),
                         shared.recycle_limit,
-                    )?
+                    )?;
+                    mark_duplicates(&mut chunks, filter);
+                    chunks
                 }
                 None => return Ok(false),
             },
@@ -3328,16 +3518,13 @@ impl Engine {
             targets.main2.as_deref(),
             targets.merged.as_deref(),
         );
-        if let Source::Serial(..) = self.source {
-            mark_duplicates(&mut chunks, self.duplication.as_mut());
-        }
         let mut read_pool = ReadPool {
             reads: Vec::with_capacity(chunks.iter().map(|c| c.processed.len()).sum()),
             limit: max_bytes,
             ..ReadPool::default()
         };
         let mut read_pools = Vec::with_capacity(chunks.len() + 1);
-        let profile_after_in_worker = !a.dedup && !a.overrepresentation_analysis;
+        let profile_after_in_worker = shared.config.profile_after_in_worker();
         // Bloom decisions remain ordered. Determine global after-filter indices
         // before parallel profiling so sampling is independent of chunk boundaries.
         let mut offsets = std::array::from_fn(|i| stats.after[i].simple.total_reads);
@@ -3715,6 +3902,31 @@ mod tests {
     }
 
     #[test]
+    fn overrep_bucket_collisions_still_require_exact_counts() {
+        // The 20-base keys share both eight-byte ends and therefore a bucket.
+        // Only the first key reaches the threshold of 100. The trailing byte
+        // gives each read exactly one eligible 20-base window.
+        let reads: Vec<_> = (0..5000)
+            .map(|i| {
+                let mut seq = b"ACGTACGTAAAAACGTACGTN".to_vec();
+                if i >= 100 {
+                    let key = 1 + (i - 100) % 255;
+                    for (j, base) in seq[8..12].iter_mut().enumerate() {
+                        *base = b"ACGT"[(key >> (2 * j)) & 3];
+                    }
+                }
+                Read {
+                    seq: Cow::Owned(seq),
+                    ..Read::default()
+                }
+            })
+            .collect();
+        let found = Overrep::candidates(&reads.iter().collect::<Vec<_>>(), 24);
+        let exact: Vec<_> = found.iter().filter(|(seq, _)| seq.len() == 20).collect();
+        assert_eq!(exact, vec![(&reads[0].seq[..20].to_vec(), &100)]);
+    }
+
+    #[test]
     fn quality_validation_matches_scalar_at_every_byte_and_vector_boundary() {
         for offset in [33, 64] {
             for len in [0, 1, 15, 16, 17, 31, 32, 33, 51, 64, 65, 148, 513] {
@@ -3828,7 +4040,13 @@ mod tests {
             ] {
                 let alphabet = b"ATCGNnatcg\0\xff";
                 let seq: Vec<_> = (0..length)
-                    .map(|i| alphabet[(i * 17 + length) % alphabet.len()])
+                    .map(|i| {
+                        if length == 512 {
+                            i as u8
+                        } else {
+                            alphabet[(i * 17 + length) % alphabet.len()]
+                        }
+                    })
                     .collect();
                 for split in [
                     length,
@@ -3837,14 +4055,7 @@ mod tests {
                     length.min(15),
                     length.min(17),
                 ] {
-                    let first = Read {
-                        seq: seq[..split].to_vec().into(),
-                        ..Read::default()
-                    };
-                    let second = Read {
-                        seq: seq[split..].to_vec().into(),
-                        ..Read::default()
-                    };
+                    let (first, second) = seq.split_at(split);
                     let mut expected = [0u64; 8];
                     let n = duplication.buffers.len();
                     for (p, &b) in seq.iter().enumerate() {
@@ -3863,12 +4074,19 @@ mod tests {
                         }
                     }
                     assert_eq!(
-                        hash.positions(&first, Some(&second)),
+                        hash.positions(first, Some(second)),
                         expected,
                         "level={level}, length={length}, split={split}"
                     );
+                    #[cfg(target_arch = "aarch64")]
+                    if let Some(table) = hash.pair.as_deref().filter(|_| length <= 512) {
+                        assert_eq!(
+                            table.positions_neon(first, Some(second), &hash.primes),
+                            expected
+                        );
+                    }
                     if split == length {
-                        assert_eq!(hash.positions(&first, None), expected);
+                        assert_eq!(hash.positions(first, None), expected);
                     }
                 }
             }
@@ -3966,6 +4184,47 @@ mod tests {
     }
 
     #[test]
+    fn packed_offsets_match_each_lane_and_spill_in_input_order() {
+        for stored in [[1, 2, 3, 4, 5], [2047, 1024, 1023, 16, 15]] {
+            let mut bucket = Bucket::<11>::default();
+            for used in 0..=stored.len() {
+                for offset in 0..2048 {
+                    let mut probe = Bucket::<11>(bucket.0);
+                    let expected = if stored[..used].contains(&offset) {
+                        Some(true)
+                    } else if used < stored.len() || offset == 0 {
+                        Some(false)
+                    } else {
+                        None
+                    };
+                    assert_eq!(probe.check_and_set(offset), expected);
+                }
+                if let Some(&next) = stored.get(used) {
+                    assert_eq!(bucket.check_and_set(next), Some(false));
+                }
+            }
+            assert_eq!(bucket.check_and_set(0), Some(false));
+            assert_eq!(bucket.check_and_set(0), Some(true));
+        }
+
+        let mut table = BucketTable::new(2);
+        let mut reference = [0u8; 8192];
+        for i in 0..200_000u64 {
+            let bit = ((i * 40503) ^ (i / 7)) as usize & 65535;
+            let mask = 1 << (bit % 8);
+            let byte = &mut reference[bit / 8];
+            assert_eq!(table.check_and_set(bit as u64), *byte & mask != 0);
+            *byte |= mask;
+        }
+        for bit in 0..65536 {
+            assert_eq!(
+                table.check_and_set(bit as u64),
+                reference[bit / 8] & (1 << (bit % 8)) != 0
+            );
+        }
+    }
+
+    #[test]
     fn adaptive_bloom_page_preserves_every_bit_through_promotion() {
         let mut page = BloomPage::default();
         let mut reference = [0u8; 4096];
@@ -4004,19 +4263,72 @@ mod tests {
     }
 
     #[test]
+    fn packed_duplicate_counts_match_ordered_bit_sets_across_chunks() {
+        for level in 1..=6 {
+            let mut duplication = Duplication::new(level);
+            let width = duplication.buffers.len();
+            let mut seen = vec![FxHashSet::default(); width];
+            let mut start: usize = 0;
+            for n in [0, 1, 15, 16, 17, 33, 257, 4096] {
+                let mut packed = Vec::new();
+                let mut expected = 0;
+                for i in start..start + n {
+                    let mut duplicate = true;
+                    for (j, set) in seen.iter_mut().enumerate() {
+                        // Independent repeats, collisions between the filters,
+                        // and high address bits that wrap at lower accuracies.
+                        let k = (i / (j + 1)) % (53 + j);
+                        let pos = ((k as u64) << 32) | ((k as u64 & 15) << 24);
+                        duplicate &= !set.insert(pos & (duplication.bits - 1));
+                        packed.push(pos);
+                    }
+                    expected += usize::from(duplicate);
+                }
+                assert_eq!(
+                    duplication.count_packed(&packed),
+                    expected,
+                    "level {level}, batch {n}"
+                );
+                start += n;
+            }
+        }
+    }
+
+    #[test]
+    fn sparse_buckets_preserve_offsets_across_groups_and_overflow() {
+        let bits = 1u64 << 35;
+        let mut buckets = SparseBuckets::new(bits);
+        let mut seen = FxHashSet::default();
+        // The first four nonzero offsets stay inline. The rest spill into
+        // pages shared between buckets, including a dense bitmap in each group.
+        for &base in &[0, 1 << 18, 1 << 32, bits - (1 << 18)] {
+            for bucket in [0, 1, 3, 4, 31] {
+                let start = base + (bucket << 13);
+                for offset in (0..1024).chain((0..8192).rev()) {
+                    let bit = start + offset;
+                    assert_eq!(buckets.check_and_set(bit), !seen.insert(bit), "{bit}");
+                }
+            }
+        }
+        for bit in seen {
+            assert!(buckets.check_and_set(bit), "{bit}");
+        }
+    }
+
+    #[test]
     fn bloom_pages_preserve_bit_addresses_and_order() {
         for level in [1, 3, 6] {
             let mut duplication = Duplication::new(level);
             for bit in [0, 1, 7, 8, 32767, 32768, duplication.bits - 1] {
                 let positions = [bit; 8];
                 assert!(
-                    !duplication.check_positions(positions),
+                    !duplication.check_positions(&positions),
                     "level={level}, bit={bit}"
                 );
-                assert!(duplication.check_positions(positions));
+                assert!(duplication.check_positions(&positions));
             }
             // Addresses wrap modulo the same upstream bit count.
-            assert!(duplication.check_positions([duplication.bits; 8]));
+            assert!(duplication.check_positions(&[duplication.bits; 8]));
         }
     }
 

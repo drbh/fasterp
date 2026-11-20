@@ -4967,6 +4967,62 @@ fn test_dedup_paired_end_exact_duplicates() {
 }
 
 #[test]
+fn dedup_marks_original_sequences_before_quality_filtering_and_trimming() {
+    let dir = TempDir::new().unwrap();
+    let input = dir.path().join("in.fq");
+    let tail = "ACGT".repeat(7);
+    let high = "I".repeat(tail.len() + 1);
+    let low = "!".repeat(tail.len() + 1);
+    let mut records = String::new();
+    for (name, base, quality) in [
+        ("failed_first", 'A', &low),
+        ("passing_first", 'G', &high),
+        ("different_original", 'C', &high),
+        ("repeat_of_failed", 'A', &high),
+        ("repeat_of_passing", 'G', &high),
+    ] {
+        records.push_str(&format!("@{name}\n{base}{tail}\n+\n{quality}\n"));
+    }
+    fs::write(&input, records).unwrap();
+
+    for backlog in ["1", "2"] {
+        let run = Command::new(assert_cmd::cargo::cargo_bin!("fasterp"))
+            .current_dir(dir.path())
+            .args([
+                "-i",
+                "in.fq",
+                "-o",
+                "out.fq",
+                "--dedup",
+                "--disable_adapter_trimming",
+                "--trim_front1",
+                "1",
+                "--batch-bytes",
+                "1",
+                "--max-backlog",
+                backlog,
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            run.status.success(),
+            "{}",
+            String::from_utf8_lossy(&run.stderr)
+        );
+        let output = fs::read_to_string(dir.path().join("out.fq")).unwrap();
+        let expected = ["passing_first", "different_original"]
+            .map(|name| format!("@{name}\n{tail}\n+\n{}\n", &high[1..]))
+            .join("");
+        assert_eq!(output, expected);
+        let report: Value =
+            serde_json::from_slice(&fs::read(dir.path().join("fasterp.json")).unwrap()).unwrap();
+        assert_eq!(report["summary"]["before_filtering"]["total_reads"], 5);
+        assert_eq!(report["summary"]["after_filtering"]["total_reads"], 2);
+        assert_eq!(report["duplication"]["rate"], 0.4);
+    }
+}
+
+#[test]
 fn test_dedup_multithreaded_consistency() {
     let temp_dir = TempDir::new().unwrap();
 
