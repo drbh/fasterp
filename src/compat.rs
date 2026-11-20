@@ -2434,6 +2434,23 @@ fn wasm_pool() -> Result<&'static rayon::ThreadPool> {
     Ok(POOL.get_or_init(|| pool))
 }
 
+/// Stack for each worker. A worker that waits for part of a batch runs other
+/// chunks meanwhile, on the same stack, and with two batches in flight it
+/// can start the next batch there too. Each level holds a chunk's statistics,
+/// about 240 KiB; eleven levels deep was seen, past the 2 MiB a thread gets
+/// by default. This covers one level for every chunk of both batches. Only
+/// the pages a worker touches are ever backed by memory.
+#[cfg(not(target_arch = "wasm32"))]
+const WORKER_STACK: usize = 64 << 20;
+
+#[cfg(not(target_arch = "wasm32"))]
+fn worker_pool(threads: usize) -> Result<rayon::ThreadPool> {
+    Ok(rayon::ThreadPoolBuilder::new()
+        .num_threads(threads)
+        .stack_size(WORKER_STACK)
+        .build()?)
+}
+
 fn worker_threads(a: &Args) -> usize {
     // wasm32-unknown-unknown cannot spawn threads.
     if cfg!(target_arch = "wasm32") {
@@ -2886,6 +2903,19 @@ impl Shared {
     fn pool(&self) -> &rayon::ThreadPool {
         &self.pool
     }
+
+    fn process(&self, batch: ReadBatch) -> ProcessedBatch {
+        let [before, after] = &self.templates;
+        process_batch(
+            batch,
+            self.pool(),
+            &self.config,
+            before,
+            after,
+            self.hasher.as_ref(),
+            self.recycle_limit,
+        )
+    }
 }
 
 type ProcessedBatch = Result<Vec<Chunk<'static>>>;
@@ -2975,23 +3005,60 @@ impl Pipeline {
         };
         let shared = Arc::clone(shared);
         threads.push(std::thread::spawn(move || {
-            for batch in input_rx {
-                let result = batch.and_then(|b| {
-                    let [before, after] = &shared.templates;
-                    process_batch(
-                        b,
-                        shared.pool(),
-                        &shared.config,
-                        before,
-                        after,
-                        shared.hasher.as_ref(),
-                        shared.recycle_limit,
-                    )
-                });
+            // A batch waits for its slowest chunk, often one on an efficiency
+            // core. Starting the next batch meanwhile gives idle workers its
+            // chunks. Results still leave in input order. A few workers are
+            // never idle for long, and a second batch only costs memory.
+            let in_flight = if shared.pool().current_num_threads() > 4 {
+                2
+            } else {
+                1
+            };
+            type Running = crossbeam_channel::Receiver<std::thread::Result<ProcessedBatch>>;
+            let mut running: VecDeque<Running> = VecDeque::with_capacity(in_flight);
+            let mut input = input_rx.into_iter();
+            let mut reading = true;
+            loop {
+                while reading && running.len() < in_flight {
+                    let Some(batch) = input.next() else {
+                        reading = false;
+                        break;
+                    };
+                    let (done, result) = crossbeam_channel::bounded(1);
+                    match batch {
+                        Ok(batch) => {
+                            let job = Arc::clone(&shared);
+                            shared.pool().spawn(move || {
+                                let result =
+                                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                        job.process(batch)
+                                    }));
+                                let _ = done.send(result);
+                            });
+                        }
+                        Err(error) => {
+                            reading = false;
+                            let _ = done.send(Ok(Err(error)));
+                        }
+                    }
+                    running.push_back(result);
+                }
+                let Some(next) = running.pop_front() else {
+                    break;
+                };
+                let result = match next.recv() {
+                    Ok(Ok(result)) => result,
+                    Ok(Err(panic)) => std::panic::resume_unwind(panic),
+                    Err(_) => unreachable!("a processing job always reports"),
+                };
                 let failed = result.is_err();
                 if processed_tx.send(result).is_err() || failed {
                     break;
                 }
+            }
+            // Let started jobs finish before the pipeline reports it stopped.
+            for next in running {
+                let _ = next.recv();
             }
         }));
         Self {
@@ -3278,9 +3345,7 @@ impl Engine {
         };
         let threads = worker_threads(&a);
         #[cfg(not(target_arch = "wasm32"))]
-        let owned_pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(threads)
-            .build()?;
+        let owned_pool = worker_pool(threads)?;
         #[cfg(not(target_arch = "wasm32"))]
         let pool = &owned_pool;
         #[cfg(target_arch = "wasm32")]
@@ -3521,16 +3586,7 @@ impl Engine {
                             filter.take().expect("deduplication requires a filter"),
                         );
                     }
-                    let [before, after] = &shared.templates;
-                    let mut chunks = process_batch(
-                        batch,
-                        shared.pool(),
-                        &shared.config,
-                        before,
-                        after,
-                        shared.hasher.as_ref(),
-                        shared.recycle_limit,
-                    )?;
+                    let mut chunks = shared.process(batch)?;
                     mark_duplicates(&mut chunks, filter);
                     chunks
                 }
@@ -3915,6 +3971,22 @@ fn escape_html(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn workers_have_room_for_nested_batches() {
+        #[inline(never)]
+        fn descend(levels: usize) -> usize {
+            // One level's worth of chunk statistics.
+            let frame = std::hint::black_box([1u8; 240 << 10]);
+            if levels == 0 {
+                return frame[0] as usize;
+            }
+            descend(levels - 1) + frame[frame.len() - 1] as usize
+        }
+        // Four times the deepest nesting seen with two batches in flight.
+        let pool = worker_pool(2).unwrap();
+        assert_eq!(pool.install(|| descend(44)), 45);
+    }
 
     #[test]
     fn overrep_counts_repeated_window_lengths_and_excludes_final_window() {
