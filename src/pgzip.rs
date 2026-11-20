@@ -97,19 +97,46 @@ impl<'a> Bits<'a> {
 
 // huffman
 
-const PRIMARY: u32 = 10;
-
-/// Two-level decode table. A primary entry is `symbol << 8 | length`, or
-/// `offset << 8 | 0x80 | sub_bits` pointing at a subtable for longer codes,
-/// whose entries are `symbol << 8 | (length - PRIMARY)`. Length 0 is invalid.
-struct Huffman {
-    table: Vec<u32>,
+/// A two-level decode table for a canonical Huffman code, indexed by the
+/// next `P` bits. Its entries carry everything a symbol needs, so decoding
+/// one is a lookup, a shift and at most one add:
+///
+/// * bits 0..8: bits to consume, the code length plus the symbol's extra bits;
+/// * bits 8..12: the code length, to shift the extra bits down;
+/// * bits 16..32: the symbol, a literal byte, a length or distance base, or
+///   the start of a subtable for longer codes (then bits 8..12 hold the
+///   subtable's index width and the entry consumes the `P` bits that led to
+///   it; subtable entries count their code length from there).
+///
+/// The buffer is kept between blocks, which each bring their own codes.
+#[derive(Default)]
+struct Table<const P: u32> {
+    entries: Vec<u32>,
 }
 
-impl Huffman {
-    /// Canonical code for `lens`, or `None` if it is over-subscribed, or
-    /// incomplete with more than a single one-bit code (zlib's rule).
-    fn new(lens: &[u8]) -> Option<Self> {
+/// Set on literal entries.
+const LITERAL: u32 = 1 << 15;
+/// Set on every entry that is not a symbol, literal, length or distance.
+const SPECIAL: u32 = 1 << 14;
+/// With `SPECIAL`: the entry points at a subtable.
+const SUBTABLE: u32 = 1 << 13;
+/// With `SPECIAL`: the end-of-block symbol.
+const END: u32 = 1 << 12;
+/// An unused code, or a symbol deflate does not define.
+const INVALID: u32 = SPECIAL;
+
+/// Index bits for literal/length codes, distance codes and the code that
+/// compresses their lengths, which is at most seven bits long.
+const LITLEN: u32 = 10;
+const DISTANCE: u32 = 8;
+const LENGTHS: u32 = 7;
+
+impl<const P: u32> Table<P> {
+    /// Fill the table for the canonical code `lens`, with `entry` giving a
+    /// symbol's entry from its code length. Returns false if the code is
+    /// over-subscribed, or incomplete with more than a single one-bit code
+    /// (zlib's rule).
+    fn build(&mut self, lens: &[u8], entry: impl Fn(usize, u32) -> u32) -> bool {
         let mut count = [0u16; 16];
         for &l in lens {
             count[usize::from(l)] += 1;
@@ -120,14 +147,14 @@ impl Huffman {
         for (len, &c) in count.iter().enumerate().skip(1) {
             left = (left << 1) - i32::from(c);
             if left < 0 {
-                return None;
+                return false;
             }
             if c > 0 {
                 max = len;
             }
         }
         if left > 0 && max > 1 {
-            return None;
+            return false;
         }
         let mut next = [0u32; 16];
         let mut code = 0u32;
@@ -135,72 +162,151 @@ impl Huffman {
             code = (code + u32::from(count[len - 1])) << 1;
             next[len] = code;
         }
-        let primary = 1usize << PRIMARY;
-        let mut table = vec![0u32; primary];
-        let reverse = |code: u32, len: usize| code.reverse_bits() >> (32 - len);
-        let mut long = Vec::new();
+        let primary = 1usize << P;
+        let table = &mut self.entries;
+        table.clear();
+        table.resize(primary, INVALID);
+        let reverse = |code: u32, len: usize| (code.reverse_bits() >> (32 - len)) as usize;
+        if max <= P as usize {
+            for (sym, &l) in lens.iter().enumerate() {
+                let len = usize::from(l);
+                if len == 0 {
+                    continue;
+                }
+                let rev = reverse(next[len], len);
+                next[len] += 1;
+                let e = entry(sym, len as u32);
+                for j in (rev..primary).step_by(1 << len) {
+                    table[j] = e;
+                }
+            }
+            return true;
+        }
+        // Widths of the subtables that long codes need, by primary index.
+        let mut starts = next;
+        let mut width = [0u8; 1 << 10];
+        for &l in lens {
+            let len = usize::from(l);
+            if len == 0 {
+                continue;
+            }
+            let rev = reverse(starts[len], len);
+            starts[len] += 1;
+            if len > P as usize {
+                let slot = &mut width[rev & (primary - 1)];
+                *slot = (*slot).max((len - P as usize) as u8);
+            }
+        }
+        for (p, &bits) in width[..primary].iter().enumerate() {
+            if bits > 0 {
+                table[p] =
+                    (table.len() as u32) << 16 | SPECIAL | SUBTABLE | u32::from(bits) << 8 | P;
+                table.resize(table.len() + (1 << bits), INVALID);
+            }
+        }
         for (sym, &l) in lens.iter().enumerate() {
             let len = usize::from(l);
             if len == 0 {
                 continue;
             }
-            let rev = reverse(next[len], len) as usize;
+            let rev = reverse(next[len], len);
             next[len] += 1;
-            if len <= PRIMARY as usize {
+            if len <= P as usize {
+                let e = entry(sym, len as u32);
                 for j in (rev..primary).step_by(1 << len) {
-                    table[j] = (sym as u32) << 8 | len as u32;
+                    table[j] = e;
                 }
             } else {
-                long.push((sym, len, rev));
-            }
-        }
-        if !long.is_empty() {
-            let mut sub_len = vec![0usize; primary];
-            for &(_, len, rev) in &long {
                 let p = rev & (primary - 1);
-                sub_len[p] = sub_len[p].max(len - PRIMARY as usize);
-            }
-            for (p, &bits) in sub_len.iter().enumerate() {
-                if bits > 0 {
-                    table[p] = (table.len() as u32) << 8 | 0x80 | bits as u32;
-                    table.resize(table.len() + (1 << bits), 0);
-                }
-            }
-            for (sym, len, rev) in long {
-                let p = rev & (primary - 1);
-                let bits = sub_len[p];
-                let offset = (table[p] >> 8) as usize;
-                let extra = len - PRIMARY as usize;
-                for j in ((rev >> PRIMARY)..(1 << bits)).step_by(1 << extra) {
-                    table[offset + j] = (sym as u32) << 8 | extra as u32;
+                let offset = (table[p] >> 16) as usize;
+                let extra = len - P as usize;
+                let e = entry(sym, extra as u32);
+                for j in ((rev >> P)..(1 << width[p])).step_by(1 << extra) {
+                    table[offset + j] = e;
                 }
             }
         }
-        Some(Self { table })
+        true
     }
 
-    /// Needs at least 15 bits in `bits`.
+    /// The entry for the next code in `bits`, following a subtable pointer
+    /// and consuming its primary bits. Needs at least 15 bits in `bits`.
     #[inline(always)]
-    fn decode(&self, bits: &mut Bits) -> Option<u32> {
-        let e = self.table[(bits.buf & ((1 << PRIMARY) - 1)) as usize];
-        if e & 0x80 == 0 {
-            let len = e & 15;
-            if len == 0 {
-                return None;
+    fn entry(&self, bits: &mut Bits) -> u32 {
+        // SAFETY: the primary table has `1 << P` entries, and a subtable
+        // pointer addresses `1 << width` entries from its start.
+        unsafe {
+            let e = *self
+                .entries
+                .get_unchecked((bits.buf & ((1 << P) - 1)) as usize);
+            if e & (SPECIAL | SUBTABLE) != SPECIAL | SUBTABLE {
+                return e;
             }
-            bits.consume(len);
-            Some(e >> 8)
-        } else {
-            let sub = ((bits.buf >> PRIMARY) & ((1 << (e & 15)) - 1)) as usize;
-            let e2 = self.table[(e >> 8) as usize + sub];
-            let len = e2 & 15;
-            if len == 0 {
-                return None;
-            }
-            bits.consume(PRIMARY + len);
-            Some(e2 >> 8)
+            bits.consume(P);
+            let width = (e >> 8) & 15;
+            let index = (e >> 16) as usize + (bits.buf & ((1 << width) - 1)) as usize;
+            *self.entries.get_unchecked(index)
         }
     }
+}
+
+impl Table<LITLEN> {
+    fn litlen(&mut self, lens: &[u8]) -> bool {
+        self.build(lens, |sym, len| match sym {
+            0..=255 => (sym as u32) << 16 | LITERAL | len << 8 | len,
+            256 => SPECIAL | END | len << 8 | len,
+            257..=285 => {
+                let extra = u32::from(LEN_EXTRA[sym - 257]);
+                u32::from(LEN_BASE[sym - 257]) << 16 | len << 8 | (len + extra)
+            }
+            _ => INVALID,
+        })
+    }
+}
+
+impl Table<DISTANCE> {
+    fn distance(&mut self, lens: &[u8]) -> bool {
+        self.build(lens, |sym, len| match sym {
+            0..=29 => {
+                let extra = u32::from(DIST_EXTRA[sym]);
+                u32::from(DIST_BASE[sym]) << 16 | len << 8 | (len + extra)
+            }
+            _ => INVALID,
+        })
+    }
+}
+
+impl Table<LENGTHS> {
+    fn lengths(&mut self, lens: &[u8]) -> bool {
+        self.build(lens, |sym, len| (sym as u32) << 16 | len << 8 | len)
+    }
+
+    /// The next code-length symbol. Needs at least 7 bits in `bits`.
+    #[inline(always)]
+    fn decode(&self, bits: &mut Bits) -> Option<u32> {
+        let e = self.entries[(bits.buf & ((1 << LENGTHS) - 1)) as usize];
+        if e & SPECIAL != 0 {
+            return None;
+        }
+        bits.consume(e & 0xff);
+        Some(e >> 16)
+    }
+}
+
+/// The base of a length or distance entry plus its extra bits, taken from
+/// `saved`, the bit buffer before the entry was consumed.
+#[inline(always)]
+fn with_extra(entry: u32, saved: u64) -> usize {
+    let extra = (saved & ((1u64 << (entry & 0xff)) - 1)) >> ((entry >> 8) & 15);
+    (entry >> 16) as usize + extra as usize
+}
+
+/// The literal/length and distance tables of a block.
+#[derive(Default)]
+struct Tables {
+    litlen: Table<LITLEN>,
+    distance: Table<DISTANCE>,
+    lengths: Table<LENGTHS>,
 }
 
 const LEN_BASE: [u16; 29] = [
@@ -222,56 +328,61 @@ const CODE_ORDER: [usize; 19] = [
     16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15,
 ];
 
-fn fixed_tables() -> (Huffman, Huffman) {
+fn fixed_tables() -> Tables {
     let mut lens = [0u8; 288];
     lens[..144].fill(8);
     lens[144..256].fill(9);
     lens[256..280].fill(7);
     lens[280..].fill(8);
-    (
-        Huffman::new(&lens).unwrap(),
-        Huffman::new(&[5u8; 32]).unwrap(),
-    )
+    let mut tables = Tables::default();
+    assert!(tables.litlen.litlen(&lens) && tables.distance.distance(&[5u8; 32]));
+    tables
 }
 
-/// The litlen and distance codes of a dynamic block, after its 3 header bits.
-fn dynamic_tables(bits: &mut Bits) -> Option<(Huffman, Huffman)> {
+/// Read the literal/length and distance codes of a dynamic block, after its
+/// 3 header bits, into `tables`. Returns false if they are invalid.
+fn dynamic_tables(bits: &mut Bits, tables: &mut Tables) -> bool {
     let hlit = bits.take(5) as usize + 257;
     let hdist = bits.take(5) as usize + 1;
     let hclen = bits.take(4) as usize + 4;
     if hlit > 286 || hdist > 30 {
-        return None;
+        return false;
     }
     let mut code_lens = [0u8; 19];
     for &i in &CODE_ORDER[..hclen] {
         code_lens[i] = bits.take(3) as u8;
     }
-    let codes = Huffman::new(&code_lens)?;
+    if !tables.lengths.lengths(&code_lens) {
+        return false;
+    }
     let mut lens = [0u8; 286 + 30];
     let total = hlit + hdist;
     let mut i = 0;
     while i < total {
         bits.refill();
-        let sym = codes.decode(bits)?;
+        let Some(sym) = tables.lengths.decode(bits) else {
+            return false;
+        };
         let (value, repeat) = match sym {
             0..=15 => (sym as u8, 1),
-            16 => (*lens[..i].last()?, 3 + bits.take(2) as usize),
+            16 => {
+                let Some(&previous) = lens[..i].last() else {
+                    return false;
+                };
+                (previous, 3 + bits.take(2) as usize)
+            }
             17 => (0, 3 + bits.take(3) as usize),
             _ => (0, 11 + bits.take(7) as usize),
         };
         if i + repeat > total {
-            return None;
+            return false;
         }
         lens[i..i + repeat].fill(value);
         i += repeat;
     }
-    if lens[256] == 0 {
-        return None;
-    }
-    Some((
-        Huffman::new(&lens[..hlit])?,
-        Huffman::new(&lens[hlit..total])?,
-    ))
+    lens[256] != 0
+        && tables.litlen.litlen(&lens[..hlit])
+        && tables.distance.distance(&lens[hlit..total])
 }
 
 // inflate
@@ -311,7 +422,9 @@ enum Error {
 
 struct Inflater<'a> {
     bits: Bits<'a>,
-    fixed: Option<(Huffman, Huffman)>,
+    fixed: Option<Tables>,
+    /// The tables of the dynamic block being decoded.
+    dynamic: Tables,
 }
 
 impl<'a> Inflater<'a> {
@@ -333,7 +446,6 @@ impl<'a> Inflater<'a> {
     ) -> Result<bool, Error> {
         let bits = &mut self.bits;
         let last = bits.take(1) == 1;
-        let dynamic;
         let (litlen, dist) = match bits.take(2) {
             0 => {
                 let skip = bits.n % 8;
@@ -355,103 +467,149 @@ impl<'a> Inflater<'a> {
             }
             1 => {
                 let fixed = self.fixed.get_or_insert_with(fixed_tables);
-                (&fixed.0, &fixed.1)
+                (&fixed.litlen, &fixed.distance)
             }
             2 => {
-                dynamic = dynamic_tables(bits).ok_or(Error::Bad)?;
-                (&dynamic.0, &dynamic.1)
+                if !dynamic_tables(bits, &mut self.dynamic) {
+                    return Err(Error::Bad);
+                }
+                (&self.dynamic.litlen, &self.dynamic.distance)
             }
             _ => return Err(Error::Bad),
         };
-        loop {
+        let mut at = *n;
+        let mut window_end = *last_window;
+        // The bit reader lives in locals while symbols are decoded: output is
+        // written through a raw pointer, and with the reader behind a
+        // reference every such write would force its fields to be reloaded.
+        let mut local = Bits {
+            data: bits.data,
+            pos: bits.pos,
+            buf: bits.buf,
+            n: bits.n,
+        };
+        let outcome = 'symbols: loop {
             // Room for three literals and the longest copy, which may write up
             // to a chunk past its end.
-            if *n + 3 + 258 + CHUNK > out.len() {
-                grow(out, *n + 3 + 258 + CHUNK);
+            if at + 3 + 258 + CHUNK > out.len() {
+                grow(out, at + 3 + 258 + CHUNK);
             }
+            let base = out.as_mut_ptr();
+            // SAFETY (for every write through `base` in this iteration): the
+            // check above leaves room for three literals at `at` and then a
+            // copy of at most 258 elements rounded up to a whole chunk.
+            let room = out.len();
+            let put = |slot: usize, b: u8| {
+                debug_assert!(slot < room);
+                unsafe { *base.add(slot) = T::byte(b) }
+            };
             // A refill leaves at least 56 bits: three literal codes of up to
-            // 15 bits each, or one length, distance and their extra bits.
-            bits.refill();
-            let mut sym = litlen.decode(bits).ok_or(Error::Bad)?;
-            if sym < 256 {
-                out[*n] = T::byte(sym as u8);
-                *n += 1;
-                sym = litlen.decode(bits).ok_or(Error::Bad)?;
-                if sym < 256 {
-                    out[*n] = T::byte(sym as u8);
-                    *n += 1;
-                    sym = litlen.decode(bits).ok_or(Error::Bad)?;
-                    if sym < 256 {
-                        out[*n] = T::byte(sym as u8);
-                        *n += 1;
+            // 15 bits each, or one length, distance and their extra local.
+            local.refill();
+            let mut entry = litlen.entry(&mut local);
+            if entry & LITERAL != 0 {
+                local.consume(entry & 0xff);
+                put(at, (entry >> 16) as u8);
+                at += 1;
+                entry = litlen.entry(&mut local);
+                if entry & LITERAL != 0 {
+                    local.consume(entry & 0xff);
+                    put(at, (entry >> 16) as u8);
+                    at += 1;
+                    entry = litlen.entry(&mut local);
+                    if entry & LITERAL != 0 {
+                        local.consume(entry & 0xff);
+                        put(at, (entry >> 16) as u8);
+                        at += 1;
                         // Past the end the bits read as zeros, which can
                         // decode as literals forever: stop there as copies do.
-                        if bits.overrun() {
-                            return Err(Error::More);
+                        if local.overrun() {
+                            break 'symbols Err(Error::More);
                         }
                         continue;
                     }
                 }
-                if bits.n < 48 {
-                    bits.refill();
+                // The entry read before this refill is still the next code:
+                // a refill only adds bits above those already present.
+                if local.n < 48 {
+                    local.refill();
                 }
             }
-            if sym == 256 {
-                break;
+            if entry & SPECIAL != 0 {
+                if entry & END == 0 {
+                    break 'symbols Err(Error::Bad);
+                }
+                local.consume(entry & 0xff);
+                break 'symbols Ok(());
             }
-            let s = (sym - 257) as usize;
-            if s >= 29 {
-                return Err(Error::Bad);
+            let saved = local.buf;
+            local.consume(entry & 0xff);
+            let len = with_extra(entry, saved);
+            let entry = dist.entry(&mut local);
+            if entry & SPECIAL != 0 {
+                break 'symbols Err(Error::Bad);
             }
-            let len = usize::from(LEN_BASE[s]) + bits.take(u32::from(LEN_EXTRA[s])) as usize;
-            let d = dist.decode(bits).ok_or(Error::Bad)? as usize;
-            if d >= 30 {
-                return Err(Error::Bad);
-            }
-            let distance = usize::from(DIST_BASE[d]) + bits.take(u32::from(DIST_EXTRA[d])) as usize;
-            let p = *n;
+            let saved = local.buf;
+            local.consume(entry & 0xff);
+            let distance = with_extra(entry, saved);
+            let p = at;
             // Copying from before the last placeholder may copy placeholders.
-            if p.saturating_sub(distance) < *last_window {
-                *last_window = p + len;
+            if p.saturating_sub(distance) < window_end {
+                window_end = p + len;
             }
             if distance <= p {
                 let from = p - distance;
-                if distance >= CHUNK {
-                    // Copy whole chunks, which compile to vector loads and
-                    // stores, and may write past `len` into spare buffer.
-                    // Chunks never overlap the bytes they read.
-                    let mut i = 0;
-                    while i < len {
-                        let chunk: [T; CHUNK] = out[from + i..from + i + CHUNK].try_into().unwrap();
-                        out[p + i..p + i + CHUNK].copy_from_slice(&chunk);
-                        i += CHUNK;
-                    }
-                } else if distance >= len {
-                    out.copy_within(from..from + len, p);
-                } else if distance == 1 {
-                    let v = out[from];
-                    out[p..p + len].fill(v);
-                } else {
-                    for i in 0..len {
-                        out[p + i] = out[from + i];
+                debug_assert!(p + len.next_multiple_of(CHUNK) <= room);
+                // SAFETY: `from + len <= p + len`, within the room checked
+                // above, and everything before `p` has been written.
+                unsafe {
+                    if distance >= CHUNK {
+                        // Copy whole chunks, which compile to vector loads
+                        // and stores, and may write past `len` into spare
+                        // buffer. Chunks never overlap the bytes they read.
+                        let mut i = 0;
+                        while i < len {
+                            std::ptr::copy_nonoverlapping(
+                                base.add(from + i),
+                                base.add(p + i),
+                                CHUNK,
+                            );
+                            i += CHUNK;
+                        }
+                    } else if distance == 1 {
+                        let v = *base.add(from);
+                        for i in 0..len {
+                            *base.add(p + i) = v;
+                        }
+                    } else {
+                        for i in 0..len {
+                            *base.add(p + i) = *base.add(from + i);
+                        }
                     }
                 }
             } else {
                 for i in 0..len {
-                    let at = (p + i) as isize - distance as isize;
-                    out[p + i] = if at >= 0 {
-                        out[at as usize]
+                    let back = (p + i) as isize - distance as isize;
+                    out[p + i] = if back >= 0 {
+                        out[back as usize]
                     } else {
-                        T::window((WINDOW as isize + at) as usize).ok_or(Error::Bad)?
+                        match T::window((WINDOW as isize + back) as usize) {
+                            Some(symbol) => symbol,
+                            None => break 'symbols Err(Error::Bad),
+                        }
                     };
                 }
-                *last_window = p + len;
+                window_end = p + len;
             }
-            *n += len;
-            if bits.overrun() {
-                return Err(Error::More);
+            at += len;
+            if local.overrun() {
+                break 'symbols Err(Error::More);
             }
-        }
+        };
+        *bits = local;
+        *n = at;
+        *last_window = window_end;
+        outcome?;
         if bits.overrun() {
             return Err(Error::More);
         }
@@ -647,6 +805,7 @@ fn decode(
     let mut inflater = Inflater {
         bits: Bits::at(data, start),
         fixed: None,
+        dynamic: Tables::default(),
     };
     let mut head = Vec::new();
     // Taken when the tail starts: a region that is all head needs its
@@ -712,6 +871,8 @@ fn decode(
 /// dynamic block starts whose header is valid and whose whole block decodes.
 fn find_block(data: &[u8], from: usize, to: usize, scratch: &mut Vec<u16>) -> Option<usize> {
     let to = to.min(data.len().saturating_sub(8) * 8);
+    // Table buffers, reused for every candidate.
+    let mut tables = Tables::default();
     for bit in from..to {
         let byte = bit / 8;
         let w = u32::from_le_bytes(data[byte..byte + 4].try_into().unwrap()) >> (bit % 8);
@@ -726,17 +887,19 @@ fn find_block(data: &[u8], from: usize, to: usize, scratch: &mut Vec<u16>) -> Op
         for &i in &CODE_ORDER[..hclen] {
             lens[i] = bits.take(3) as u8;
         }
-        if Huffman::new(&lens).is_none() {
+        if !tables.lengths.lengths(&lens) {
             continue;
         }
         let mut inflater = Inflater {
             bits: Bits::at(data, bit),
             fixed: None,
+            dynamic: std::mem::take(&mut tables),
         };
         let (mut n, mut last_window) = (0, 0);
         if inflater.block(scratch, &mut n, &mut last_window).is_ok() {
             return Some(bit);
         }
+        tables = inflater.dynamic;
     }
     None
 }
@@ -949,7 +1112,22 @@ fn resolve(head: &[u16], window: &[u8], out: &mut [u8]) -> io::Result<()> {
     {
         return Err(invalid("Invalid deflate distance"));
     }
-    for (o, &s) in out.iter_mut().zip(head) {
+    // Most groups of symbols hold no placeholder and only need narrowing,
+    // which compiles to vector code; the rest go through the table.
+    let mut bytes = out.chunks_exact_mut(32);
+    let mut symbols = head.chunks_exact(32);
+    for (bytes, symbols) in (&mut bytes).zip(&mut symbols) {
+        if symbols.iter().fold(0, |all, &s| all | s) < 256 {
+            for (o, &s) in bytes.iter_mut().zip(symbols) {
+                *o = s as u8;
+            }
+        } else {
+            for (o, &s) in bytes.iter_mut().zip(symbols) {
+                *o = lut[usize::from(s)];
+            }
+        }
+    }
+    for (o, &s) in bytes.into_remainder().iter_mut().zip(symbols.remainder()) {
         *o = lut[usize::from(s)];
     }
     Ok(())
@@ -1261,6 +1439,88 @@ fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Decode a raw deflate stream block by block, as bytes or as symbols
+    /// with window placeholders.
+    fn inflate_all<T: Symbol>(deflated: &[u8]) -> Result<Vec<T>, Error> {
+        let mut inflater = Inflater {
+            bits: Bits::at(deflated, 0),
+            fixed: None,
+            dynamic: Tables::default(),
+        };
+        let mut out = Vec::new();
+        let (mut n, mut last_window) = (0, 0);
+        while !inflater.block(&mut out, &mut n, &mut last_window)? {}
+        out.truncate(n);
+        Ok(out)
+    }
+
+    #[test]
+    fn inflater_matches_the_input_for_every_block_type_and_survives_damage() {
+        use std::io::Write;
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut random = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let mut inputs: Vec<Vec<u8>> = vec![
+            Vec::new(),
+            b"a".to_vec(),
+            b"abcabcabcabcabcabc".to_vec(),
+            vec![b'A'; 70_000],
+            fastq(3000, 5),
+        ];
+        // Incompressible bytes are stored; skewed ones need long codes and
+        // subtables; short periods give overlapping copies at every distance.
+        inputs.push((0..40_000).map(|_| random() as u8).collect());
+        inputs.push(
+            (0..120_000)
+                .map(|_| (random() % 97).min(random() % 251) as u8)
+                .collect(),
+        );
+        for period in [1usize, 2, 3, 7, 15, 16, 17, 31, 255, 300] {
+            let unit: Vec<u8> = (0..period).map(|_| random() as u8).collect();
+            inputs.push(unit.iter().cycle().take(5000 + period).copied().collect());
+        }
+        for input in &inputs {
+            for level in [0, 1, 4, 6, 9] {
+                let mut encoder =
+                    flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::new(level));
+                encoder.write_all(input).unwrap();
+                let deflated = encoder.finish().unwrap();
+                let bytes: Vec<u8> = inflate_all(&deflated).ok().unwrap();
+                assert!(
+                    bytes == *input,
+                    "bytes, level {level}, {} long",
+                    input.len()
+                );
+                let symbols: Vec<u16> = inflate_all(&deflated).ok().unwrap();
+                assert!(
+                    symbols.iter().map(|&s| s as u8).eq(input.iter().copied())
+                        && symbols.iter().all(|&s| s < 256),
+                    "symbols, level {level}, {} long",
+                    input.len()
+                );
+                // Damaged and truncated streams may decode to anything or
+                // fail, but must not read or write out of bounds.
+                for _ in 0..40 {
+                    let mut damaged = deflated.clone();
+                    if damaged.is_empty() {
+                        break;
+                    }
+                    for _ in 0..1 + random() % 3 {
+                        let at = random() as usize % damaged.len();
+                        damaged[at] ^= 1 << (random() % 8);
+                    }
+                    damaged.truncate(1 + random() as usize % damaged.len());
+                    let _ = inflate_all::<u8>(&damaged);
+                    let _ = inflate_all::<u16>(&damaged);
+                }
+            }
+        }
+    }
     use std::io::Write;
 
     fn fastq(n: usize, seed: u64) -> Vec<u8> {

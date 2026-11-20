@@ -3177,16 +3177,19 @@ impl Engine {
         } else {
             None
         };
-        // Decoding one large member in parallel costs about 2.5 times zlib's CPU
-        // per byte and holds the regions in flight in memory, so it pays off
-        // only when decoding limits the run. For a single input that is output
+        // Decoding one large member in parallel costs more CPU per byte than
+        // zlib and holds the regions in flight in memory, so it pays off only
+        // when decoding limits the run. For a single input that is output
         // that is not gzip, or binned qualities, which make compressing the
-        // output cheap. Paired inputs share the decoding threads and need
-        // uncompressed output: any compression limits the run before two
-        // sequential decoders do.
+        // output cheap, or enough cores that compression leaves some idle
+        // (measured on 14: 10% faster). Paired inputs share the decoding
+        // threads and need uncompressed output: with two decoders already
+        // running, compression limits the run first.
         let output = io::CompressionFormat::from_path(&a.output);
         let split = if a.input2.is_none() {
-            output != io::CompressionFormat::Gzip || io::binned_gzip_input(&a.input)
+            output != io::CompressionFormat::Gzip
+                || num_cpus::get() >= 12
+                || io::binned_gzip_input(&a.input)
         } else {
             output == io::CompressionFormat::None
         };
