@@ -6,7 +6,7 @@ use crate::util::Instant;
 use crate::{adapter, auto_adapter, html, io, overlap, simd, split, stats, Args};
 use anyhow::{ensure, Context, Result};
 use rayon::prelude::*;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use serde_json::{json, Value};
 use std::borrow::Cow;
 use std::collections::{BTreeMap, VecDeque};
@@ -608,40 +608,45 @@ struct Overrep {
 }
 
 impl Overrep {
-    fn candidates<'a>(
-        reads: impl Iterator<Item = &'a Read<'a>>,
-        len: usize,
-    ) -> BTreeMap<Vec<u8>, usize> {
+    fn candidates(reads: &[&Read], len: usize) -> BTreeMap<Vec<u8>, usize> {
         let mut counts = BTreeMap::new();
         let mut bases = 0;
-        let steps = [10, 20, 40, 100, 150.min(len.saturating_sub(2)).max(1)];
+        let mut sampled = 0;
         for r in reads {
             if bases >= 151 * 10000 {
                 break;
             }
             bases += r.seq.len();
-            for step in steps {
-                for i in 0..r.seq.len().saturating_sub(step) {
-                    *counts.entry(r.seq[i..i + step].to_vec()).or_insert(0usize) += 1;
+            sampled += 1;
+        }
+        // The evaluation reads outlive this scan. Borrow each distinct window
+        // from them and keep only one length's frequency table in memory.
+        let mut steps = [10, 20, 40, 100, 150.min(len.saturating_sub(2)).max(1)];
+        steps.sort_unstable();
+        for group in steps.chunk_by(|a, b| a == b) {
+            let step = group[0];
+            let threshold = match step {
+                n if n >= len.saturating_sub(1) => 3,
+                100.. => 5,
+                40.. => 20,
+                20.. => 100,
+                10.. => 500,
+                _ => continue,
+            };
+            let mut frequencies = FxHashMap::default();
+            for read in &reads[..sampled] {
+                // fastp excludes the window ending exactly at the read end.
+                let sequence = &read.seq[..read.seq.len().saturating_sub(1)];
+                for window in sequence.windows(step) {
+                    *frequencies.entry(window).or_insert(0usize) += group.len();
+                }
+            }
+            for (seq, n) in frequencies {
+                if n >= threshold {
+                    counts.insert(seq.to_vec(), n);
                 }
             }
         }
-        counts.retain(|seq, count| {
-            *count
-                >= if seq.len() >= len.saturating_sub(1) {
-                    3
-                } else if seq.len() >= 100 {
-                    5
-                } else if seq.len() >= 40 {
-                    20
-                } else if seq.len() >= 20 {
-                    100
-                } else if seq.len() >= 10 {
-                    500
-                } else {
-                    usize::MAX
-                }
-        });
         // Match upstream's lexicographic removal of redundant substrings.
         let keys: Vec<_> = counts.keys().cloned().collect();
         for seq in keys {
@@ -1017,15 +1022,13 @@ enum BloomPages {
     Sparse(FxHashMap<u64, BloomPage>),
 }
 
-// Most 4 KiB pages contain only a few set bits on ordinary FASTQ inputs.
-// Store those exact bit offsets inline, promoting a populated page to the
-// original bitmap. This changes storage, never hashes or membership decisions.
+// Keep small sets of exact offsets inline. Spill to a short vector for
+// moderately populated pages, then use indexed lookups as membership scans
+// grow more expensive. A full bitmap bounds the storage for a dense page.
 enum BloomPage {
-    Small {
-        len: u8,
-        bits: [u16; 32],
-        summary: u64,
-    },
+    Small { len: u8, bits: [u16; 24] },
+    Offsets(Vec<u16>),
+    Sparse(FxHashSet<u16>),
     Bitmap(Box<[u8; 4096]>),
 }
 
@@ -1033,8 +1036,7 @@ impl Default for BloomPage {
     fn default() -> Self {
         Self::Small {
             len: 0,
-            bits: [0; 32],
-            summary: 0,
+            bits: [u16::MAX; 24],
         }
     }
 }
@@ -1042,20 +1044,49 @@ impl Default for BloomPage {
 impl BloomPage {
     fn check_and_set(&mut self, bit: u16) -> bool {
         match self {
-            Self::Small { len, bits, summary } => {
-                let mask = 1u64 << (bit % 64);
-                // An unset summary bit proves absence. A hit still checks the
-                // exact offsets, so this shortcut cannot create false positives.
-                if *summary & mask != 0 && bits[..usize::from(*len)].contains(&bit) {
+            Self::Small { len, bits } => {
+                // Unused slots contain a value outside the 15-bit page.
+                // Searching a fixed-size array lets the compiler use SIMD.
+                if bits.contains(&bit) {
                     return true;
                 }
                 if usize::from(*len) < bits.len() {
                     bits[usize::from(*len)] = bit;
                     *len += 1;
-                    *summary |= mask;
                 } else {
+                    let mut offsets = Vec::with_capacity(32);
+                    offsets.extend_from_slice(bits);
+                    offsets.push(bit);
+                    *self = Self::Offsets(offsets);
+                }
+                false
+            }
+            Self::Offsets(offsets) => {
+                if offsets.contains(&bit) {
+                    return true;
+                }
+                if offsets.len() < 64 {
+                    offsets.push(bit);
+                } else {
+                    *self = Self::Sparse(
+                        offsets
+                            .iter()
+                            .copied()
+                            .chain(std::iter::once(bit))
+                            .collect(),
+                    );
+                }
+                false
+            }
+            Self::Sparse(offsets) => {
+                if !offsets.insert(bit) {
+                    return true;
+                }
+                // At 896 entries the next hash table allocation would exceed
+                // the size of the complete bitmap (u16 keys plus control bytes).
+                if offsets.len() == 896 {
                     let mut bitmap = Box::new([0; 4096]);
-                    for &offset in bits.iter().chain(std::iter::once(&bit)) {
+                    for &offset in offsets.iter() {
                         bitmap[usize::from(offset) / 8] |= 1 << (offset % 8);
                     }
                     *self = Self::Bitmap(bitmap);
@@ -1110,9 +1141,9 @@ impl Duplication {
         }
         let bits = (1u64 << 32) * scale;
         let pages = (bits / 8 / 4096) as usize;
-        // Direct lookup for ordinary accuracy levels, without committing the
-        // Bloom data itself. Keep high-accuracy directories sparse and bounded.
-        let dense = pages * n * std::mem::size_of::<BloomPage>() <= 32 * 1024 * 1024;
+        // Direct lookup for the default two directories. Higher accuracies
+        // allocate only the pages seen, including on very small inputs.
+        let dense = pages * n <= 2 * (1 << 17);
         Self {
             buffers: (0..n)
                 .map(|_| {
@@ -1162,7 +1193,7 @@ impl Duplication {
     fn check_positions(&mut self, positions: [u64; 8]) -> bool {
         let mut duplicate = true;
         for (buf, pos) in self.buffers.iter_mut().zip(positions) {
-            let bit = pos % self.bits;
+            let bit = pos & (self.bits - 1);
             let page = buf.page(bit / 32768);
             duplicate &= page.check_and_set((bit % 32768) as u16);
         }
@@ -1279,8 +1310,8 @@ impl DuplicationHash {
 
 struct Config {
     args: Args,
-    adapters: [Option<Vec<u8>>; 2],
-    fasta: Vec<Vec<u8>>,
+    adapters: [Option<adapter::AdapterMatcher>; 2],
+    fasta: Vec<adapter::AdapterMatcher>,
     blacklist: [Vec<Vec<u8>>; 2],
     poly_g: bool,
 }
@@ -1581,9 +1612,9 @@ fn mark_duplicates(chunks: &mut [Chunk], duplication: Option<&mut Duplication>) 
     }
 }
 
-fn trim_adapter(r: &mut Read, seq: &[u8], min: usize) -> Option<usize> {
+fn trim_adapter(r: &mut Read, seq: &adapter::AdapterMatcher, min: usize) -> Option<usize> {
     let before = r.seq.len();
-    let found = adapter::find_adapter(&r.seq, seq, min, usize::MAX)?;
+    let found = seq.find(&r.seq, min)?;
     r.resize(found.position);
     Some(if found.is_atailing {
         found.overlap_len
@@ -3087,8 +3118,11 @@ impl Engine {
         };
         let config = Config {
             args: a,
-            adapters,
-            fasta,
+            adapters: adapters.map(|a| a.map(adapter::AdapterMatcher::new)),
+            fasta: fasta
+                .into_iter()
+                .map(adapter::AdapterMatcher::new)
+                .collect(),
             blacklist,
             poly_g,
         };
@@ -3172,7 +3206,7 @@ impl Engine {
                     .map(|r| r.seq.len())
                     .max()
                     .unwrap_or(0);
-                let candidates = Overrep::candidates(reads.iter().copied(), len);
+                let candidates = Overrep::candidates(&reads, len);
                 stats.before[i].overrep = Some(Overrep::new(
                     &candidates,
                     len,
@@ -3666,6 +3700,21 @@ mod tests {
     use super::*;
 
     #[test]
+    fn overrep_counts_repeated_window_lengths_and_excludes_final_window() {
+        let read = Read {
+            seq: Cow::Borrowed(b"AAAAAAAAAACC"),
+            ..Read::default()
+        };
+        let reads = vec![&read; 250];
+        // For twelve cycles the length-dependent step and fixed ten-base
+        // step are equal. Both contribute toward the discovery threshold.
+        assert_eq!(
+            Overrep::candidates(&reads, 12),
+            BTreeMap::from([(b"AAAAAAAAAA".to_vec(), 500), (b"AAAAAAAAAC".to_vec(), 500)])
+        );
+    }
+
+    #[test]
     fn quality_validation_matches_scalar_at_every_byte_and_vector_boundary() {
         for offset in [33, 64] {
             for len in [0, 1, 15, 16, 17, 31, 32, 33, 51, 64, 65, 148, 513] {
@@ -3923,7 +3972,7 @@ mod tests {
         let mut state = 140u64;
         for index in 0..100_000 {
             state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
-            let bit = if index < 33 {
+            let bit = if index < 66 {
                 index * 991 % 32768
             } else {
                 (state >> 32) as usize % 32768
@@ -3935,13 +3984,17 @@ mod tests {
                 "insertion {index}, bit {bit}"
             );
             reference[bit / 8] |= 1 << (bit % 8);
-            if index == 31 {
-                assert!(matches!(page, BloomPage::Small { len: 32, .. }));
+            if index == 23 {
+                assert!(matches!(page, BloomPage::Small { len: 24, .. }));
             }
-            if index == 32 {
-                assert!(matches!(page, BloomPage::Bitmap(_)));
+            if index == 24 {
+                assert!(matches!(page, BloomPage::Offsets(_)));
+            }
+            if index == 64 {
+                assert!(matches!(page, BloomPage::Sparse(_)));
             }
         }
+        assert!(matches!(page, BloomPage::Bitmap(_)));
         for bit in 0..32768 {
             assert_eq!(
                 page.check_and_set(bit as u16),
