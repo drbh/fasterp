@@ -185,9 +185,10 @@ fn dist_symbol(t: &Tables, d: usize) -> usize {
 
 // ---- tokens ---------------------------------------------------------------
 
-/// A literal run (its length, bit 31 clear) or a match: bit 31 set, length
-/// in bits 16..25, distance - 1 in bits 0..15. Tokens consume the input in
-/// order, so the writer walks the input alongside them.
+/// A literal run (its length, bit 31 clear) or a match: bit 31 set, the
+/// distance symbol in bits 25..30, length in bits 16..25, distance - 1 in
+/// bits 0..15. Tokens consume the input in order, so the writer walks the
+/// input alongside them.
 type Token = u32;
 const MATCH: u32 = 1 << 31;
 
@@ -252,9 +253,11 @@ impl Tokens {
             } else {
                 len
             };
-            self.buf.push(token_match(take, dist));
+            let symbol = dist_symbol(t, dist) & 31;
+            self.buf
+                .push(token_match(take, dist) | (symbol as u32) << 25);
             self.lit_freq[t.len_sym[take] as usize & 511] += 1;
-            self.dist_freq[dist_symbol(t, dist) & 31] += 1;
+            self.dist_freq[symbol] += 1;
             len -= take;
         }
     }
@@ -456,6 +459,20 @@ impl Matcher {
         // A match needs MIN_MATCH bytes up to `end`.
         let limit = (end + 1).saturating_sub(MIN_MATCH);
         while pos < limit {
+            // Eight bytes equal to the eight before them start a run of one
+            // byte, as most of a binned quality line is. A match at distance
+            // one is its cheapest coding and needs no search; what follows
+            // the run finds earlier runs through positions outside them.
+            if pos > 0 && pos + 8 <= end {
+                let here = u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap());
+                let before = u64::from_le_bytes(data[pos - 1..pos + 7].try_into().unwrap());
+                if here == before {
+                    let len = extend(data, pos - 1, pos, (end - pos).min(MAX_MATCH * 4));
+                    tok.matched(t, len, 1);
+                    pos += len;
+                    continue;
+                }
+            }
             let (len, dist) = self.find(data, pos, end);
             if len == 0 {
                 tok.literal(data[pos]);
@@ -634,25 +651,50 @@ impl<'a> Tokenizer<'a> {
                 self.generic(phase_start, hdr_start);
             }
             pos = hdr_start;
+            // Line ends already found for the record about to be read.
+            let mut known: Option<(usize, usize)> = None;
             // Records loop.
             loop {
                 // header unit: data[pos..h_end]
-                let h_end = line_end(data, if data[pos] == b'\n' { pos + 1 } else { pos });
+                let (h_end, s_end) = match known.take() {
+                    Some(ends) => ends,
+                    None => {
+                        let h_end = line_end(data, if data[pos] == b'\n' { pos + 1 } else { pos });
+                        (
+                            h_end,
+                            if h_end >= n {
+                                n
+                            } else {
+                                line_end(data, h_end + 1)
+                            },
+                        )
+                    }
+                };
                 if h_end >= n {
                     self.header(pos, n);
                     break 'outer;
                 }
                 self.header(pos, h_end + 1);
                 // sequence unit: bases only
-                let s_end = line_end(data, h_end + 1);
                 self.sequence(h_end + 1, s_end);
                 if s_end >= n {
                     break 'outer;
                 }
-                // plus + quality unit: "\n+...\n" + quals (no trailing newline)
-                let p_end = line_end(data, s_end + 1);
+                // plus + quality unit: "\n+...\n" + quals (no trailing newline).
+                // The plus line is nearly always bare and the qualities as
+                // long as the sequence: look there before searching.
+                let p_end = if data.get(s_end + 2) == Some(&b'\n') {
+                    s_end + 2
+                } else {
+                    line_end(data, s_end + 1)
+                };
+                let same = p_end + 1 + (s_end - h_end - 1);
                 let q_end = if p_end >= n {
                     n
+                } else if data.get(same) == Some(&b'\n')
+                    && data.get(same + 1).is_none_or(|&b| b == b'@')
+                {
+                    same
                 } else {
                     line_end(data, p_end + 1)
                 };
@@ -665,14 +707,14 @@ impl<'a> Tokenizer<'a> {
                 if next < n && data[next] == b'@' && {
                     // cheap shape check: a '+' two lines later
                     let e1 = line_end(data, next);
-                    e1 + 1 >= n || {
-                        let e2 = line_end(data, e1 + 1);
-                        e2 + 1 >= n || data[e2 + 1] == b'+'
-                    }
+                    let e2 = if e1 >= n { n } else { line_end(data, e1 + 1) };
+                    known = Some((e1, e2));
+                    e1 + 1 >= n || e2 + 1 >= n || data[e2 + 1] == b'+'
                 } {
                     pos = q_end; // header unit includes the newline
                     continue;
                 }
+                known = None;
                 // Lost the phase (or the block ends at a record boundary):
                 // the newline joins the generic segment.
                 if next >= n {
@@ -987,6 +1029,19 @@ pub fn deflate(input: &[u8], matcher: &mut Matcher, out: &mut Vec<u8>) {
     // Code and length in one entry: one load per literal.
     let lit_table: [u32; 256] =
         std::array::from_fn(|b| u32::from(lit_codes[b]) | u32::from(lit_lens[b]) << 24);
+    // A match length's code and extra bits, and how many bits they take.
+    let len_table: [(u32, u32); 259] = std::array::from_fn(|len| {
+        if len < 3 {
+            return (0, 0);
+        }
+        let symbol = t.len_sym[len] as usize;
+        let count = lit_lens[symbol] as u32;
+        let extra = (len - LEN_BASE[symbol - 257] as usize) as u32;
+        (
+            u32::from(lit_codes[symbol]) | extra << count,
+            count + LEN_EXTRA[symbol - 257] as u32,
+        )
+    });
     let mut ip = 0usize;
     for &tk in &tok.buf {
         if tk & MATCH == 0 {
@@ -1022,18 +1077,18 @@ pub fn deflate(input: &[u8], matcher: &mut Matcher, out: &mut Vec<u8>) {
                 w.put_small(c, l);
             }
         } else {
-            ip += ((tk >> 16) & 0x1ff) as usize;
             let len = ((tk >> 16) & 0x1ff) as usize;
-            let dist = (tk & 0xffff) as usize + 1;
-            let ls = t.len_sym[len] as usize;
-            let li = ls - 257;
-            let count = lit_lens[ls] as u32;
-            let bits = lit_codes[ls] as u64 | (((len - LEN_BASE[li] as usize) as u64) << count);
-            w.put_small(bits, count + LEN_EXTRA[li] as u32);
-            let ds = dist_symbol(t, dist);
+            ip += len;
+            let dist = (tk & 0x7fff) as usize + 1;
+            let (lbits, lcount) = len_table[len];
+            let ds = ((tk >> 25) & 31) as usize;
             let count = dist_lens[ds] as u32;
-            let bits = dist_codes[ds] as u64 | (((dist - DIST_BASE[ds] as usize) as u64) << count);
-            w.put_small(bits, count + DIST_EXTRA[ds] as u32);
+            let dbits = dist_codes[ds] as u64 | (((dist - DIST_BASE[ds] as usize) as u64) << count);
+            // At most 20 bits of length and 28 of distance.
+            w.put_small(
+                u64::from(lbits) | dbits << lcount,
+                lcount + count + DIST_EXTRA[ds] as u32,
+            );
         }
     }
     w.put_small(lit_codes[256] as u64, lit_lens[256] as u32);
