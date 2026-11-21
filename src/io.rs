@@ -1010,6 +1010,25 @@ mod input_tests {
     use super::*;
 
     #[test]
+    fn zstd_output_from_several_threads_is_one_standard_stream() {
+        let data: Vec<u8> = (0..6_000_000u32)
+            .map(|i| b"ACGTN@+!IJ\n"[(i.wrapping_mul(2654435761) >> 27) as usize % 11])
+            .collect();
+        let temp = tempfile::TempDir::new().unwrap();
+        for threads in [1, 4] {
+            let path = temp.path().join(format!("out{threads}.fq.zst"));
+            let mut writer =
+                open_output_with_threads(path.to_str().unwrap(), Some(3), true, threads).unwrap();
+            for block in data.chunks(70_001) {
+                writer.write_all(block).unwrap();
+            }
+            writer.finish().unwrap();
+            let decoded = zstd::stream::decode_all(File::open(&path).unwrap()).unwrap();
+            assert!(decoded == data, "{threads} threads");
+        }
+    }
+
+    #[test]
     fn paired_inputs_share_the_decoding_threads() {
         for (cpus, one, two) in [(1, 2, 2), (4, 2, 2), (8, 4, 2), (14, 7, 4), (32, 8, 4)] {
             assert_eq!(split_decoding_threads(cpus, 1), one);
@@ -1405,7 +1424,12 @@ pub(crate) fn open_output_with_threads(
             CompressionFormat::Zstd => {
                 // Zstd supports levels 1-22, default is 3
                 let level = compression_level.unwrap_or(3).clamp(1, 22) as i32;
-                let encoder = ZstdEncoder::new(file, level)?;
+                let mut encoder = ZstdEncoder::new(file, level)?;
+                if parallel && compression_threads > 1 {
+                    // zstd splits the input into jobs and compresses them on
+                    // its own workers; the output is still one standard frame.
+                    encoder.multithread(compression_threads as u32)?;
+                }
                 let writer = BufWriter::with_capacity(16 * 1024 * 1024, encoder);
                 Ok(OutputWriter::Zstd(writer))
             }

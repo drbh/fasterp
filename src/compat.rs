@@ -2275,7 +2275,7 @@ struct Output {
 
 impl Output {
     fn new(a: &Args) -> Self {
-        let gzip_outputs = [
+        let compressed_outputs = [
             Some(a.output.as_str()),
             a.output2.as_deref(),
             a.merged_out.as_deref(),
@@ -2289,7 +2289,7 @@ impl Output {
         .filter(|path| {
             !crate::io::is_s3_path(path)
                 && crate::io::CompressionFormat::from_path(path)
-                    == crate::io::CompressionFormat::Gzip
+                    != crate::io::CompressionFormat::None
         })
         .collect::<std::collections::BTreeSet<_>>()
         .len();
@@ -2300,7 +2300,7 @@ impl Output {
             direct: BTreeMap::new(),
             writers: BTreeMap::new(),
             scratch: Vec::new(),
-            compression_threads: crate::io::threads_per_output(gzip_outputs),
+            compression_threads: crate::io::threads_per_output(compressed_outputs),
         }
     }
     fn open_main(&mut self, a: &Args, split: &split::SplitConfig) -> Result<()> {

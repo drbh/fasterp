@@ -63,7 +63,7 @@ js-sys = {version = "=0.3.69", optional = true}
 wasm-bindgen = {version = "=0.2.92", optional = true}
 
 # Optional features
-zstd = {version = "0.13", optional = true}
+zstd = {version = "0.13", optional = true, features = ["zstdmt"]}
 
 # Streaming gzip decoding: macOS's system zlib inflates about 1.5x faster than
 # zlib-ng on Apple Silicon, other native targets use zlib-ng, and wasm uses
