@@ -361,8 +361,64 @@ impl Matcher {
     }
 
     /// Longest match at `pos` among the bucket candidates (and inserts `pos`).
+    ///
+    /// Whether a candidate matches is close to a coin toss on quality
+    /// strings, so testing them one by one mispredicts constantly. This
+    /// compares eight bytes of all four without branching and branches once
+    /// on the best; only candidates that match all eight are extended.
     #[inline(always)]
     fn find(&mut self, data: &[u8], pos: usize, end: usize) -> (usize, usize) {
+        if pos + 8 > data.len() {
+            return self.find_near_end(data, pos, end);
+        }
+        let cur = u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap());
+        let h = Self::hash(cur as u32);
+        let bucket = self.table[h];
+        let stored = self.stored(pos);
+        self.table[h] = bucket << 32 | u128::from(stored);
+        let max = (end - pos).min(MAX_MATCH * 4);
+        // Entries from earlier blocks are further back than `pos`.
+        let reach = pos.min(WINDOW);
+        let mut lens = [0u32; 4];
+        let mut dists = [0usize; 4];
+        // Longest prefix first, then the most recent candidate.
+        let mut best = 0u32;
+        for way in 0..4 {
+            let dist = stored.wrapping_sub((bucket >> (32 * way)) as u32) as usize;
+            let valid = dist.wrapping_sub(1) < reach;
+            // An invalid candidate reads `pos` itself, and counts as no match.
+            let cand = pos - if valid { dist } else { 0 };
+            let diff = u64::from_le_bytes(data[cand..cand + 8].try_into().unwrap()) ^ cur;
+            let len = if valid { diff.trailing_zeros() / 8 } else { 0 };
+            lens[way] = len;
+            dists[way] = dist;
+            best = best.max(len << 2 | (3 - way as u32));
+        }
+        let len = (best >> 2) as usize;
+        if len < MIN_MATCH {
+            return (0, 0);
+        }
+        if len < 8 || max <= 8 {
+            return (len.min(max), dists[3 - (best & 3) as usize]);
+        }
+        let mut best = (0usize, 0usize);
+        for way in 0..4 {
+            if lens[way] == 8 {
+                let len = extend(data, pos - dists[way], pos, max);
+                if len > best.0 {
+                    best = (len, dists[way]);
+                    if len >= NICE_MATCH {
+                        break;
+                    }
+                }
+            }
+        }
+        best
+    }
+
+    /// `find` for the last bytes of a block, where eight cannot be loaded.
+    #[inline(never)]
+    fn find_near_end(&mut self, data: &[u8], pos: usize, end: usize) -> (usize, usize) {
         let cur = Self::load4(data, pos);
         let h = Self::hash(cur);
         let bucket = self.table[h];
