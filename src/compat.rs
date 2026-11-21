@@ -1270,6 +1270,26 @@ impl Duplication {
             .sum()
     }
 
+    /// Whether each read is a duplicate, in input order. The tables are far
+    /// larger than the cache, so the buckets of later reads are requested
+    /// while earlier ones are checked.
+    fn check_batch(&mut self, positions: &[[u64; 8]]) -> Vec<bool> {
+        const AHEAD: usize = 16;
+        let mask = self.bits - 1;
+        (0..positions.len())
+            .map(|i| {
+                if let Some(later) = positions.get(i + AHEAD) {
+                    for (buf, pos) in self.buffers.iter().zip(later) {
+                        if let BloomPages::Dense(table) = buf {
+                            table.prefetch(BucketTable::address(pos & mask));
+                        }
+                    }
+                }
+                self.check_positions(&positions[i])
+            })
+            .collect()
+    }
+
     fn check_positions(&mut self, positions: &[u64]) -> bool {
         let mut duplicate = true;
         for (buf, pos) in self.buffers.iter_mut().zip(positions) {
@@ -1905,6 +1925,12 @@ struct ReadBatch {
 
 impl ReadBatch {
     fn mark_duplicates(&mut self, shared: &Shared, filter: &mut Duplication) {
+        let positions = self.duplicate_positions(shared);
+        self.duplicate_flags = Some(filter.check_batch(&positions));
+    }
+
+    /// The duplicate filter's hash positions for every read, or pair.
+    fn duplicate_positions(&self, shared: &Shared) -> Vec<[u64; 8]> {
         let raw = self
             .raw
             .as_ref()
@@ -1915,11 +1941,16 @@ impl ReadBatch {
             .expect("deduplication requires hashes");
         let interleaved = shared.config.args.interleaved_in;
         let stride = if interleaved { 2 } else { 1 };
-        // Hash original sequences in parallel, then mark in input order so
-        // the first occurrence still wins across worker and batch boundaries.
-        let positions: Vec<_> = shared.pool().install(|| {
+        // Hash original sequences in parallel; they are marked in input order
+        // so the first occurrence still wins across worker and batch
+        // boundaries.
+        shared.pool().install(|| {
             (0..raw[0].len() / stride)
                 .into_par_iter()
+                // A hash takes well under a microsecond: split no finer than
+                // a few hundred reads, or handing out the work costs more
+                // than doing it.
+                .with_min_len(256)
                 .map(|i| {
                     let mate = if interleaved {
                         Some(raw[0].sequence(2 * i + 1))
@@ -1931,13 +1962,7 @@ impl ReadBatch {
                     hasher.positions(raw[0].sequence(i * stride), mate)
                 })
                 .collect()
-        });
-        self.duplicate_flags = Some(
-            positions
-                .iter()
-                .map(|pos| filter.check_positions(pos))
-                .collect(),
-        );
+        })
     }
 }
 
@@ -2918,6 +2943,9 @@ impl Shared {
     }
 }
 
+/// Batches whose reads are hashed for duplicate marking at one time.
+const HASHES_IN_FLIGHT: usize = 3;
+
 type ProcessedBatch = Result<Vec<Chunk<'static>>>;
 
 /// Where processed batches come from: this thread, or the read-ahead,
@@ -2970,15 +2998,68 @@ impl Pipeline {
             let shared = Arc::clone(shared);
             let (ready, prepared) = crossbeam_channel::bounded(1);
             threads.push(std::thread::spawn(move || {
-                for batch in input_rx {
-                    let result = batch.map(|mut b| {
-                        b.mark_duplicates(&shared, &mut filter);
-                        b
+                // Marking must follow input order on one thread, but hashing
+                // need not. Hashing a batch only when its turn came left this
+                // thread waiting for the pool on every batch, and it was the
+                // slowest stage. The next batches are hashed on the pool
+                // while this one is marked.
+                let in_flight = if shared.pool().current_num_threads() > 4 {
+                    HASHES_IN_FLIGHT
+                } else {
+                    1
+                };
+                type Hashed = Result<(ReadBatch, Vec<[u64; 8]>)>;
+                type Running = crossbeam_channel::Receiver<std::thread::Result<Hashed>>;
+                let mut running: VecDeque<Running> = VecDeque::with_capacity(in_flight);
+                let mut input = input_rx.into_iter();
+                let mut reading = true;
+                loop {
+                    while reading && running.len() < in_flight {
+                        let Some(batch) = input.next() else {
+                            reading = false;
+                            break;
+                        };
+                        let (done, result) = crossbeam_channel::bounded(1);
+                        match batch {
+                            Ok(batch) => {
+                                let job = Arc::clone(&shared);
+                                shared.pool().spawn(move || {
+                                    let hashed = std::panic::catch_unwind(
+                                        std::panic::AssertUnwindSafe(|| {
+                                            let positions = batch.duplicate_positions(&job);
+                                            Ok((batch, positions))
+                                        }),
+                                    );
+                                    let _ = done.send(hashed);
+                                });
+                            }
+                            Err(error) => {
+                                reading = false;
+                                let _ = done.send(Ok(Err(error)));
+                            }
+                        }
+                        running.push_back(result);
+                    }
+                    let Some(next) = running.pop_front() else {
+                        break;
+                    };
+                    let hashed = match next.recv() {
+                        Ok(Ok(hashed)) => hashed,
+                        Ok(Err(panic)) => std::panic::resume_unwind(panic),
+                        Err(_) => unreachable!("a hashing job always reports"),
+                    };
+                    let result = hashed.map(|(mut batch, positions)| {
+                        batch.duplicate_flags = Some(filter.check_batch(&positions));
+                        batch
                     });
                     let failed = result.is_err();
                     if ready.send(result).is_err() || failed {
                         break;
                     }
+                }
+                // Let started jobs finish before the pipeline reports it stopped.
+                for next in running {
+                    let _ = next.recv();
                 }
             }));
             prepared
