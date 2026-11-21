@@ -13,6 +13,13 @@
 # updates that dataset in the book's benchmarks chapter. Override with R1, R2,
 # DATASET, WORKERS (comma separated), RUNS, WARMUP and OUT. ARGS is added to every
 # command for both programs, for example ARGS=-g to trim poly-G tails.
+#
+# fastp is the reference and takes most of the time. Its rows in $CSV are
+# snapshots: a row measured with the same fastp version on the same machine,
+# for the same dataset, workload and worker count, is kept and fastp is not
+# run again. fasterp's output must still match the snapshot's digest; if it
+# does not, the snapshot describes other inputs or options and fastp is timed
+# again. REFERENCE=rerun times fastp regardless.
 set -euo pipefail
 
 fastp=${1:-fastp}
@@ -26,6 +33,7 @@ warmup=${WARMUP:-1}
 out=${OUT:-target/bench}
 extra=${ARGS:-}
 csv=${CSV:-$out/results.csv}
+reference=${REFERENCE:-snapshot}
 
 command -v hyperfine >/dev/null || { echo "hyperfine is required (brew install hyperfine)" >&2; exit 1; }
 tmp=$out/tmp
@@ -45,8 +53,8 @@ date=$(date +%F)
 rows=$tmp/rows.csv
 : >"$rows"
 
-# Total size of the gzip files a program wrote, so output size is checked
-# alongside time: a faster encoder must not write larger files.
+# Total size of the gzip files a program wrote, so output size is recorded
+# alongside time and a faster encoder cannot hide larger files.
 output_bytes() {
   find "$1" -name '*.gz' -exec wc -c {} + | awk '$2 != "total" {s += $1} END {print s + 0}'
 }
@@ -65,28 +73,51 @@ output_sha256() {
   done | sha256 | cut -c1-16
 }
 
-# Arguments name output files as @/file; each program writes to its own
-# directory so their sizes can be compared.
-bench() {
-  local name=$1 args=$2 w
-  for w in ${workers//,/ }; do
-    rm -rf "$tmp/fastp" "$tmp/fasterp"
-    mkdir -p "$tmp/fastp" "$tmp/fasterp"
-    hyperfine --warmup "$warmup" --runs "$runs" --export-csv "$tmp/run.csv" \
-      -n "fastp $w" "$fastp ${args//@/$tmp/fastp} $extra -j $tmp/fastp.json -h $tmp/fastp.html -w $w" \
-      -n "fasterp $w" "$fasterp ${args//@/$tmp/fasterp} $extra -j $tmp/fasterp.json -h $tmp/fasterp.html -w $w"
-    # hyperfine columns: command,mean,stddev,median,user,system,min,max
-    tail -n +2 "$tmp/run.csv" | while IFS=, read -r command mean stddev _ _ _ min max; do
-      program=${command% *}
-      version=$fastp_version
-      [ "$program" = fasterp ] && version=$fasterp_version
-      printf '%s,%s,%s,%s,%s,%.3f,%.3f,%.3f,%.3f,%s,%s,%s,%s,%s\n' "$dataset" "$name" "$w" "$program" \
-        "$version" "$mean" "$stddev" "$min" "$max" "$runs" "$machine" "$date" \
-        "$(output_bytes "$tmp/$program")" "$(output_sha256 "$tmp/$program")" >>"$rows"
-    done
+# The reference row already in $csv for a workload and worker count, measured
+# with this fastp version on this machine, or nothing.
+snapshot() {
+  [ "$reference" = snapshot ] && [ -f "$csv" ] || return 0
+  awk -F, -v d="$dataset" -v n="$1" -v w="$2" -v v="$fastp_version" -v m="$machine" \
+    '$1 == d && $2 == n && $3 == w && $4 == "fastp" && $5 == v && $11 == m' "$csv" | tail -1
+}
+
+# Time one program and print its row. hyperfine columns:
+# command,mean,stddev,median,user,system,min,max
+time_program() {
+  local program=$1 version=$2 name=$3 w=$4 command=$5
+  hyperfine --warmup "$warmup" --runs "$runs" --export-csv "$tmp/run.csv" -n "$program $w" "$command" >&2
+  tail -n +2 "$tmp/run.csv" | while IFS=, read -r _ mean stddev _ _ _ min max; do
+    printf '%s,%s,%s,%s,%s,%.3f,%.3f,%.3f,%.3f,%s,%s,%s,%s,%s\n' "$dataset" "$name" "$w" "$program" \
+      "$version" "$mean" "$stddev" "$min" "$max" "$runs" "$machine" "$date" \
+      "$(output_bytes "$tmp/$program")" "$(output_sha256 "$tmp/$program")"
   done
 }
 
+# Arguments name output files as @/file; each program writes to its own
+# directory so their sizes can be compared.
+bench() {
+  local name=$1 args=$2 w ours kept
+  for w in ${workers//,/ }; do
+    rm -rf "$tmp/fastp" "$tmp/fasterp"
+    mkdir -p "$tmp/fastp" "$tmp/fasterp"
+    ours=$(time_program fasterp "$fasterp_version" "$name" "$w" \
+      "$fasterp ${args//@/$tmp/fasterp} $extra -j $tmp/fasterp.json -h $tmp/fasterp.html -w $w")
+    kept=$(snapshot "$name" "$w")
+    if [ -n "$kept" ] && [ "${kept##*,}" != "${ours##*,}" ]; then
+      echo "$dataset $name -w $w: output differs from the fastp snapshot, timing fastp again" >&2
+      kept=
+    fi
+    if [ -n "$kept" ]; then
+      reused=$((reused + 1))
+    else
+      kept=$(time_program fastp "$fastp_version" "$name" "$w" \
+        "$fastp ${args//@/$tmp/fastp} $extra -j $tmp/fastp.json -h $tmp/fastp.html -w $w")
+    fi
+    printf '%s\n%s\n' "$kept" "$ours" >>"$rows"
+  done
+}
+
+reused=0
 bench single-end "-i $r1 -o @/se.fq.gz"
 bench paired-end "-i $r1 -I $r2 -o @/r1.fq.gz -O @/r2.fq.gz"
 bench paired-correct-merge "-i $r1 -I $r2 -c -m --merged_out @/merged.fq.gz -o @/r1.fq.gz -O @/r2.fq.gz"
@@ -99,4 +130,4 @@ bench paired-correct-merge "-i $r1 -I $r2 -c -m --merged_out @/merged.fq.gz -o @
 } >"$tmp/merged.csv"
 mkdir -p "$(dirname "$csv")"
 mv "$tmp/merged.csv" "$csv"
-echo "wrote $(wc -l <"$rows" | tr -d ' ') rows for $dataset to $csv"
+echo "wrote $(wc -l <"$rows" | tr -d ' ') rows for $dataset to $csv ($reused fastp snapshots reused)"

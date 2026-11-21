@@ -6,7 +6,9 @@ Wall time in seconds for fastp and fasterp on the same inputs and options, measu
 <div id="bench-chart"></div>
 <p id="bench-meta" class="bench-meta"></p>
 
-fasterp `0.3.0` has new gzip output: blocks with binned qualities, as NovaSeq writes them, use a FASTQ-aware encoder that is as small as level 4 at about 2.4 times its speed, and other blocks are compressed as before. Reads sorted by alignment position, as in ERR3239279, overlap their neighbours, and level 4 compresses them to half the size the FASTQ-aware encoder does, so their blocks stay with level 4.
+fasterp compresses gzip output with a FASTQ-aware encoder at levels 2 to 4. The stream is standard gzip, and the records are the same as fastp's, as the digests in the CSV show. With binned qualities, as NovaSeq writes them, the files are as small as fastp's. With full-range qualities they are larger: about 4% on the 148 bp reads of SRR1766443 and 5 to 8% on the 50 bp reads of SRR5808766 and SRR891269. Reads sorted by alignment position, as in ERR3239279, overlap their neighbours, and level 4 compresses them to half the size the FASTQ-aware encoder does, so their blocks stay with level 4.
+
+The ERR3239279-400M rows were measured with the `0.3.0` release and have not been rerun since.
 
 ## Workloads
 
@@ -47,7 +49,9 @@ cargo build --release
 CSV=book/src/benchmarks.csv bash scripts/bench.sh fastp target/release/fasterp
 ```
 
-The results are written to `book/src/benchmarks.csv`, which this page reads. Rows for the same dataset are replaced and other datasets are kept, so set `R1`, `R2` and `DATASET` to add or update another dataset. `WORKERS`, `RUNS` and `WARMUP` change the worker counts, the number of timed runs and the number of untimed runs before them, and `ARGS` adds options to every command. For example, for the NovaSeq prefix:
+The results are written to `book/src/benchmarks.csv`, which this page reads. Rows for the same dataset are replaced and other datasets are kept, so set `R1`, `R2` and `DATASET` to add or update another dataset.
+
+fastp takes most of the time, so its rows are kept as snapshots. When the CSV already has a fastp row for the same dataset, workload and worker count, measured with the same fastp version on the same machine, the script times only fasterp and keeps that row. It still compares fasterp's output digest with the snapshot's, and times fastp again if they differ, which is what happens when the inputs or `ARGS` have changed. `REFERENCE=rerun` times fastp regardless. `WORKERS`, `RUNS` and `WARMUP` change the worker counts, the number of timed runs and the number of untimed runs before them, and `ARGS` adds options to every command. For example, for the NovaSeq prefix:
 
 ```bash
 bash .github/scripts/download_test_data.sh test_data err3534523-2m
