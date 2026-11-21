@@ -6,7 +6,9 @@ use crate::util::Instant;
 use crate::{adapter, auto_adapter, html, io, overlap, simd, split, stats, Args};
 use anyhow::{ensure, Context, Result};
 use rayon::prelude::*;
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::FxHashMap;
+#[cfg(test)]
+use rustc_hash::FxHashSet;
 use serde_json::{json, Value};
 use std::borrow::Cow;
 use std::collections::{BTreeMap, VecDeque};
@@ -982,14 +984,41 @@ enum BloomPages {
     Sparse(SparseBuckets),
 }
 
-// Keep small sets of exact offsets inline. Spill to a short vector for
-// moderately populated pages, then use indexed lookups as membership scans
-// grow more expensive. A full bitmap bounds the storage for a dense page.
+// Keep small sets of exact offsets inline, then a small table of them that
+// grows with the page. A full bitmap bounds the storage for a dense page.
 enum BloomPage {
-    Small { len: u8, bits: [u16; 24] },
-    Offsets(Vec<u16>),
-    Sparse(FxHashSet<u16>),
+    Small {
+        len: u8,
+        bits: [u16; 24],
+    },
+    /// Open addressing over a power-of-two table, at most three quarters
+    /// full. Where an offset belongs is known from the offset alone, so it
+    /// can be requested from memory before it is looked up.
+    Sparse {
+        slots: Box<[u16]>,
+        len: u16,
+    },
     Bitmap(Box<[u8; 4096]>),
+}
+
+/// A free slot of a sparse page: offsets are below 32768.
+const NO_OFFSET: u16 = u16::MAX;
+
+/// Ask for the memory at `ptr` ahead of its use.
+#[inline(always)]
+fn prefetch<T>(ptr: *const T) {
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: the hint does not dereference or modify memory.
+    unsafe {
+        std::arch::asm!("prfm pldl1keep, [{ptr}]", ptr = in(reg) ptr,
+            options(nostack, preserves_flags, readonly));
+    }
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: a cache hint; the address is never dereferenced.
+    unsafe {
+        std::arch::x86_64::_mm_prefetch::<{ std::arch::x86_64::_MM_HINT_T0 }>(ptr.cast());
+    }
+    let _ = ptr;
 }
 
 impl Default for BloomPage {
@@ -1002,6 +1031,49 @@ impl Default for BloomPage {
 }
 
 impl BloomPage {
+    /// Where `bit` starts its search in a sparse table of `slots` slots.
+    #[inline(always)]
+    fn home(bit: u16, slots: usize) -> usize {
+        (u32::from(bit).wrapping_mul(0x9E37_79B1) >> (32 - slots.trailing_zeros())) as usize
+    }
+
+    /// Insert into a sparse table with room. Returns whether it was there.
+    #[inline(always)]
+    fn probe(slots: &mut [u16], bit: u16) -> bool {
+        let mask = slots.len() - 1;
+        let mut at = Self::home(bit, slots.len());
+        loop {
+            match slots[at] {
+                seen if seen == bit => return true,
+                NO_OFFSET => {
+                    slots[at] = bit;
+                    return false;
+                }
+                _ => at = (at + 1) & mask,
+            }
+        }
+    }
+
+    fn sparse(offsets: impl Iterator<Item = u16>, slots: usize) -> Box<[u16]> {
+        let mut table = vec![NO_OFFSET; slots].into_boxed_slice();
+        for offset in offsets {
+            Self::probe(&mut table, offset);
+        }
+        table
+    }
+
+    /// Request the memory `check_and_set(bit)` will read.
+    #[inline(always)]
+    fn prefetch(&self, bit: u16) {
+        match self {
+            Self::Small { .. } => {}
+            Self::Sparse { slots, .. } => {
+                prefetch(slots.as_ptr().wrapping_add(Self::home(bit, slots.len())));
+            }
+            Self::Bitmap(bitmap) => prefetch(bitmap.as_ptr().wrapping_add(usize::from(bit) / 8)),
+        }
+    }
+
     fn check_and_set(&mut self, bit: u16) -> bool {
         match self {
             Self::Small { len, bits } => {
@@ -1014,42 +1086,29 @@ impl BloomPage {
                     bits[usize::from(*len)] = bit;
                     *len += 1;
                 } else {
-                    let mut offsets = Vec::with_capacity(32);
-                    offsets.extend_from_slice(bits);
-                    offsets.push(bit);
-                    *self = Self::Offsets(offsets);
+                    let all = bits.iter().copied().chain(std::iter::once(bit));
+                    *self = Self::Sparse {
+                        slots: Self::sparse(all, 64),
+                        len: 25,
+                    };
                 }
                 false
             }
-            Self::Offsets(offsets) => {
-                if offsets.contains(&bit) {
+            Self::Sparse { slots, len } => {
+                if Self::probe(slots, bit) {
                     return true;
                 }
-                if offsets.len() < 64 {
-                    offsets.push(bit);
-                } else {
-                    *self = Self::Sparse(
-                        offsets
-                            .iter()
-                            .copied()
-                            .chain(std::iter::once(bit))
-                            .collect(),
-                    );
-                }
-                false
-            }
-            Self::Sparse(offsets) => {
-                if !offsets.insert(bit) {
-                    return true;
-                }
-                // At 896 entries the next hash table allocation would exceed
-                // the size of the complete bitmap (u16 keys plus control bytes).
-                if offsets.len() == 896 {
+                *len += 1;
+                let held = slots.iter().copied().filter(|&o| o != NO_OFFSET);
+                if *len == 896 {
+                    // The next table would be as large as the whole bitmap.
                     let mut bitmap = Box::new([0; 4096]);
-                    for &offset in offsets.iter() {
+                    for offset in held {
                         bitmap[usize::from(offset) / 8] |= 1 << (offset % 8);
                     }
                     *self = Self::Bitmap(bitmap);
+                } else if usize::from(*len) * 4 > slots.len() * 3 {
+                    *slots = Self::sparse(held, slots.len() * 2);
                 }
                 false
             }
@@ -1118,22 +1177,28 @@ impl BucketTable {
         }
     }
 
-    #[inline]
+    /// The three reads a check may make depend on one another: the bucket
+    /// and the overflow directory, then the page the directory points at,
+    /// then the page's own storage. Each is requested a few checks before
+    /// the one that needs it, so a check rarely waits for memory itself.
+    #[inline(always)]
     fn prefetch(&self, bit: u64) {
-        let ptr = self.buckets.as_ptr().wrapping_add((bit >> 11) as usize);
-        #[cfg(target_arch = "aarch64")]
-        // SAFETY: the hint does not dereference or modify memory.
-        unsafe {
-            std::arch::asm!("prfm pldl1keep, [{ptr}]", ptr = in(reg) ptr,
-                options(nostack, preserves_flags, readonly));
+        prefetch(self.buckets.as_ptr().wrapping_add((bit >> 11) as usize));
+        prefetch(self.overflow.as_ptr().wrapping_add((bit >> 15) as usize));
+    }
+
+    #[inline(always)]
+    fn prefetch_page(&self, bit: u64) {
+        if let Some(page) = &self.overflow[(bit >> 15) as usize] {
+            prefetch::<BloomPage>(&**page);
         }
-        #[cfg(target_arch = "x86_64")]
-        // SAFETY: the pointer addresses an allocated bucket and this is a cache hint.
-        unsafe {
-            std::arch::x86_64::_mm_prefetch::<{ std::arch::x86_64::_MM_HINT_T0 }>(ptr.cast());
+    }
+
+    #[inline(always)]
+    fn prefetch_entry(&self, bit: u64) {
+        if let Some(page) = &self.overflow[(bit >> 15) as usize] {
+            page.prefetch((bit & 32767) as u16);
         }
-        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-        let _ = ptr;
     }
 
     fn check_and_set(&mut self, bit: u64) -> bool {
@@ -1252,14 +1317,21 @@ impl Duplication {
                         & b.check_and_set(BucketTable::address(pair[1])),
                 )
             };
-            const AHEAD: usize = 16;
+            const AHEAD: usize = 8;
             let mut count = 0;
-            for (pair, later) in pairs.iter().zip(pairs.iter().skip(AHEAD)) {
-                a.prefetch(BucketTable::address(later[0]));
-                b.prefetch(BucketTable::address(later[1]));
-                count += check(a, b, pair);
-            }
-            for pair in &pairs[pairs.len().saturating_sub(AHEAD)..] {
+            for (i, pair) in pairs.iter().enumerate() {
+                if let Some(later) = pairs.get(i + 3 * AHEAD) {
+                    a.prefetch(BucketTable::address(later[0]));
+                    b.prefetch(BucketTable::address(later[1]));
+                }
+                if let Some(later) = pairs.get(i + 2 * AHEAD) {
+                    a.prefetch_page(BucketTable::address(later[0]));
+                    b.prefetch_page(BucketTable::address(later[1]));
+                }
+                if let Some(later) = pairs.get(i + AHEAD) {
+                    a.prefetch_entry(BucketTable::address(later[0]));
+                    b.prefetch_entry(BucketTable::address(later[1]));
+                }
                 count += check(a, b, pair);
             }
             return count;
@@ -1274,15 +1346,25 @@ impl Duplication {
     /// larger than the cache, so the buckets of later reads are requested
     /// while earlier ones are checked.
     fn check_batch(&mut self, positions: &[[u64; 8]]) -> Vec<bool> {
-        const AHEAD: usize = 16;
+        const AHEAD: usize = 8;
         let mask = self.bits - 1;
+        let dense = |buffers: &[BloomPages], positions: &[u64; 8], stage: usize| {
+            for (buf, pos) in buffers.iter().zip(positions) {
+                if let BloomPages::Dense(table) = buf {
+                    let bit = BucketTable::address(pos & mask);
+                    match stage {
+                        3 => table.prefetch(bit),
+                        2 => table.prefetch_page(bit),
+                        _ => table.prefetch_entry(bit),
+                    }
+                }
+            }
+        };
         (0..positions.len())
             .map(|i| {
-                if let Some(later) = positions.get(i + AHEAD) {
-                    for (buf, pos) in self.buffers.iter().zip(later) {
-                        if let BloomPages::Dense(table) = buf {
-                            table.prefetch(BucketTable::address(pos & mask));
-                        }
+                for stage in 1..=3 {
+                    if let Some(later) = positions.get(i + stage * AHEAD) {
+                        dense(&self.buffers, later, stage);
                     }
                 }
                 self.check_positions(&positions[i])
@@ -4488,10 +4570,10 @@ mod tests {
                 assert!(matches!(page, BloomPage::Small { len: 24, .. }));
             }
             if index == 24 {
-                assert!(matches!(page, BloomPage::Offsets(_)));
+                assert!(matches!(page, BloomPage::Sparse { len: 25, .. }));
             }
-            if index == 64 {
-                assert!(matches!(page, BloomPage::Sparse(_)));
+            if let BloomPage::Sparse { slots, len } = &page {
+                assert!(usize::from(*len) * 4 <= slots.len() * 3, "table too full");
             }
         }
         assert!(matches!(page, BloomPage::Bitmap(_)));
