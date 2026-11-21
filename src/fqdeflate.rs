@@ -21,6 +21,10 @@ const MIN_MATCH: usize = 4;
 const MAX_MATCH: usize = 258;
 const NICE_MATCH: usize = 64;
 const INSERT_IN_MATCH: usize = 16;
+/// With binned qualities matches are long and alike, and four positions find
+/// nearly all that sixteen do: 12% faster for files 0.5% larger, which still
+/// leaves them the size of level 4's.
+const INSERT_IN_BINNED_MATCH: usize = 4;
 
 const HASH_BITS: u32 = 12;
 
@@ -47,7 +51,13 @@ const OVERLAP_KEY: usize = 16;
 /// other like sorted reads. The choice depends only on the block, so output
 /// is the same on every run and thread count.
 pub(crate) fn suits(input: &[u8]) -> bool {
-    quality_values(input).is_some()
+    kind(input).is_some()
+}
+
+/// Whether the encoder should compress `input`, as [`suits`], and if so
+/// whether its qualities are binned.
+pub(crate) fn kind(input: &[u8]) -> Option<bool> {
+    quality_values(input).map(|values| values <= MAX_BINS)
 }
 
 /// Whether `input` suits the encoder and its first records have binned
@@ -191,6 +201,34 @@ fn dist_symbol(t: &Tables, d: usize) -> usize {
 /// input alongside them.
 type Token = u32;
 const MATCH: u32 = 1 << 31;
+/// A literal run of bases, which the writer codes four at a time.
+const BASES: u32 = 1 << 30;
+
+/// The two bits that tell A, C, T and G apart, in that order.
+const BASE_ORDER: [u8; 4] = *b"ACTG";
+
+/// Four bases as one byte, two bits each, the first in the low bits.
+#[inline(always)]
+fn quad_index(word: u32) -> usize {
+    let two = (word >> 1) & 0x0303_0303;
+    ((two | two >> 6 | two >> 12 | two >> 18) & 0xff) as usize
+}
+
+/// The four bases each index stands for, to tell them from other bytes
+/// that share the same two bits, such as N.
+const QUAD_BYTES: [u32; 256] = {
+    let mut table = [0u32; 256];
+    let mut index = 0;
+    while index < 256 {
+        let mut k = 0;
+        while k < 4 {
+            table[index] |= (BASE_ORDER[(index >> (2 * k)) & 3] as u32) << (8 * k);
+            k += 1;
+        }
+        index += 1;
+    }
+    table
+};
 
 #[inline(always)]
 fn token_match(len: usize, dist: usize) -> Token {
@@ -203,6 +241,8 @@ struct Tokens {
     lit_freq: [u32; 512],
     /// Literal counts from `literals`, added into `lit_freq` at the end.
     lit4: [[u32; 256]; 4],
+    /// Counts of four bases at once from `bases`, by `quad_index`.
+    quads: [u32; 256],
     dist_freq: [u32; 32],
     /// Length of the literal run being accumulated.
     run: u32,
@@ -229,6 +269,31 @@ impl Tokens {
             self.lit_freq[b as usize] += 1;
         }
         self.run += bytes.len() as u32;
+    }
+    /// Literals from a sequence line. Counted four at a time: one increment
+    /// for each four bases, shared out between the bases at the end.
+    #[inline(always)]
+    fn bases(&mut self, bytes: &[u8]) {
+        if bytes.is_empty() {
+            return;
+        }
+        self.end_run();
+        let mut quads = bytes.chunks_exact(4);
+        for q in &mut quads {
+            let word = u32::from_le_bytes(q.try_into().unwrap());
+            let index = quad_index(word);
+            if QUAD_BYTES[index] == word {
+                self.quads[index] += 1;
+            } else {
+                for &b in q {
+                    self.lit_freq[b as usize] += 1;
+                }
+            }
+        }
+        for &b in quads.remainder() {
+            self.lit_freq[b as usize] += 1;
+        }
+        self.buf.push(bytes.len() as u32 | BASES);
     }
     #[inline(always)]
     fn end_run(&mut self) {
@@ -277,6 +342,8 @@ pub struct Matcher {
     base: u32,
     /// Token buffer, kept between blocks.
     tokens: Vec<Token>,
+    /// Positions inserted inside each match.
+    insert_in_match: usize,
 }
 
 const READ_KEY: usize = 16;
@@ -295,6 +362,7 @@ impl Matcher {
                 .unwrap(),
             base: 0,
             tokens: Vec::new(),
+            insert_in_match: INSERT_IN_MATCH,
         }
     }
 
@@ -485,7 +553,7 @@ impl Matcher {
             // costs 10% of the speed for 0.5% of the size.
             let stop = (pos + len).min(limit);
             let mut p = pos + 1;
-            let insert_until = (pos + 1 + INSERT_IN_MATCH).min(stop);
+            let insert_until = (pos + 1 + self.insert_in_match).min(stop);
             while p < insert_until {
                 self.insert(data, p);
                 p += 1;
@@ -608,10 +676,10 @@ impl<'a> Tokenizer<'a> {
         // Below about 24 bases a match costs more bits than two-bit literals.
         if len >= 24 {
             self.tok.matched(self.t, len, dist);
-            self.tok.literals(&self.data[start + len..end]);
+            self.tok.bases(&self.data[start + len..end]);
             return;
         }
-        self.tok.literals(&self.data[start..end]);
+        self.tok.bases(&self.data[start..end]);
     }
 
     fn generic(&mut self, start: usize, end: usize) {
@@ -910,6 +978,7 @@ pub fn deflate(input: &[u8], matcher: &mut Matcher, out: &mut Vec<u8>) {
             buf,
             lit_freq: [0; 512],
             lit4: [[0; 256]; 4],
+            quads: [0; 256],
             dist_freq: [0; 32],
             run: 0,
         },
@@ -923,6 +992,11 @@ pub fn deflate(input: &[u8], matcher: &mut Matcher, out: &mut Vec<u8>) {
     for table in &tok.lit4 {
         for (f, &c) in tok.lit_freq.iter_mut().zip(table) {
             *f += c;
+        }
+    }
+    for (index, &count) in tok.quads.iter().enumerate() {
+        for k in 0..4 {
+            tok.lit_freq[BASE_ORDER[(index >> (2 * k)) & 3] as usize] += count;
         }
     }
     tok.lit_freq[256] = 1;
@@ -1042,11 +1116,64 @@ pub fn deflate(input: &[u8], matcher: &mut Matcher, out: &mut Vec<u8>) {
             count + LEN_EXTRA[symbol - 257] as u32,
         )
     });
+    // Four bases' codes together, and their length, when that fits 32 bits.
+    let base_lens = BASE_ORDER.map(|b| lit_lens[b as usize] as u32);
+    let quads_fit = base_lens.iter().all(|&len| (1..=8).contains(&len));
+    let quad_table: [(u32, u32); 256] = std::array::from_fn(|index| {
+        let (mut bits, mut count) = (0u32, 0u32);
+        if quads_fit {
+            for k in 0..4 {
+                let base = BASE_ORDER[(index >> (2 * k)) & 3] as usize;
+                bits |= u32::from(lit_codes[base]) << count;
+                count += lit_lens[base] as u32;
+            }
+        }
+        (bits, count)
+    });
     let mut ip = 0usize;
     for &tk in &tok.buf {
-        if tk & MATCH == 0 {
-            let run = &input[ip..ip + tk as usize];
-            ip += tk as usize;
+        if tk & MATCH == 0 && tk & BASES != 0 && quads_fit {
+            let len = (tk & !BASES) as usize;
+            let run = &input[ip..ip + len];
+            ip += len;
+            let (mut pending, mut held) = (0u64, 0u32);
+            let mut quads = run.chunks_exact(4);
+            for q in &mut quads {
+                let word = u32::from_le_bytes(q.try_into().unwrap());
+                let index = quad_index(word);
+                let (bits, count) = if QUAD_BYTES[index] == word {
+                    quad_table[index]
+                } else {
+                    // Not four bases: at most 60 bits, written on their own.
+                    if held > 0 {
+                        w.put_small(pending, held);
+                        (pending, held) = (0, 0);
+                    }
+                    for &b in &q[..3] {
+                        let e = lit_table[b as usize];
+                        w.put_small(u64::from(e & 0xff_ffff), e >> 24);
+                    }
+                    let e = lit_table[q[3] as usize];
+                    (e & 0xff_ffff, e >> 24)
+                };
+                if held + count > 56 {
+                    w.put_small(pending, held);
+                    (pending, held) = (0, 0);
+                }
+                pending |= u64::from(bits) << held;
+                held += count;
+            }
+            if held > 0 {
+                w.put_small(pending, held);
+            }
+            for &b in quads.remainder() {
+                let e = lit_table[b as usize];
+                w.put_small(u64::from(e & 0xff_ffff), e >> 24);
+            }
+        } else if tk & MATCH == 0 {
+            let len = (tk & !BASES) as usize;
+            let run = &input[ip..ip + len];
+            ip += len;
             // Several codes per put: up to 56 bits fit.
             let code = |b: u8| {
                 let e = lit_table[b as usize];
@@ -1098,7 +1225,9 @@ pub fn deflate(input: &[u8], matcher: &mut Matcher, out: &mut Vec<u8>) {
 
 /// A complete gzip member for `input`, carrying the `FP` member-size extra
 /// field that `io` uses to decompress members in parallel.
-pub(crate) fn gzip_member(input: &[u8], out: &mut Vec<u8>) {
+/// `binned` says the block's qualities are binned (see [`kind`]); it only
+/// tunes the matcher.
+pub(crate) fn gzip_member(input: &[u8], binned: bool, out: &mut Vec<u8>) {
     thread_local! {
         static MATCHER: std::cell::RefCell<Matcher> = std::cell::RefCell::new(Matcher::new());
     }
@@ -1113,7 +1242,15 @@ pub(crate) fn gzip_member(input: &[u8], out: &mut Vec<u8>) {
     out.extend_from_slice(&4u16.to_le_bytes());
     let size_at = out.len();
     out.extend_from_slice(&[0; 4]);
-    MATCHER.with(|m| deflate(input, &mut m.borrow_mut(), out));
+    MATCHER.with(|m| {
+        let mut matcher = m.borrow_mut();
+        matcher.insert_in_match = if binned {
+            INSERT_IN_BINNED_MATCH
+        } else {
+            INSERT_IN_MATCH
+        };
+        deflate(input, &mut matcher, out)
+    });
     let mut crc = libdeflater::Crc::new();
     crc.update(input);
     out.extend_from_slice(&crc.sum().to_le_bytes());
@@ -1128,8 +1265,13 @@ mod tests {
     use std::io::Read;
 
     fn roundtrip(data: &[u8]) {
+        roundtrip_as(data, false);
+        roundtrip_as(data, true);
+    }
+
+    fn roundtrip_as(data: &[u8], binned: bool) {
         let mut out = Vec::new();
-        gzip_member(data, &mut out);
+        gzip_member(data, binned, &mut out);
         let mut back = Vec::new();
         flate2::read::MultiGzDecoder::new(&out[..])
             .read_to_end(&mut back)
@@ -1206,6 +1348,44 @@ mod tests {
             .copied()
             .collect();
         roundtrip(&mixed);
+    }
+
+    #[test]
+    fn bases_four_at_a_time_match_one_at_a_time() {
+        // Every index names its own four bases, and nothing else passes.
+        for index in 0..256 {
+            assert_eq!(quad_index(QUAD_BYTES[index]), index);
+        }
+        assert_ne!(
+            QUAD_BYTES[quad_index(u32::from_le_bytes(*b"ACNT"))],
+            u32::from_le_bytes(*b"ACNT")
+        );
+        assert_ne!(
+            QUAD_BYTES[quad_index(u32::from_le_bytes(*b"acgt"))],
+            u32::from_le_bytes(*b"acgt")
+        );
+        // Sequence lines of every length, with N, lower case and other bytes
+        // at every position of a group of four.
+        let mut x = 99u64;
+        let mut next = |n: usize| {
+            x = x.wrapping_mul(6364136223846793005).wrapping_add(1);
+            (x >> 33) as usize % n
+        };
+        for odd in [b'N', b'a', b'.', b'G'] {
+            let mut data = Vec::new();
+            for record in 0..300 {
+                let len = 1 + record % 37;
+                data.extend_from_slice(format!("@r{record}\n").as_bytes());
+                for k in 0..len {
+                    data.push(if next(9) == 0 { odd } else { b"ACGT"[next(4)] });
+                    let _ = k;
+                }
+                data.extend_from_slice(b"\n+\n");
+                data.extend(std::iter::repeat_n(b'F', len));
+                data.push(b'\n');
+            }
+            roundtrip(&data);
+        }
     }
 
     #[test]
@@ -1350,7 +1530,7 @@ mod fuzz {
         for it in 0..iters {
             let data = sample(&mut r);
             gz.clear();
-            super::gzip_member(&data, &mut gz);
+            super::gzip_member(&data, super::binned(&data), &mut gz);
             let mut back = Vec::with_capacity(data.len());
             flate2::read::GzDecoder::new(&gz[..])
                 .read_to_end(&mut back)
@@ -1389,7 +1569,7 @@ mod corpus {
         let mut fq = 0;
         for c in &chunks {
             out.clear();
-            super::gzip_member(c, &mut out);
+            super::gzip_member(c, super::binned(c), &mut out);
             fq += out.len();
         }
         let fq_t = t.elapsed().as_secs_f64();
@@ -1407,7 +1587,7 @@ mod corpus {
         for c in &chunks {
             if super::suits(c) {
                 out.clear();
-                super::gzip_member(c, &mut out);
+                super::gzip_member(c, super::binned(c), &mut out);
                 gated += out.len();
                 picked += 1;
             } else {

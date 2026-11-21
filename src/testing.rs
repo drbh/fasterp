@@ -6,7 +6,7 @@ use std::io::{self, BufReader, Read};
 /// not the output path would choose it for this block.
 pub fn fq_gzip_member(input: &[u8]) -> Vec<u8> {
     let mut out = Vec::new();
-    crate::fqdeflate::gzip_member(input, &mut out);
+    crate::fqdeflate::gzip_member(input, crate::fqdeflate::binned(input), &mut out);
     out
 }
 
