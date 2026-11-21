@@ -6,7 +6,9 @@
 
 With --dataset, one panel per workload shows each program's seconds and
 megabytes. Without it, every dataset is drawn relative to fastp, so sets of
-different sizes share the axes. --name VERSION=TEXT renames a version in the
+different sizes share the axes. --rate turns the --dataset axes into megabases
+read per second and megabases read per megabyte of peak memory, so better is
+up and to the right. --name VERSION=TEXT renames a version in the
 legend, for example --name 0.3.0+13331c6=my-branch. Needs matplotlib.
 """
 import argparse
@@ -39,6 +41,7 @@ def load(path, workers):
         if int(row["workers"]) != workers or not row.get("peak_mb"):
             continue
         row["mean"], row["peak_mb"] = float(row["mean"]), float(row["peak_mb"])
+        row["megabases"] = float(row.get("input_bases") or 0) / 1e6
         groups[row["dataset"], row["workload"]][row["program"], row["version"]] = row
     return groups
 
@@ -73,30 +76,41 @@ def legend(fig, fastp, names, colors):
                frameon=False, fontsize=12, handletextpad=0.3, columnspacing=1.8, labelcolor=INK)
 
 
-def one_dataset(groups, dataset, order, names, fig, axes):
+def seconds_and_megabytes(row):
+    return row["mean"], row["peak_mb"], f"{row['mean']:.2f} s · {row['peak_mb']:.0f} MB"
+
+
+def rates(row):
+    """Megabases per second, and megabases per megabyte of peak memory."""
+    speed, economy = row["megabases"] / row["mean"], row["megabases"] / row["peak_mb"]
+    return speed, economy, f"{speed:,.0f} Mb/s · {economy:.2f} Mb/MB"
+
+
+def one_dataset(groups, dataset, order, names, fig, axes, measure, xlabel, ylabel):
     for ax, workload in zip(axes, WORKLOADS):
         rows = groups.get((dataset, workload), {})
         style(ax)
         ax.set_title(workload, loc="left", fontsize=13, fontweight="bold", color=INK, pad=10)
         points = [(k, r) for k, r in rows.items() if k[0] == "fastp"]
         points += [(("fasterp", v), rows["fasterp", v]) for v in order if ("fasterp", v) in rows]
+        points = [(k, measure(r)) for k, r in points]
         if not points:
             continue
-        path = [(r["mean"], r["peak_mb"]) for (p, _), r in points if p == "fasterp"]
+        path = [(x, y) for (p, _), (x, y, _) in points if p == "fasterp"]
         ax.plot(*zip(*path), color=GRID, linewidth=2, zorder=2)
-        right = max(r["mean"] for _, r in points) * 1.25
-        top = max(r["peak_mb"] for _, r in points) * 1.2
+        right = max(x for _, (x, _, _) in points) * 1.25
+        top = max(y for _, (_, y, _) in points) * 1.2
         ax.set_xlim(0, right)
         ax.set_ylim(0, top)
         labels = []
-        for (program, version), r in points:
+        for (program, version), (x, y, values) in points:
             fastp = program == "fastp"
             color = REFERENCE if fastp else SERIES[order.index(version)]
-            dot(ax, r["mean"], r["peak_mb"], color, "D" if fastp else "o")
+            dot(ax, x, y, color, "D" if fastp else "o")
             name = f"fastp {version}" if fastp else names[order.index(version)]
-            px, py = ax.transData.transform((r["mean"], r["peak_mb"]))
+            px, py = ax.transData.transform((x, y))
             # the label goes left of the point when the right would leave the panel
-            labels.append([py, px, r["mean"] > right * 0.6, f"{name}\n{r['mean']:.2f} s · {r['peak_mb']:.0f} MB"])
+            labels.append([py, px, x > right * 0.6, f"{name}\n{values}"])
         # Labels on the same side that would overlap form a stack: one column
         # beside the outermost point, centred on the points, with leader lines.
         boxes = []
@@ -127,8 +141,8 @@ def one_dataset(groups, dataset, order, names, fig, axes):
                                 linespacing=1.35, zorder=5,
                                 arrowprops={"arrowstyle": "-", "color": MUTED, "linewidth": 0.8, "shrinkB": 6}
                                 if y != py else None)
-        ax.set_xlabel("Wall time (seconds)", color=MUTED, fontsize=11)
-    axes[0].set_ylabel("Peak memory (MB)", color=MUTED, fontsize=11)
+        ax.set_xlabel(xlabel, color=MUTED, fontsize=11)
+    axes[0].set_ylabel(ylabel, color=MUTED, fontsize=11)
 
 
 def relative(groups, order, fig, axes):
@@ -173,6 +187,7 @@ def main():
     parser.add_argument("out")
     parser.add_argument("--dataset")
     parser.add_argument("--workers", type=int, default=8)
+    parser.add_argument("--rate", action="store_true", help="plot megabases per second and per megabyte")
     parser.add_argument("--name", action="append", default=[], metavar="VERSION=TEXT")
     args = parser.parse_args()
 
@@ -191,8 +206,16 @@ def main():
     fig, axes = plt.subplots(1, 3, figsize=(16.5, 6.6), sharey=bool(not args.dataset), facecolor=SURFACE,
                              dpi=110)
     fig.subplots_adjust(left=0.055, right=0.985, top=0.74, bottom=0.1, wspace=0.16 if args.dataset else 0.07)
-    if args.dataset:
-        one_dataset(groups, args.dataset, order, names, fig, axes)
+    better = "lower left is better"
+    if args.dataset and args.rate:
+        one_dataset(groups, args.dataset, order, names, fig, axes, rates,
+                    "Megabases read per second", "Megabases read per MB of peak memory")
+        title = f"Throughput and memory economy on {args.dataset}"
+        note = "Each line joins the fasterp builds from oldest to newest"
+        better = "upper right is better"
+    elif args.dataset:
+        one_dataset(groups, args.dataset, order, names, fig, axes, seconds_and_megabytes,
+                    "Wall time (seconds)", "Peak memory (MB)")
         title = f"Wall time and peak memory on {args.dataset}"
         note = "Each line joins the fasterp builds from oldest to newest"
     else:
@@ -201,7 +224,7 @@ def main():
         note = f"One point per dataset ({len({d for d, _ in groups})} datasets), joined from the oldest fasterp build to the newest"
     fig.text(0.055, 0.965, title, fontsize=20, fontweight="bold", color=INK, va="top")
     fig.text(0.055, 0.9, f"gzip in, gzip out · -w {args.workers} · {' · '.join(machine)} · {note} · "
-             "lower left is better", fontsize=11.5, color=MUTED, va="top")
+             f"{better}", fontsize=11.5, color=MUTED, va="top")
     legend(fig, " / ".join(fastp), [n for n, d in zip(names, drawn) if d],
            [c for c, d in zip(SERIES, drawn) if d])
     fig.savefig(args.out, facecolor=SURFACE)

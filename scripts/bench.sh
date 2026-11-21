@@ -29,7 +29,8 @@
 # version with a + is never kept as a snapshot. LABEL overrides the label.
 #
 # Each row also has the CPU time (user plus system, mean per run) and the peak
-# resident memory (largest of the runs), the latter from /usr/bin/time.
+# resident memory (largest of the runs), the latter from /usr/bin/time, and
+# the number of bases read, from the report of the build under test.
 set -euo pipefail
 
 fastp=${1:-fastp}
@@ -45,7 +46,7 @@ extra=${ARGS:-}
 csv=${CSV:-$out/results.csv}
 reference=${REFERENCE:-snapshot}
 releases=${RELEASES:-}
-header=dataset,workload,workers,program,version,mean,stddev,min,max,runs,machine,date,output_bytes,output_sha256,cpu_seconds,peak_mb
+header=dataset,workload,workers,program,version,mean,stddev,min,max,runs,machine,date,output_bytes,output_sha256,cpu_seconds,peak_mb,input_bases
 
 command -v hyperfine >/dev/null || { echo "hyperfine is required (brew install hyperfine)" >&2; exit 1; }
 tmp=$out/tmp
@@ -137,10 +138,21 @@ time_program() {
   done
 }
 
+# Bases in the input, from the summary of the report just written.
+input_bases() {
+  grep -o '"before_filtering":{[^}]*}' "$tmp/report.json" | tail -1 | sed 's/.*"total_bases":\([0-9]*\).*/\1/'
+}
+
+# Append a row to $rows with the group's input size.
+keep() {
+  echo "$1" | awk -F, -v OFS=, -v b="$bases" '{ $17 = b; print }' >>"$rows"
+}
+
 bench() {
-  local name=$1 args=$2 w ours kept release version given
+  local name=$1 args=$2 w ours kept release version given bases
   for w in ${workers//,/ }; do
     ours=$(time_program fasterp "$label" "$name" "$w" "$fasterp $args")
+    bases=$(input_bases)
     kept=$(snapshot fastp "$fastp_version" "$name" "$w")
     if [ -n "$kept" ] && [ "$(echo "$kept" | cut -d, -f14)" != "$(echo "$ours" | cut -d, -f14)" ]; then
       echo "$dataset $name -w $w: output differs from the fastp snapshot, timing fastp again" >&2
@@ -151,7 +163,7 @@ bench() {
     else
       kept=$(time_program fastp "$fastp_version" "$name" "$w" "$fastp $args")
     fi
-    echo "$kept" >>"$rows"
+    keep "$kept"
     given=" $label "
     for release in $releases; do
       version=$("$release" --version | awk '{print $2}')
@@ -171,15 +183,15 @@ bench() {
         echo "$dataset $name -w $w: fasterp $version writes different output, no row written" >&2
         continue
       fi
-      echo "$kept" >>"$rows"
+      keep "$kept"
     done
     # snapshots of releases whose binary was not given
     if [ -f "$csv" ]; then
       awk -F, -v d="$dataset" -v n="$name" -v w="$w" -v given="$given" \
         '$1 == d && $2 == n && $3 == w && $4 == "fasterp" && $5 !~ /\+/ && $16 != "" && !index(given, " " $5 " ")' \
-        "$csv" >>"$rows"
+        "$csv" | while read -r kept; do keep "$kept"; done
     fi
-    echo "$ours" >>"$rows"
+    keep "$ours"
   done
 }
 
@@ -192,7 +204,7 @@ bench paired-correct-merge "-i $r1 -I $r2 -c -m --merged_out @/merged.fq.gz -o @
 {
   echo "$header"
   if [ -f "$csv" ]; then
-    tail -n +2 "$csv" | awk -F, -v OFS=, -v d="$dataset" '$1 != d { if (NF == 14) $16 = ""; print }'
+    tail -n +2 "$csv" | awk -F, -v OFS=, -v d="$dataset" '$1 != d { if (NF < 17) $17 = ""; print }'
   fi
   cat "$rows"
 } >"$tmp/merged.csv"

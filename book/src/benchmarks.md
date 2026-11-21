@@ -55,11 +55,12 @@ Programs that never change are measured once and their rows are kept as snapshot
 
 The build under test is always timed. Its row is labelled with the version and the commit, as in `0.3.0+13331c6`, unless the commit is that version's tag. A release gets a row only where its output digest equals the build under test's, so every row of a group did the same work. Release rows stay in the CSV when their binary is not given, so the history can be plotted later. This page charts fastp against the newest fasterp row.
 
-Each row also records the CPU time (user plus system) and the peak resident memory, taken from `/usr/bin/time`. `scripts/bench_plot.py` draws wall time against peak memory for every program in the CSV:
+Each row also records the CPU time (user plus system), the peak resident memory, taken from `/usr/bin/time`, and the number of bases read. `scripts/bench_plot.py` draws wall time against peak memory for every program in the CSV. With `--rate` it draws megabases read per second against megabases read per megabyte of peak memory, so better is up and to the right:
 
 ```bash
 RELEASES="path/to/fasterp-0.2.1 path/to/fasterp-0.3.0" CSV=book/src/benchmarks.csv bash scripts/bench.sh
 python3 scripts/bench_plot.py book/src/benchmarks.csv memory.png --dataset SRR5808766
+python3 scripts/bench_plot.py book/src/benchmarks.csv rate.png --dataset SRR5808766 --rate
 ```
 
 `WORKERS`, `RUNS` and `WARMUP` change the worker counts, the number of timed runs and the number of untimed runs before them, and `ARGS` adds options to every command. For example, for the NovaSeq prefix:
