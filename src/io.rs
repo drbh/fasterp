@@ -892,7 +892,7 @@ pub(crate) fn binned_gzip_input(path: &str) -> bool {
     if decoder.take(256 << 10).read_to_end(&mut head).is_err() {
         return false;
     }
-    crate::fqdeflate::suits(&head)
+    crate::fqdeflate::binned(&head)
 }
 
 pub(crate) fn open_input(path: &str) -> Result<Box<dyn BufRead + Send>> {

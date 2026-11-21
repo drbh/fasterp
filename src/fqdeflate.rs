@@ -28,7 +28,8 @@ const HASH_BITS: u32 = 12;
 /// as NovaSeq and NextSeq 2000 write them (four values). There this encoder
 /// matches libdeflate level 4 in size at about 2.4 times its speed. With eight
 /// bins or full-range qualities level 4 finds matches in the qualities that
-/// greedy hashing misses, and is 2-8% smaller, so those blocks stay with it.
+/// greedy hashing misses: this encoder's output is about 3% and 4% larger
+/// there, at about twice the speed.
 const MAX_BINS: u32 = 6;
 const SAMPLE_RECORDS: usize = 64;
 
@@ -42,20 +43,28 @@ const OVERLAP_READS: usize = 8;
 const OVERLAP_KEY: usize = 16;
 
 /// Whether the FASTQ-aware encoder should compress `input` instead of
-/// libdeflate: the block's first records have binned qualities and do not
-/// overlap each other like sorted reads. The choice depends only on the
-/// block, so output is the same on every run and thread count.
+/// libdeflate: the block starts with FASTQ records that do not overlap each
+/// other like sorted reads. The choice depends only on the block, so output
+/// is the same on every run and thread count.
 pub(crate) fn suits(input: &[u8]) -> bool {
-    binned_unsorted(input)
+    quality_values(input).is_some()
 }
 
-fn binned_unsorted(data: &[u8]) -> bool {
+/// Whether `input` suits the encoder and its first records have binned
+/// qualities, which decode and compress much faster than full-range ones.
+pub(crate) fn binned(input: &[u8]) -> bool {
+    quality_values(input).is_some_and(|values| values <= MAX_BINS)
+}
+
+/// The number of distinct quality characters in the first records of `data`,
+/// or `None` when it does not start with unsorted FASTQ records.
+fn quality_values(data: &[u8]) -> Option<u32> {
     let n = data.len();
     let mut pos = 0;
     while !record_starts(data, pos) {
         match memchr::memchr(b'\n', &data[pos.min(n)..]) {
             Some(i) => pos += i + 1,
-            None => return false,
+            None => return None,
         }
     }
     let mut seen = [0u64; 4];
@@ -91,10 +100,8 @@ fn binned_unsorted(data: &[u8]) -> bool {
         records += 1;
         pos = end + 1;
     }
-    records > 0
-        && seen.iter().map(|w| w.count_ones()).sum::<u32>() <= MAX_BINS
-        // Every fourth record is tested.
-        && overlapping * 16 <= records
+    // Every fourth record is tested.
+    (records > 0 && overlapping * 16 <= records).then(|| seen.iter().map(|w| w.count_ones()).sum())
 }
 
 // ---- static tables --------------------------------------------------------
@@ -1114,8 +1121,21 @@ mod tests {
         };
         let unsorted = fastq(&mut |_| next(genome.len() - 150));
         let sorted = fastq(&mut |i| i * 5);
-        assert!(suits(&unsorted));
-        assert!(!suits(&sorted));
+        assert!(suits(&unsorted) && binned(&unsorted));
+        assert!(!suits(&sorted) && !binned(&sorted));
+        // Full-range qualities suit the encoder but are not binned.
+        let mut full = unsorted.clone();
+        let mut at = 0;
+        for (line, text) in unsorted.split_inclusive(|&b| b == b'\n').enumerate() {
+            if line % 4 == 3 {
+                for (k, q) in full[at..at + text.len() - 1].iter_mut().enumerate() {
+                    *q = b'!' + ((k * 7 + line) % 41) as u8;
+                }
+            }
+            at += text.len();
+        }
+        assert!(suits(&full) && !binned(&full));
+        assert!(!suits(b"not a fastq file\n"));
     }
 }
 
