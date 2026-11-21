@@ -1098,6 +1098,7 @@ dependencies = [
  "gzp",
  "indexmap",
  "js-sys",
+ "libdeflate-sys",
  "libdeflater",
  "memchr",
  "mimalloc",

@@ -484,12 +484,14 @@ const BUFFER: usize = 1024 * 1024;
 /// member end and, before each member's last buffer, its trailer values. An
 /// empty buffer marks the end of input.
 fn inflate_members(
-    mut input: BufReader<Box<dyn Read + Send>>,
+    input: BufReader<Box<dyn Read + Send>>,
     sender: &crossbeam_channel::Sender<std::io::Result<Vec<u8>>>,
     reused: &crossbeam_channel::Receiver<Vec<u8>>,
     trailers: &crossbeam_channel::Sender<Trailer>,
 ) -> std::io::Result<()> {
     let bad = |m: &str| std::io::Error::new(std::io::ErrorKind::InvalidData, m.to_string());
+    let mut input = crate::pgzip::Carry::new(input);
+    let mut regions = crate::pgzip::ExactRegions::new();
     loop {
         // Member header (RFC 1952). At a clean end of input, stop.
         let mut header = [0u8; 10];
@@ -531,31 +533,17 @@ fn inflate_members(
                 return Err(bad("invalid gzip header checksum"));
             }
         }
-        // Deflate stream.
-        let mut decoder = flate2::bufread::DeflateDecoder::new(input);
+        // Deflate stream, in exact regions.
+        regions.start();
         let mut member_bytes = 0u64;
         // One buffer is held back until the next read shows whether it is
         // the member's last, which must follow the trailer.
         let mut held: Option<Vec<u8>> = None;
         loop {
             let mut buffer = reused.try_recv().unwrap_or_default();
-            buffer.resize(BUFFER, 0);
-            let mut filled = 0;
-            let mut ended = false;
-            while filled < buffer.len() {
-                match decoder.read(&mut buffer[filled..]) {
-                    Ok(0) => {
-                        ended = true;
-                        break;
-                    }
-                    Ok(n) => filled += n,
-                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                    Err(e) => return Err(e),
-                }
-            }
-            member_bytes += filled as u64;
-            buffer.truncate(filled);
-            if filled > 0 {
+            let ended = regions.next(&mut input, &mut buffer)?;
+            member_bytes += buffer.len() as u64;
+            if !buffer.is_empty() {
                 if let Some(full) = held.replace(buffer) {
                     if sender.send(Ok(full)).is_err() {
                         return Ok(());
@@ -566,7 +554,6 @@ fn inflate_members(
                 break;
             }
         }
-        input = decoder.into_inner();
         let mut trailer = [0u8; 8];
         input.read_exact(&mut trailer)?;
         let crc = u32::from_le_bytes(trailer[..4].try_into().unwrap());
