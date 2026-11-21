@@ -1,6 +1,6 @@
 # Benchmarks
 
-Wall time in seconds for fastp and fasterp on the same inputs and options, measured with [hyperfine](https://github.com/sharkdp/hyperfine). Lower is better. The label next to each pair is fastp time divided by fasterp time, and the whiskers span the fastest and slowest run. The CSV also records each program's total gzip output size and a SHA-256 of its decompressed output, so a faster setting cannot hide larger files and any difference from fastp's records shows up.
+Wall time in seconds for fastp and fasterp on the same inputs and options, measured with [hyperfine](https://github.com/sharkdp/hyperfine). Lower is better. The label next to each pair is fastp time divided by fasterp time, and the whiskers span the fastest and slowest run. The CSV also records each program's CPU time, peak memory, total gzip output size and a SHA-256 of its decompressed output, so a faster setting cannot hide larger files and any difference from fastp's records shows up.
 
 <div class="bench-legend"><span class="fastp">fastp</span><span class="fasterp">fasterp</span></div>
 <div id="bench-chart"></div>
@@ -51,7 +51,18 @@ CSV=book/src/benchmarks.csv bash scripts/bench.sh fastp target/release/fasterp
 
 The results are written to `book/src/benchmarks.csv`, which this page reads. Rows for the same dataset are replaced and other datasets are kept, so set `R1`, `R2` and `DATASET` to add or update another dataset.
 
-fastp takes most of the time, so its rows are kept as snapshots. When the CSV already has a fastp row for the same dataset, workload and worker count, measured with the same fastp version on the same machine, the script times only fasterp and keeps that row. It still compares fasterp's output digest with the snapshot's, and times fastp again if they differ, which is what happens when the inputs or `ARGS` have changed. `REFERENCE=rerun` times fastp regardless. `WORKERS`, `RUNS` and `WARMUP` change the worker counts, the number of timed runs and the number of untimed runs before them, and `ARGS` adds options to every command. For example, for the NovaSeq prefix:
+Programs that never change are measured once and their rows are kept as snapshots. That covers fastp, which takes most of the time, and any fasterp release whose binary is named in `RELEASES`. When the CSV already has a row for the same program version, dataset, workload and worker count, measured on the same machine, the script keeps that row and does not run the program. It still compares fasterp's output digest with the fastp snapshot's, and times fastp again if they differ, which is what happens when the inputs or `ARGS` have changed. `REFERENCE=rerun` times everything regardless.
+
+The build under test is always timed. Its row is labelled with the version and the commit, as in `0.3.0+13331c6`, unless the commit is that version's tag. A release gets a row only where its output digest equals the build under test's, so every row of a group did the same work. Release rows stay in the CSV when their binary is not given, so the history can be plotted later. This page charts fastp against the newest fasterp row.
+
+Each row also records the CPU time (user plus system) and the peak resident memory, taken from `/usr/bin/time`. `scripts/bench_plot.py` draws wall time against peak memory for every program in the CSV:
+
+```bash
+RELEASES="path/to/fasterp-0.2.1 path/to/fasterp-0.3.0" CSV=book/src/benchmarks.csv bash scripts/bench.sh
+python3 scripts/bench_plot.py book/src/benchmarks.csv memory.png --dataset SRR5808766
+```
+
+`WORKERS`, `RUNS` and `WARMUP` change the worker counts, the number of timed runs and the number of untimed runs before them, and `ARGS` adds options to every command. For example, for the NovaSeq prefix:
 
 ```bash
 bash .github/scripts/download_test_data.sh test_data err3534523-2m
