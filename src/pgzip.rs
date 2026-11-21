@@ -1175,7 +1175,7 @@ pub(crate) fn decompress_source(
 /// decoded output in memory.
 fn region_size() -> usize {
     match crate::io::forced_split_region() {
-        0 => REGION / crate::io::split_decoding_inputs().max(1),
+        0 => REGION / crate::io::split_region_shares().max(1),
         size => size,
     }
 }

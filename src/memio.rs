@@ -49,7 +49,7 @@ pub(crate) fn is_s3_path(_path: &str) -> bool {
     false
 }
 
-pub(crate) fn set_split_decoding(_inputs: usize) {}
+pub(crate) fn set_split_decoding(_inputs: usize, _compressing: bool) {}
 
 pub(crate) fn binned_gzip_input(_path: &str) -> bool {
     false

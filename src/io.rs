@@ -853,8 +853,23 @@ static SPLIT_DECODING: std::sync::atomic::AtomicUsize = std::sync::atomic::Atomi
 /// Decode the large single-member gzip inputs opened from now on in parallel
 /// regions (`pgzip`), sharing the decoding threads between `inputs` of them,
 /// or by one sequential decoder each when `inputs` is 0.
-pub(crate) fn set_split_decoding(inputs: usize) {
+///
+/// `compressing` says the run also compresses its output. Compression then
+/// sets the pace, not decoding, and regions half the size decode just as
+/// fast for the run while holding about 100 MB less.
+pub(crate) fn set_split_decoding(inputs: usize, compressing: bool) {
     SPLIT_DECODING.store(inputs, std::sync::atomic::Ordering::Relaxed);
+    SPLIT_REGION_SHARES.store(
+        inputs * (1 + usize::from(compressing)),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+/// How many parts a decoding region's normal size is divided into.
+static SPLIT_REGION_SHARES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+pub(crate) fn split_region_shares() -> usize {
+    SPLIT_REGION_SHARES.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 pub(crate) fn split_decoding_inputs() -> usize {

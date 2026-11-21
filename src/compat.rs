@@ -3274,11 +3274,14 @@ impl Engine {
         } else {
             output == io::CompressionFormat::None
         };
-        io::set_split_decoding(if split {
-            1 + usize::from(a.input2.is_some())
-        } else {
-            0
-        });
+        io::set_split_decoding(
+            if split {
+                1 + usize::from(a.input2.is_some())
+            } else {
+                0
+            },
+            output != io::CompressionFormat::None,
+        );
         let mut reader1 = Reader::open(&a.input, a.phred64)?;
         let mut reader2 = a
             .input2
