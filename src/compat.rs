@@ -1155,6 +1155,18 @@ impl<const WIDTH: u32> Bucket<WIDTH> {
     }
 }
 
+/// Reads in a batch below which the two directories are checked in turn: a
+/// thread costs more to start than they take.
+const LANE_PAIRS: usize = 8192;
+/// How many checks ahead a lane requests memory. A lane does half the work
+/// of checking both directories, so it looks twice as far ahead.
+const LANE_AHEAD: usize = 16;
+
+/// Whether a second thread for the duplicate filter has a core to run on.
+fn lanes_available() -> bool {
+    std::thread::available_parallelism().is_ok_and(|n| n.get() > 2)
+}
+
 struct BucketTable {
     buckets: Vec<Bucket>,
     overflow: Vec<Option<Box<BloomPage>>>,
@@ -1199,6 +1211,33 @@ impl BucketTable {
         if let Some(page) = &self.overflow[(bit >> 15) as usize] {
             page.prefetch((bit & 32767) as u16);
         }
+    }
+
+    /// Check and set position `lane` of every pair in `chunks`, in order:
+    /// one bit per pair, set where the position had been seen.
+    fn seen(&mut self, chunks: &[&[u64]], lane: usize) -> Vec<Vec<u64>> {
+        const AHEAD: usize = LANE_AHEAD;
+        chunks
+            .iter()
+            .map(|positions| {
+                let (pairs, _) = positions.as_chunks::<2>();
+                let mut bits = vec![0u64; pairs.len().div_ceil(64)];
+                for (i, pair) in pairs.iter().enumerate() {
+                    if let Some(later) = pairs.get(i + 3 * AHEAD) {
+                        self.prefetch(Self::address(later[lane]));
+                    }
+                    if let Some(later) = pairs.get(i + 2 * AHEAD) {
+                        self.prefetch_page(Self::address(later[lane]));
+                    }
+                    if let Some(later) = pairs.get(i + AHEAD) {
+                        self.prefetch_entry(Self::address(later[lane]));
+                    }
+                    let seen = self.check_and_set(Self::address(pair[lane]));
+                    bits[i / 64] |= u64::from(seen) << (i % 64);
+                }
+                bits
+            })
+            .collect()
     }
 
     fn check_and_set(&mut self, bit: u64) -> bool {
@@ -1303,6 +1342,36 @@ impl Duplication {
             #[cfg(target_arch = "aarch64")]
             pair: (self.buffers.len() == 2).then(|| duplication_neon::PairHash::new(&self.primes)),
         }
+    }
+
+    /// `count_packed` for each of `chunks`, in order.
+    ///
+    /// The two default directories never read each other, so each can check
+    /// its own position of every read on its own thread, in input order,
+    /// and the answers are the same as checking them in turn. A read is a
+    /// duplicate when both had seen it.
+    fn count_chunks(&mut self, chunks: &[&[u64]]) -> Vec<usize> {
+        let pairs: usize = chunks.iter().map(|c| c.len() / 2).sum();
+        if let [BloomPages::Dense(a), BloomPages::Dense(b)] = self.buffers.as_mut_slice() {
+            if pairs >= LANE_PAIRS && lanes_available() {
+                let (first, second) = std::thread::scope(|scope| {
+                    let first = scope.spawn(|| a.seen(chunks, 0));
+                    let second = b.seen(chunks, 1);
+                    (first.join().expect("duplicate lane panicked"), second)
+                });
+                return first
+                    .iter()
+                    .zip(&second)
+                    .map(|(x, y)| {
+                        x.iter()
+                            .zip(y)
+                            .map(|(x, y)| (x & y).count_ones() as usize)
+                            .sum()
+                    })
+                    .collect();
+            }
+        }
+        chunks.iter().map(|c| self.count_packed(c)).collect()
     }
 
     fn count_packed(&mut self, positions: &[u64]) -> usize {
@@ -1731,6 +1800,20 @@ fn pack_main_output(a: &Args) -> bool {
 
 fn mark_duplicates(chunks: &mut [Chunk], duplication: Option<&mut Duplication>) {
     if let Some(duplication) = duplication {
+        if chunks.iter().all(|chunk| chunk.packed.is_some()) {
+            let positions: Vec<&[u64]> = chunks
+                .iter()
+                .flat_map(|chunk| &chunk.packed)
+                .map(|packed| packed.positions.as_slice())
+                .collect();
+            let counts = duplication.count_chunks(&positions);
+            for (chunk, count) in chunks.iter_mut().zip(counts) {
+                if let Some(packed) = &mut chunk.packed {
+                    packed.duplicates += count;
+                }
+            }
+            return;
+        }
         for chunk in chunks {
             if let Some(packed) = &mut chunk.packed {
                 packed.duplicates += duplication.count_packed(&packed.positions);
@@ -4592,7 +4675,7 @@ mod tests {
             let width = duplication.buffers.len();
             let mut seen = vec![FxHashSet::default(); width];
             let mut start: usize = 0;
-            for n in [0, 1, 15, 16, 17, 33, 257, 4096] {
+            for n in [0, 1, 15, 16, 17, 33, 257, 4096, 3 * LANE_PAIRS + 5] {
                 let mut packed = Vec::new();
                 let mut expected = 0;
                 for i in start..start + n {
@@ -4607,14 +4690,65 @@ mod tests {
                     }
                     expected += usize::from(duplicate);
                 }
+                // In two chunks, as a batch arrives: large batches of the
+                // default level are checked by two threads.
+                let cut = packed.len() / width / 3 * width;
+                let counts = duplication.count_chunks(&[&packed[..cut], &packed[cut..]]);
                 assert_eq!(
-                    duplication.count_packed(&packed),
+                    counts.iter().sum::<usize>(),
                     expected,
                     "level {level}, batch {n}"
                 );
                 start += n;
             }
         }
+    }
+
+    /// Pairs checked per second once the tables are far larger than the
+    /// cache, as late in a large file:
+    /// cargo test --release duplicate_throughput -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn duplicate_throughput() {
+        let mut duplication = Duplication::new(1);
+        let mut state = 99u64;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            state >> 16
+        };
+        let millions: usize = std::env::var("PAIRS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(200);
+        let mut batch = |pairs: usize| -> Vec<Vec<u64>> {
+            (0..16)
+                .map(|_| (0..2 * pairs / 16).map(|_| next()).collect())
+                .collect()
+        };
+        let mut total = 0;
+        for round in 0..millions * 1_000_000 / (1 << 18) {
+            let chunks = batch(1 << 18);
+            let slices: Vec<&[u64]> = chunks.iter().map(Vec::as_slice).collect();
+            let start = std::time::Instant::now();
+            total += duplication.count_chunks(&slices).iter().sum::<usize>();
+            let lanes = start.elapsed();
+            if round % 100 == 99 {
+                let chunks = batch(1 << 18);
+                let start = std::time::Instant::now();
+                for chunk in &chunks {
+                    total += duplication.count_packed(chunk);
+                }
+                println!(
+                    "{:>4}M pairs: {:.1} ns per pair in lanes, {:.1} in turn",
+                    (round + 1) * (1 << 18) / 1_000_000,
+                    lanes.as_nanos() as f64 / (1 << 18) as f64,
+                    start.elapsed().as_nanos() as f64 / (1 << 18) as f64
+                );
+            }
+        }
+        println!("{total} duplicates");
     }
 
     #[test]
