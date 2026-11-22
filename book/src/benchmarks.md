@@ -6,9 +6,7 @@ Wall time in seconds for fastp and fasterp on the same inputs and options, measu
 <div id="bench-chart"></div>
 <p id="bench-meta" class="bench-meta"></p>
 
-fasterp compresses gzip output with a FASTQ-aware encoder at levels 2 to 4. The stream is standard gzip, and the records are the same as fastp's, as the digests in the CSV show. With binned qualities, as NovaSeq writes them, the files are as small as fastp's. With full-range qualities they are larger: about 4% on the 148 bp reads of SRR1766443 and 5 to 8% on the 50 bp reads of SRR5808766 and SRR891269. Reads sorted by alignment position, as in ERR3239279, overlap their neighbours, and level 4 compresses them to half the size the FASTQ-aware encoder does, so their blocks stay with level 4.
-
-The ERR3239279-400M rows were measured with the `0.3.0` release and have not been rerun since.
+fasterp compresses gzip output with a FASTQ-aware encoder at levels 2 to 4. The stream is standard gzip, and the records are the same as fastp's, as the digests in the CSV show. With binned qualities, as NovaSeq writes them, the files are about 2% smaller than fastp's on ERR3534523. With full-range qualities they are larger: about 4% on the 148 bp reads of SRR1766443, 5% on the 51 bp reads of SRR5808766 and 6 to 7% on the 50 bp reads of SRR891269. Reads sorted by alignment position, as in ERR3239279, overlap their neighbours, and the encoder matches each read against the ones before it: those files are 0.6% larger than fastp's single-end and about 2.5% larger paired.
 
 ## Workloads
 
