@@ -856,7 +856,7 @@ fn decode(
     out.truncate(out_n);
     pool.words_size.saw(head_n);
     pool.output_size.saw(out_n.max(head_n));
-    let tail_crc = crc32fast::hash(out.get(head_n..).unwrap_or_default());
+    let tail_crc = checksum(out.get(head_n..).unwrap_or_default());
     Ok(Decoded {
         start,
         end: inflater.bits.bit_pos(),
@@ -1052,6 +1052,14 @@ fn read_range(src: &dyn Source, from: usize, to: usize) -> io::Result<Vec<u8>> {
 fn read_range_into(src: &dyn Source, from: usize, to: usize, buf: &mut Vec<u8>) -> io::Result<()> {
     buf.resize(to - from, 0);
     src.read_at(buf, from)
+}
+
+/// CRC-32 of `data`. libdeflate's is several times faster than crc32fast's
+/// on Arm, and every decoded byte goes through it.
+fn checksum(data: &[u8]) -> u32 {
+    let mut crc = libdeflater::Crc::new();
+    crc.update(data);
+    crc.sum()
 }
 
 fn invalid(message: &str) -> io::Error {
@@ -1353,7 +1361,7 @@ fn run(
                             }
                             let head = &mut decoded.out[..n];
                             let crc = resolve(&decoded.head, &window, head)
-                                .map(|()| crc32fast::hash(head));
+                                .map(|()| checksum(head));
                             // Keep only the length; the buffer is free now.
                             let head = std::mem::take(&mut decoded.head);
                             let _ = resolved_tx.send((k, crc, n, decoded));
