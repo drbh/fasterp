@@ -1186,7 +1186,7 @@ dependencies = [
 
 [[package]]
 name = "fasterp"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -2406,8 +2406,9 @@ dependencies = [
 
 [[package]]
 name = "readkit-batch"
-version = "0.1.0"
-source = "git+https://github.com/drbh/readkit?tag=v0.1.0#6c0a1107cb56180a5a1cf191f65557cb33f59eeb"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2ea1cbf9d671d26daea8d8cdb29d91b34fc123c4d5b2f6f1dbd714026c4da03f"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -2416,8 +2417,9 @@ dependencies = [
 
 [[package]]
 name = "readkit-io"
-version = "0.1.0"
-source = "git+https://github.com/drbh/readkit?tag=v0.1.0#6c0a1107cb56180a5a1cf191f65557cb33f59eeb"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dd66a7ddd0885f4bb641a2999bb50777848407fa12295722eab689c5b0f97f8a"
 dependencies = [
  "readkit-batch",
 ]
@@ -2834,9 +2836,9 @@ dependencies = [
 
 [[package]]
 name = "spin"
-version = "0.9.8"
+version = "0.9.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6980e8d7511241f8acf4aebddbb1ff938df5eebe98691418c4468d0b72a96a67"
+checksum = "3763264f6b73151db08c50ff20d7d8a0b8796e021cdea7ceedad07b80155fa0e"
 dependencies = [
  "lock_api",
 ]
