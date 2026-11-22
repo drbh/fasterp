@@ -3552,7 +3552,13 @@ impl Engine {
                 let remaining = sample_limit - sample_count;
                 let base_limit = 151 * 256 * 1024 - sample_bases;
                 let block = if a.interleaved_in {
-                    block::read_sample_batch::<true>(&mut reader1, None, budget, remaining, base_limit)?
+                    block::read_sample_batch::<true>(
+                        &mut reader1,
+                        None,
+                        budget,
+                        remaining,
+                        base_limit,
+                    )?
                 } else {
                     block::read_sample_batch::<false>(
                         &mut reader1,

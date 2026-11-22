@@ -1360,8 +1360,8 @@ fn run(
                                 decoded.out.truncate(n);
                             }
                             let head = &mut decoded.out[..n];
-                            let crc = resolve(&decoded.head, &window, head)
-                                .map(|()| checksum(head));
+                            let crc =
+                                resolve(&decoded.head, &window, head).map(|()| checksum(head));
                             // Keep only the length; the buffer is free now.
                             let head = std::mem::take(&mut decoded.head);
                             let _ = resolved_tx.send((k, crc, n, decoded));
