@@ -1147,6 +1147,52 @@ fn region(
     result
 }
 
+/// Whether the bits from `pos` to `to` are whole empty blocks, none of them
+/// final. pigz ends each of its chunks with an empty stored block, as zlib
+/// does at a flush. A region whose first block comes after such blocks
+/// starts where the stream had got to all the same: they hold no output.
+fn only_empty_blocks(src: &dyn Source, pos: usize, to: usize) -> io::Result<bool> {
+    // A stored block is at most 43 bits and a fixed one 10; flushes do not
+    // put many in a row.
+    if to <= pos || to - pos > 8 * 64 {
+        return Ok(false);
+    }
+    let from = pos / 8;
+    let data = read_range(src, from, (to.div_ceil(8) + 4).min(src.len()))?;
+    let take = |bit: usize, count: usize| -> Option<u32> {
+        (bit + count <= data.len() * 8).then(|| {
+            (0..count).fold(0, |value, i| {
+                value | u32::from(data[(bit + i) / 8] >> ((bit + i) % 8) & 1) << i
+            })
+        })
+    };
+    let (mut bit, target) = (pos - from * 8, to - from * 8);
+    while bit < target {
+        // BFINAL, then BTYPE.
+        let ends = match take(bit, 3) {
+            // Stored: padding to a byte, a zero length and its complement.
+            Some(0b000) => {
+                let length = (bit + 3).div_ceil(8) * 8;
+                (take(length, 32) == Some(0xffff_0000)).then_some(length + 32)
+            }
+            // Fixed codes: the end-of-block code alone, seven zero bits.
+            Some(0b010) => (take(bit + 3, 7) == Some(0)).then_some(bit + 10),
+            _ => None,
+        };
+        match ends {
+            Some(end) => bit = end,
+            None => return Ok(false),
+        }
+    }
+    Ok(bit == target)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Regions the coordinator on this thread decoded again from a known start.
+    static REDONE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// A resolved region: its dispatch number, the head's CRC32 (or the error
 /// resolving it), the head's length, and the region.
 type Resolved = (usize, io::Result<u32>, usize, Decoded);
@@ -1412,8 +1458,10 @@ fn run(
                 continue;
             }
             let decoded = match result {
-                Ok(Some(d)) if d.start == pos => d,
+                Ok(Some(d)) if d.start == pos || only_empty_blocks(src, pos, d.start)? => d,
                 other => {
+                    #[cfg(test)]
+                    REDONE.with(|n| n.set(n.get() + 1));
                     // A false start: its buffers are reused for the redo.
                     if let Ok(Some(d)) = other {
                         pool.give_words(d.head);
@@ -2236,6 +2284,65 @@ mod tests {
         let n = c.gzip_compress(&data, &mut gz).unwrap();
         gz.truncate(n);
         assert_eq!(decompress_bytes(&gz, 3).unwrap(), data, "libdeflate");
+    }
+
+    #[test]
+    fn regions_after_flushes_are_not_decoded_again() {
+        // A sync flush every few thousand bytes, as pigz writes between its
+        // chunks: an empty stored block follows each run of blocks.
+        let data = fastq(60_000, 9);
+        let mut gz = vec![0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 3];
+        let mut deflate = flate2::Compress::new(flate2::Compression::new(4), false);
+        let mut buf = vec![0u8; 1 << 16];
+        for (i, chunk) in data.chunks(40_000).enumerate() {
+            let last = (i + 1) * 40_000 >= data.len();
+            let mut chunk = chunk;
+            loop {
+                let (read, written) = (deflate.total_in(), deflate.total_out());
+                let flush = if last {
+                    flate2::FlushCompress::Finish
+                } else {
+                    flate2::FlushCompress::Sync
+                };
+                let status = deflate.compress(chunk, &mut buf, flush).unwrap();
+                chunk = &chunk[(deflate.total_in() - read) as usize..];
+                let n = (deflate.total_out() - written) as usize;
+                gz.extend_from_slice(&buf[..n]);
+                if status == flate2::Status::StreamEnd
+                    || (!last && chunk.is_empty() && n < buf.len())
+                {
+                    break;
+                }
+            }
+        }
+        gz.extend_from_slice(&crc32fast::hash(&data).to_le_bytes());
+        gz.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        for region in [8_000, 20_000, 64_000] {
+            let (sender, receiver) = crossbeam_channel::unbounded();
+            REDONE.with(|n| n.set(0));
+            decompress_source(&&gz[..], region, 3, sender, crossbeam_channel::bounded(1));
+            let mut out = Vec::new();
+            for part in receiver {
+                out.extend(part.unwrap());
+            }
+            assert!(out == data, "region {region}");
+            // Most regions start after a flush here. Only the few whose
+            // guessed start was no block at all are decoded again.
+            let redone = REDONE.with(|n| n.get());
+            assert!(
+                redone * 50 <= gz.len() / region,
+                "region {region}: {redone}"
+            );
+        }
+        // Blocks that are not empty, or that end the stream, are not skipped.
+        let stored = [
+            0b000, 0, 0, 0xff, 0xff, 0b010, 0, 1, 0, 0xfe, 0xff, b'x', 0b011, 0,
+        ];
+        assert!(only_empty_blocks(&&stored[..], 0, 40).unwrap());
+        assert!(only_empty_blocks(&&stored[..], 0, 50).unwrap());
+        assert!(!only_empty_blocks(&&stored[..], 0, 45).unwrap());
+        assert!(!only_empty_blocks(&&stored[..], 50, 12 * 8).unwrap());
+        assert!(!only_empty_blocks(&&stored[..], 12 * 8, 12 * 8 + 10).unwrap());
     }
 
     /// `PGZIP_BENCH=file.gz cargo test --release pgzip_throughput -- --ignored --nocapture`
