@@ -4,9 +4,16 @@ on:
   push:
     tags:
       - 'v*.*.*'
+  pull_request:
+    paths:
+      - '.github/workflows/publish.yml'
+
+permissions:
+  contents: read
 
 jobs:
   publish-crates:
+    if: github.ref_type == 'tag'
     runs-on: ubuntu-latest
 
     steps:
@@ -32,13 +39,21 @@ jobs:
         CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
 
   build-binaries:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.runner }}
     strategy:
       matrix:
         include:
           - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+            platform: linux
             arch: x86_64
           - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-latest
+            platform: linux
+            arch: aarch64
+          - target: aarch64-apple-darwin
+            runner: macos-15
+            platform: macos
             arch: aarch64
 
     steps:
@@ -63,19 +78,27 @@ jobs:
         RUSTFLAGS: ''
         CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
 
+    - name: Smoke-test macOS binary
+      if: matrix.platform == 'macos'
+      run: target/${{ matrix.target }}/release/fasterp --version
+
     - name: Package binary
+      if: github.ref_type == 'tag'
+      env:
+        COPYFILE_DISABLE: '1'
+        FASTERP_ARCHIVE: fasterp-${{ github.ref_name }}-${{ matrix.platform }}-${{ matrix.arch }}.tar.gz
       run: |
-        cd target/${{ matrix.target }}/release
-        tar czf fasterp-${{ github.ref_name }}-linux-${{ matrix.arch }}.tar.gz fasterp
-        mv fasterp-${{ github.ref_name }}-linux-${{ matrix.arch }}.tar.gz ${{ github.workspace }}/
+        tar -czf "$FASTERP_ARCHIVE" -C "target/${{ matrix.target }}/release" fasterp
 
     - name: Upload artifact
+      if: github.ref_type == 'tag'
       uses: actions/upload-artifact@v4
       with:
-        name: fasterp-linux-${{ matrix.arch }}
-        path: fasterp-${{ github.ref_name }}-linux-${{ matrix.arch }}.tar.gz
+        name: fasterp-${{ matrix.platform }}-${{ matrix.arch }}
+        path: fasterp-${{ github.ref_name }}-${{ matrix.platform }}-${{ matrix.arch }}.tar.gz
 
   create-release:
+    if: github.ref_type == 'tag'
     needs: [publish-crates, build-binaries]
     runs-on: ubuntu-latest
     permissions:
@@ -90,7 +113,7 @@ jobs:
         path: artifacts
 
     - name: Create Release
-      uses: softprops/action-gh-release@v1
+      uses: softprops/action-gh-release@v3
       with:
         name: Release ${{ github.ref_name }}
         generate_release_notes: true
@@ -106,6 +129,7 @@ jobs:
           Download the appropriate binary for your platform from the assets below:
           - `fasterp-${{ github.ref_name }}-linux-x86_64.tar.gz` - Linux x86_64
           - `fasterp-${{ github.ref_name }}-linux-aarch64.tar.gz` - Linux ARM64
+          - `fasterp-${{ github.ref_name }}-macos-aarch64.tar.gz` - macOS on Apple Silicon
         files: |
           artifacts/**/*.tar.gz
         draft: false
