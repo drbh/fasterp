@@ -2407,6 +2407,7 @@ dependencies = [
 [[package]]
 name = "readkit-batch"
 version = "0.1.0"
+source = "git+https://github.com/drbh/readkit?tag=v0.1.0#6c0a1107cb56180a5a1cf191f65557cb33f59eeb"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -2416,6 +2417,7 @@ dependencies = [
 [[package]]
 name = "readkit-io"
 version = "0.1.0"
+source = "git+https://github.com/drbh/readkit?tag=v0.1.0#6c0a1107cb56180a5a1cf191f65557cb33f59eeb"
 dependencies = [
  "readkit-batch",
 ]

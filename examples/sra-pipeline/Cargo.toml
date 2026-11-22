@@ -20,7 +20,7 @@ path = "src/main.rs"
 [dependencies]
 fasterp = {path = "../.."}
 # Must be the readkit fasterp uses (see fasterp's Cargo.toml).
-readkit-sra = {path = "../../../../readkit/crates/readkit-sra", features = ["ngs"]}
+readkit-sra = {git = "https://github.com/drbh/readkit", tag = "v0.1.0", features = ["ngs"]}
 
 [profile.release]
 codegen-units = 1

@@ -1007,6 +1007,7 @@ dependencies = [
  "flate2",
  "gzp",
  "indexmap",
+ "libdeflate-sys",
  "libdeflater",
  "memchr",
  "mimalloc",
@@ -1964,11 +1965,13 @@ dependencies = [
 
 [[package]]
 name = "readkit-batch"
-version = "0.0.0"
+version = "0.1.0"
+source = "git+https://github.com/drbh/readkit?tag=v0.1.0#6c0a1107cb56180a5a1cf191f65557cb33f59eeb"
 
 [[package]]
 name = "readkit-fastq"
-version = "0.0.0"
+version = "0.1.0"
+source = "git+https://github.com/drbh/readkit?tag=v0.1.0#6c0a1107cb56180a5a1cf191f65557cb33f59eeb"
 dependencies = [
  "memchr",
  "readkit-batch",
@@ -1977,17 +1980,20 @@ dependencies = [
 
 [[package]]
 name = "readkit-io"
-version = "0.0.0"
+version = "0.1.0"
+source = "git+https://github.com/drbh/readkit?tag=v0.1.0#6c0a1107cb56180a5a1cf191f65557cb33f59eeb"
 dependencies = [
  "readkit-batch",
 ]
 
 [[package]]
 name = "readkit-sra"
-version = "0.0.0"
+version = "0.1.0"
+source = "git+https://github.com/drbh/readkit?tag=v0.1.0#6c0a1107cb56180a5a1cf191f65557cb33f59eeb"
 dependencies = [
  "cc",
  "libc",
+ "libdeflater",
  "readkit-batch",
  "readkit-fastq",
  "readkit-io",
