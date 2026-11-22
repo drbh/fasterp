@@ -995,7 +995,7 @@ dependencies = [
 
 [[package]]
 name = "fasterp"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "aws-config",
@@ -1965,13 +1965,15 @@ dependencies = [
 
 [[package]]
 name = "readkit-batch"
-version = "0.1.0"
-source = "git+https://github.com/drbh/readkit?tag=v0.1.0#6c0a1107cb56180a5a1cf191f65557cb33f59eeb"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2ea1cbf9d671d26daea8d8cdb29d91b34fc123c4d5b2f6f1dbd714026c4da03f"
 
 [[package]]
 name = "readkit-fastq"
-version = "0.1.0"
-source = "git+https://github.com/drbh/readkit?tag=v0.1.0#6c0a1107cb56180a5a1cf191f65557cb33f59eeb"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "110fd47f03b81349d236b3604fa2aacd33dd766b0d71f7db70af0e76561b091d"
 dependencies = [
  "memchr",
  "readkit-batch",
@@ -1980,16 +1982,18 @@ dependencies = [
 
 [[package]]
 name = "readkit-io"
-version = "0.1.0"
-source = "git+https://github.com/drbh/readkit?tag=v0.1.0#6c0a1107cb56180a5a1cf191f65557cb33f59eeb"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dd66a7ddd0885f4bb641a2999bb50777848407fa12295722eab689c5b0f97f8a"
 dependencies = [
  "readkit-batch",
 ]
 
 [[package]]
 name = "readkit-sra"
-version = "0.1.0"
-source = "git+https://github.com/drbh/readkit?tag=v0.1.0#6c0a1107cb56180a5a1cf191f65557cb33f59eeb"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "04ac9dcb17b1732a79248f607a5dba14736e4ef181d3c7b59557ce15cf083f84"
 dependencies = [
  "cc",
  "libc",
