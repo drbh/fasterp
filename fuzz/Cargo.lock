@@ -1014,6 +1014,7 @@ dependencies = [
  "flate2",
  "gzp",
  "indexmap",
+ "libdeflate-sys",
  "libdeflater",
  "memchr",
  "mimalloc",
