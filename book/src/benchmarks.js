@@ -17,6 +17,14 @@
     });
   }
 
+  // The CSV also holds snapshots of earlier fasterp releases. The page compares
+  // fastp with the newest build, which is the last row of each group.
+  function newest(rows) {
+    var last = {};
+    rows.forEach(function (r, i) { last[[r.dataset, r.workload, r.workers, r.program].join()] = i; });
+    return rows.filter(function (r, i) { return last[[r.dataset, r.workload, r.workers, r.program].join()] === i; });
+  }
+
   function unique(rows, key) {
     var seen = [];
     rows.forEach(function (r) { if (seen.indexOf(r[key]) < 0) seen.push(r[key]); });
@@ -157,7 +165,7 @@
   fetch(prefix + 'benchmarks.csv', { cache: 'no-cache' })
     .then(function (response) { return response.text(); })
     .then(function (text) {
-      var rows = parse(text);
+      var rows = newest(parse(text));
       chart(chartRoot, rows);
       var pending;
       window.addEventListener('resize', function () {

@@ -9,7 +9,7 @@ target fails on wrong bytes, not only on crashes.
 | `fqdeflate_roundtrip` | The FASTQ-aware encoder's output decodes back to its input with flate2 and libdeflate |
 | `pgzip_differential` | The parallel single-member decoder gives flate2's bytes, for streams from zlib, libdeflate and the FASTQ-aware encoder, with regions small enough that boundaries land everywhere |
 | `pgzip_corrupt` | On damaged streams the parallel decoder errors, or gives flate2's bytes, and never panics, hangs or runs out of memory |
-| `gzip_members` | The sequential multi-member reader accepts exactly the streams flate2 accepts, with the same bytes |
+| `gzip_members` | The sequential multi-member reader accepts every stream flate2 accepts, with the same bytes, and accepts a damaged one flate2 rejects only with the bytes that were compressed |
 
 Inputs are built from the fuzzer's bytes by `fuzz_targets/common.rs`, which
 shapes them like FASTQ (binned and full-range qualities, duplicate reads,

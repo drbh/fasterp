@@ -97,19 +97,46 @@ impl<'a> Bits<'a> {
 
 // huffman
 
-const PRIMARY: u32 = 10;
-
-/// Two-level decode table. A primary entry is `symbol << 8 | length`, or
-/// `offset << 8 | 0x80 | sub_bits` pointing at a subtable for longer codes,
-/// whose entries are `symbol << 8 | (length - PRIMARY)`. Length 0 is invalid.
-struct Huffman {
-    table: Vec<u32>,
+/// A two-level decode table for a canonical Huffman code, indexed by the
+/// next `P` bits. Its entries carry everything a symbol needs, so decoding
+/// one is a lookup, a shift and at most one add:
+///
+/// * bits 0..8: bits to consume, the code length plus the symbol's extra bits;
+/// * bits 8..12: the code length, to shift the extra bits down;
+/// * bits 16..32: the symbol, a literal byte, a length or distance base, or
+///   the start of a subtable for longer codes (then bits 8..12 hold the
+///   subtable's index width and the entry consumes the `P` bits that led to
+///   it; subtable entries count their code length from there).
+///
+/// The buffer is kept between blocks, which each bring their own codes.
+#[derive(Default)]
+struct Table<const P: u32> {
+    entries: Vec<u32>,
 }
 
-impl Huffman {
-    /// Canonical code for `lens`, or `None` if it is over-subscribed, or
-    /// incomplete with more than a single one-bit code (zlib's rule).
-    fn new(lens: &[u8]) -> Option<Self> {
+/// Set on literal entries.
+const LITERAL: u32 = 1 << 15;
+/// Set on every entry that is not a symbol, literal, length or distance.
+const SPECIAL: u32 = 1 << 14;
+/// With `SPECIAL`: the entry points at a subtable.
+const SUBTABLE: u32 = 1 << 13;
+/// With `SPECIAL`: the end-of-block symbol.
+const END: u32 = 1 << 12;
+/// An unused code, or a symbol deflate does not define.
+const INVALID: u32 = SPECIAL;
+
+/// Index bits for literal/length codes, distance codes and the code that
+/// compresses their lengths, which is at most seven bits long.
+const LITLEN: u32 = 10;
+const DISTANCE: u32 = 8;
+const LENGTHS: u32 = 7;
+
+impl<const P: u32> Table<P> {
+    /// Fill the table for the canonical code `lens`, with `entry` giving a
+    /// symbol's entry from its code length. Returns false if the code is
+    /// over-subscribed, or incomplete with more than a single one-bit code
+    /// (zlib's rule).
+    fn build(&mut self, lens: &[u8], entry: impl Fn(usize, u32) -> u32) -> bool {
         let mut count = [0u16; 16];
         for &l in lens {
             count[usize::from(l)] += 1;
@@ -120,14 +147,14 @@ impl Huffman {
         for (len, &c) in count.iter().enumerate().skip(1) {
             left = (left << 1) - i32::from(c);
             if left < 0 {
-                return None;
+                return false;
             }
             if c > 0 {
                 max = len;
             }
         }
         if left > 0 && max > 1 {
-            return None;
+            return false;
         }
         let mut next = [0u32; 16];
         let mut code = 0u32;
@@ -135,72 +162,151 @@ impl Huffman {
             code = (code + u32::from(count[len - 1])) << 1;
             next[len] = code;
         }
-        let primary = 1usize << PRIMARY;
-        let mut table = vec![0u32; primary];
-        let reverse = |code: u32, len: usize| code.reverse_bits() >> (32 - len);
-        let mut long = Vec::new();
+        let primary = 1usize << P;
+        let table = &mut self.entries;
+        table.clear();
+        table.resize(primary, INVALID);
+        let reverse = |code: u32, len: usize| (code.reverse_bits() >> (32 - len)) as usize;
+        if max <= P as usize {
+            for (sym, &l) in lens.iter().enumerate() {
+                let len = usize::from(l);
+                if len == 0 {
+                    continue;
+                }
+                let rev = reverse(next[len], len);
+                next[len] += 1;
+                let e = entry(sym, len as u32);
+                for j in (rev..primary).step_by(1 << len) {
+                    table[j] = e;
+                }
+            }
+            return true;
+        }
+        // Widths of the subtables that long codes need, by primary index.
+        let mut starts = next;
+        let mut width = [0u8; 1 << 10];
+        for &l in lens {
+            let len = usize::from(l);
+            if len == 0 {
+                continue;
+            }
+            let rev = reverse(starts[len], len);
+            starts[len] += 1;
+            if len > P as usize {
+                let slot = &mut width[rev & (primary - 1)];
+                *slot = (*slot).max((len - P as usize) as u8);
+            }
+        }
+        for (p, &bits) in width[..primary].iter().enumerate() {
+            if bits > 0 {
+                table[p] =
+                    (table.len() as u32) << 16 | SPECIAL | SUBTABLE | u32::from(bits) << 8 | P;
+                table.resize(table.len() + (1 << bits), INVALID);
+            }
+        }
         for (sym, &l) in lens.iter().enumerate() {
             let len = usize::from(l);
             if len == 0 {
                 continue;
             }
-            let rev = reverse(next[len], len) as usize;
+            let rev = reverse(next[len], len);
             next[len] += 1;
-            if len <= PRIMARY as usize {
+            if len <= P as usize {
+                let e = entry(sym, len as u32);
                 for j in (rev..primary).step_by(1 << len) {
-                    table[j] = (sym as u32) << 8 | len as u32;
+                    table[j] = e;
                 }
             } else {
-                long.push((sym, len, rev));
-            }
-        }
-        if !long.is_empty() {
-            let mut sub_len = vec![0usize; primary];
-            for &(_, len, rev) in &long {
                 let p = rev & (primary - 1);
-                sub_len[p] = sub_len[p].max(len - PRIMARY as usize);
-            }
-            for (p, &bits) in sub_len.iter().enumerate() {
-                if bits > 0 {
-                    table[p] = (table.len() as u32) << 8 | 0x80 | bits as u32;
-                    table.resize(table.len() + (1 << bits), 0);
-                }
-            }
-            for (sym, len, rev) in long {
-                let p = rev & (primary - 1);
-                let bits = sub_len[p];
-                let offset = (table[p] >> 8) as usize;
-                let extra = len - PRIMARY as usize;
-                for j in ((rev >> PRIMARY)..(1 << bits)).step_by(1 << extra) {
-                    table[offset + j] = (sym as u32) << 8 | extra as u32;
+                let offset = (table[p] >> 16) as usize;
+                let extra = len - P as usize;
+                let e = entry(sym, extra as u32);
+                for j in ((rev >> P)..(1 << width[p])).step_by(1 << extra) {
+                    table[offset + j] = e;
                 }
             }
         }
-        Some(Self { table })
+        true
     }
 
-    /// Needs at least 15 bits in `bits`.
+    /// The entry for the next code in `bits`, following a subtable pointer
+    /// and consuming its primary bits. Needs at least 15 bits in `bits`.
     #[inline(always)]
-    fn decode(&self, bits: &mut Bits) -> Option<u32> {
-        let e = self.table[(bits.buf & ((1 << PRIMARY) - 1)) as usize];
-        if e & 0x80 == 0 {
-            let len = e & 15;
-            if len == 0 {
-                return None;
+    fn entry(&self, bits: &mut Bits) -> u32 {
+        // SAFETY: the primary table has `1 << P` entries, and a subtable
+        // pointer addresses `1 << width` entries from its start.
+        unsafe {
+            let e = *self
+                .entries
+                .get_unchecked((bits.buf & ((1 << P) - 1)) as usize);
+            if e & (SPECIAL | SUBTABLE) != SPECIAL | SUBTABLE {
+                return e;
             }
-            bits.consume(len);
-            Some(e >> 8)
-        } else {
-            let sub = ((bits.buf >> PRIMARY) & ((1 << (e & 15)) - 1)) as usize;
-            let e2 = self.table[(e >> 8) as usize + sub];
-            let len = e2 & 15;
-            if len == 0 {
-                return None;
-            }
-            bits.consume(PRIMARY + len);
-            Some(e2 >> 8)
+            bits.consume(P);
+            let width = (e >> 8) & 15;
+            let index = (e >> 16) as usize + (bits.buf & ((1 << width) - 1)) as usize;
+            *self.entries.get_unchecked(index)
         }
     }
+}
+
+impl Table<LITLEN> {
+    fn litlen(&mut self, lens: &[u8]) -> bool {
+        self.build(lens, |sym, len| match sym {
+            0..=255 => (sym as u32) << 16 | LITERAL | len << 8 | len,
+            256 => SPECIAL | END | len << 8 | len,
+            257..=285 => {
+                let extra = u32::from(LEN_EXTRA[sym - 257]);
+                u32::from(LEN_BASE[sym - 257]) << 16 | len << 8 | (len + extra)
+            }
+            _ => INVALID,
+        })
+    }
+}
+
+impl Table<DISTANCE> {
+    fn distance(&mut self, lens: &[u8]) -> bool {
+        self.build(lens, |sym, len| match sym {
+            0..=29 => {
+                let extra = u32::from(DIST_EXTRA[sym]);
+                u32::from(DIST_BASE[sym]) << 16 | len << 8 | (len + extra)
+            }
+            _ => INVALID,
+        })
+    }
+}
+
+impl Table<LENGTHS> {
+    fn lengths(&mut self, lens: &[u8]) -> bool {
+        self.build(lens, |sym, len| (sym as u32) << 16 | len << 8 | len)
+    }
+
+    /// The next code-length symbol. Needs at least 7 bits in `bits`.
+    #[inline(always)]
+    fn decode(&self, bits: &mut Bits) -> Option<u32> {
+        let e = self.entries[(bits.buf & ((1 << LENGTHS) - 1)) as usize];
+        if e & SPECIAL != 0 {
+            return None;
+        }
+        bits.consume(e & 0xff);
+        Some(e >> 16)
+    }
+}
+
+/// The base of a length or distance entry plus its extra bits, taken from
+/// `saved`, the bit buffer before the entry was consumed.
+#[inline(always)]
+fn with_extra(entry: u32, saved: u64) -> usize {
+    let extra = (saved & ((1u64 << (entry & 0xff)) - 1)) >> ((entry >> 8) & 15);
+    (entry >> 16) as usize + extra as usize
+}
+
+/// The literal/length and distance tables of a block.
+#[derive(Default)]
+struct Tables {
+    litlen: Table<LITLEN>,
+    distance: Table<DISTANCE>,
+    lengths: Table<LENGTHS>,
 }
 
 const LEN_BASE: [u16; 29] = [
@@ -222,56 +328,61 @@ const CODE_ORDER: [usize; 19] = [
     16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15,
 ];
 
-fn fixed_tables() -> (Huffman, Huffman) {
+fn fixed_tables() -> Tables {
     let mut lens = [0u8; 288];
     lens[..144].fill(8);
     lens[144..256].fill(9);
     lens[256..280].fill(7);
     lens[280..].fill(8);
-    (
-        Huffman::new(&lens).unwrap(),
-        Huffman::new(&[5u8; 32]).unwrap(),
-    )
+    let mut tables = Tables::default();
+    assert!(tables.litlen.litlen(&lens) && tables.distance.distance(&[5u8; 32]));
+    tables
 }
 
-/// The litlen and distance codes of a dynamic block, after its 3 header bits.
-fn dynamic_tables(bits: &mut Bits) -> Option<(Huffman, Huffman)> {
+/// Read the literal/length and distance codes of a dynamic block, after its
+/// 3 header bits, into `tables`. Returns false if they are invalid.
+fn dynamic_tables(bits: &mut Bits, tables: &mut Tables) -> bool {
     let hlit = bits.take(5) as usize + 257;
     let hdist = bits.take(5) as usize + 1;
     let hclen = bits.take(4) as usize + 4;
     if hlit > 286 || hdist > 30 {
-        return None;
+        return false;
     }
     let mut code_lens = [0u8; 19];
     for &i in &CODE_ORDER[..hclen] {
         code_lens[i] = bits.take(3) as u8;
     }
-    let codes = Huffman::new(&code_lens)?;
+    if !tables.lengths.lengths(&code_lens) {
+        return false;
+    }
     let mut lens = [0u8; 286 + 30];
     let total = hlit + hdist;
     let mut i = 0;
     while i < total {
         bits.refill();
-        let sym = codes.decode(bits)?;
+        let Some(sym) = tables.lengths.decode(bits) else {
+            return false;
+        };
         let (value, repeat) = match sym {
             0..=15 => (sym as u8, 1),
-            16 => (*lens[..i].last()?, 3 + bits.take(2) as usize),
+            16 => {
+                let Some(&previous) = lens[..i].last() else {
+                    return false;
+                };
+                (previous, 3 + bits.take(2) as usize)
+            }
             17 => (0, 3 + bits.take(3) as usize),
             _ => (0, 11 + bits.take(7) as usize),
         };
         if i + repeat > total {
-            return None;
+            return false;
         }
         lens[i..i + repeat].fill(value);
         i += repeat;
     }
-    if lens[256] == 0 {
-        return None;
-    }
-    Some((
-        Huffman::new(&lens[..hlit])?,
-        Huffman::new(&lens[hlit..total])?,
-    ))
+    lens[256] != 0
+        && tables.litlen.litlen(&lens[..hlit])
+        && tables.distance.distance(&lens[hlit..total])
 }
 
 // inflate
@@ -311,7 +422,9 @@ enum Error {
 
 struct Inflater<'a> {
     bits: Bits<'a>,
-    fixed: Option<(Huffman, Huffman)>,
+    fixed: Option<Tables>,
+    /// The tables of the dynamic block being decoded.
+    dynamic: Tables,
 }
 
 impl<'a> Inflater<'a> {
@@ -333,7 +446,6 @@ impl<'a> Inflater<'a> {
     ) -> Result<bool, Error> {
         let bits = &mut self.bits;
         let last = bits.take(1) == 1;
-        let dynamic;
         let (litlen, dist) = match bits.take(2) {
             0 => {
                 let skip = bits.n % 8;
@@ -355,103 +467,149 @@ impl<'a> Inflater<'a> {
             }
             1 => {
                 let fixed = self.fixed.get_or_insert_with(fixed_tables);
-                (&fixed.0, &fixed.1)
+                (&fixed.litlen, &fixed.distance)
             }
             2 => {
-                dynamic = dynamic_tables(bits).ok_or(Error::Bad)?;
-                (&dynamic.0, &dynamic.1)
+                if !dynamic_tables(bits, &mut self.dynamic) {
+                    return Err(Error::Bad);
+                }
+                (&self.dynamic.litlen, &self.dynamic.distance)
             }
             _ => return Err(Error::Bad),
         };
-        loop {
+        let mut at = *n;
+        let mut window_end = *last_window;
+        // The bit reader lives in locals while symbols are decoded: output is
+        // written through a raw pointer, and with the reader behind a
+        // reference every such write would force its fields to be reloaded.
+        let mut local = Bits {
+            data: bits.data,
+            pos: bits.pos,
+            buf: bits.buf,
+            n: bits.n,
+        };
+        let outcome = 'symbols: loop {
             // Room for three literals and the longest copy, which may write up
             // to a chunk past its end.
-            if *n + 3 + 258 + CHUNK > out.len() {
-                grow(out, *n + 3 + 258 + CHUNK);
+            if at + 3 + 258 + CHUNK > out.len() {
+                grow(out, at + 3 + 258 + CHUNK);
             }
+            let base = out.as_mut_ptr();
+            // SAFETY (for every write through `base` in this iteration): the
+            // check above leaves room for three literals at `at` and then a
+            // copy of at most 258 elements rounded up to a whole chunk.
+            let room = out.len();
+            let put = |slot: usize, b: u8| {
+                debug_assert!(slot < room);
+                unsafe { *base.add(slot) = T::byte(b) }
+            };
             // A refill leaves at least 56 bits: three literal codes of up to
-            // 15 bits each, or one length, distance and their extra bits.
-            bits.refill();
-            let mut sym = litlen.decode(bits).ok_or(Error::Bad)?;
-            if sym < 256 {
-                out[*n] = T::byte(sym as u8);
-                *n += 1;
-                sym = litlen.decode(bits).ok_or(Error::Bad)?;
-                if sym < 256 {
-                    out[*n] = T::byte(sym as u8);
-                    *n += 1;
-                    sym = litlen.decode(bits).ok_or(Error::Bad)?;
-                    if sym < 256 {
-                        out[*n] = T::byte(sym as u8);
-                        *n += 1;
+            // 15 bits each, or one length, distance and their extra local.
+            local.refill();
+            let mut entry = litlen.entry(&mut local);
+            if entry & LITERAL != 0 {
+                local.consume(entry & 0xff);
+                put(at, (entry >> 16) as u8);
+                at += 1;
+                entry = litlen.entry(&mut local);
+                if entry & LITERAL != 0 {
+                    local.consume(entry & 0xff);
+                    put(at, (entry >> 16) as u8);
+                    at += 1;
+                    entry = litlen.entry(&mut local);
+                    if entry & LITERAL != 0 {
+                        local.consume(entry & 0xff);
+                        put(at, (entry >> 16) as u8);
+                        at += 1;
                         // Past the end the bits read as zeros, which can
                         // decode as literals forever: stop there as copies do.
-                        if bits.overrun() {
-                            return Err(Error::More);
+                        if local.overrun() {
+                            break 'symbols Err(Error::More);
                         }
                         continue;
                     }
                 }
-                if bits.n < 48 {
-                    bits.refill();
+                // The entry read before this refill is still the next code:
+                // a refill only adds bits above those already present.
+                if local.n < 48 {
+                    local.refill();
                 }
             }
-            if sym == 256 {
-                break;
+            if entry & SPECIAL != 0 {
+                if entry & END == 0 {
+                    break 'symbols Err(Error::Bad);
+                }
+                local.consume(entry & 0xff);
+                break 'symbols Ok(());
             }
-            let s = (sym - 257) as usize;
-            if s >= 29 {
-                return Err(Error::Bad);
+            let saved = local.buf;
+            local.consume(entry & 0xff);
+            let len = with_extra(entry, saved);
+            let entry = dist.entry(&mut local);
+            if entry & SPECIAL != 0 {
+                break 'symbols Err(Error::Bad);
             }
-            let len = usize::from(LEN_BASE[s]) + bits.take(u32::from(LEN_EXTRA[s])) as usize;
-            let d = dist.decode(bits).ok_or(Error::Bad)? as usize;
-            if d >= 30 {
-                return Err(Error::Bad);
-            }
-            let distance = usize::from(DIST_BASE[d]) + bits.take(u32::from(DIST_EXTRA[d])) as usize;
-            let p = *n;
+            let saved = local.buf;
+            local.consume(entry & 0xff);
+            let distance = with_extra(entry, saved);
+            let p = at;
             // Copying from before the last placeholder may copy placeholders.
-            if p.saturating_sub(distance) < *last_window {
-                *last_window = p + len;
+            if p.saturating_sub(distance) < window_end {
+                window_end = p + len;
             }
             if distance <= p {
                 let from = p - distance;
-                if distance >= CHUNK {
-                    // Copy whole chunks, which compile to vector loads and
-                    // stores, and may write past `len` into spare buffer.
-                    // Chunks never overlap the bytes they read.
-                    let mut i = 0;
-                    while i < len {
-                        let chunk: [T; CHUNK] = out[from + i..from + i + CHUNK].try_into().unwrap();
-                        out[p + i..p + i + CHUNK].copy_from_slice(&chunk);
-                        i += CHUNK;
-                    }
-                } else if distance >= len {
-                    out.copy_within(from..from + len, p);
-                } else if distance == 1 {
-                    let v = out[from];
-                    out[p..p + len].fill(v);
-                } else {
-                    for i in 0..len {
-                        out[p + i] = out[from + i];
+                debug_assert!(p + len.next_multiple_of(CHUNK) <= room);
+                // SAFETY: `from + len <= p + len`, within the room checked
+                // above, and everything before `p` has been written.
+                unsafe {
+                    if distance >= CHUNK {
+                        // Copy whole chunks, which compile to vector loads
+                        // and stores, and may write past `len` into spare
+                        // buffer. Chunks never overlap the bytes they read.
+                        let mut i = 0;
+                        while i < len {
+                            std::ptr::copy_nonoverlapping(
+                                base.add(from + i),
+                                base.add(p + i),
+                                CHUNK,
+                            );
+                            i += CHUNK;
+                        }
+                    } else if distance == 1 {
+                        let v = *base.add(from);
+                        for i in 0..len {
+                            *base.add(p + i) = v;
+                        }
+                    } else {
+                        for i in 0..len {
+                            *base.add(p + i) = *base.add(from + i);
+                        }
                     }
                 }
             } else {
                 for i in 0..len {
-                    let at = (p + i) as isize - distance as isize;
-                    out[p + i] = if at >= 0 {
-                        out[at as usize]
+                    let back = (p + i) as isize - distance as isize;
+                    out[p + i] = if back >= 0 {
+                        out[back as usize]
                     } else {
-                        T::window((WINDOW as isize + at) as usize).ok_or(Error::Bad)?
+                        match T::window((WINDOW as isize + back) as usize) {
+                            Some(symbol) => symbol,
+                            None => break 'symbols Err(Error::Bad),
+                        }
                     };
                 }
-                *last_window = p + len;
+                window_end = p + len;
             }
-            *n += len;
-            if bits.overrun() {
-                return Err(Error::More);
+            at += len;
+            if local.overrun() {
+                break 'symbols Err(Error::More);
             }
-        }
+        };
+        *bits = local;
+        *n = at;
+        *last_window = window_end;
+        outcome?;
         if bits.overrun() {
             return Err(Error::More);
         }
@@ -647,6 +805,7 @@ fn decode(
     let mut inflater = Inflater {
         bits: Bits::at(data, start),
         fixed: None,
+        dynamic: Tables::default(),
     };
     let mut head = Vec::new();
     // Taken when the tail starts: a region that is all head needs its
@@ -697,7 +856,7 @@ fn decode(
     out.truncate(out_n);
     pool.words_size.saw(head_n);
     pool.output_size.saw(out_n.max(head_n));
-    let tail_crc = crc32fast::hash(out.get(head_n..).unwrap_or_default());
+    let tail_crc = checksum(out.get(head_n..).unwrap_or_default());
     Ok(Decoded {
         start,
         end: inflater.bits.bit_pos(),
@@ -708,35 +867,102 @@ fn decode(
     })
 }
 
+/// The code space three code-length code lengths claim, of 128 for a
+/// complete code, indexed by their nine bits.
+const CLAIMED: [u8; 512] = {
+    let mut table = [0u8; 512];
+    let mut index = 0;
+    while index < 512 {
+        let mut field = 0;
+        while field < 3 {
+            let len = (index >> (3 * field)) & 7;
+            table[index] += ((128u32 >> len) & 127) as u8;
+            field += 1;
+        }
+        index += 1;
+    }
+    table
+};
+
 /// The first bit at or after `from` and before `to` where a non-final
 /// dynamic block starts whose header is valid and whose whole block decodes.
+///
+/// Nearly every bit is ruled out by the header alone, so that part is done
+/// a byte of offsets at a time and without building anything: the three
+/// header bits, the two code counts, and the code-length code, which must
+/// claim the whole code space.
 fn find_block(data: &[u8], from: usize, to: usize, scratch: &mut Vec<u16>) -> Option<usize> {
-    let to = to.min(data.len().saturating_sub(8) * 8);
-    for bit in from..to {
-        let byte = bit / 8;
-        let w = u32::from_le_bytes(data[byte..byte + 4].try_into().unwrap()) >> (bit % 8);
-        // BFINAL = 0, BTYPE = 2, HLIT <= 29, HDIST <= 29.
-        if w & 7 != 4 || (w >> 3) & 31 > 29 || (w >> 8) & 31 > 29 {
-            continue;
+    find_start(data, from, to, Some(scratch))
+}
+
+/// As `find_block`. Without `scratch` the block is not decoded: its header
+/// must be whole and valid, and the caller finds out whether it is a block.
+fn find_start(
+    data: &[u8],
+    from: usize,
+    to: usize,
+    mut scratch: Option<&mut Vec<u16>>,
+) -> Option<usize> {
+    let to = to.min(data.len().saturating_sub(16) * 8);
+    // Table buffers, reused for every candidate.
+    let mut tables = Tables::default();
+    let mut byte = from / 8;
+    while byte * 8 < to {
+        let word = u64::from_le_bytes(data[byte..byte + 8].try_into().unwrap());
+        // Offsets in this byte where BFINAL = 0 and BTYPE = 2: bits 0, 0, 1.
+        let mut starts = !word & !(word >> 1) & (word >> 2) & 0xff;
+        while starts != 0 {
+            let offset = starts.trailing_zeros() as usize;
+            starts &= starts - 1;
+            let bit = byte * 8 + offset;
+            if bit < from || bit >= to {
+                continue;
+            }
+            // HLIT <= 29, HDIST <= 29.
+            let w = (word >> offset) as u32;
+            if (w >> 3) & 31 > 29 || (w >> 8) & 31 > 29 {
+                continue;
+            }
+            // The code-length code must be complete or a single one-bit code.
+            let hclen = ((w >> 13) & 15) as usize + 4;
+            let at = bit + 17;
+            let packed = u64::from_le_bytes(data[at / 8..at / 8 + 8].try_into().unwrap())
+                >> (at % 8)
+                & ((1 << (3 * hclen)) - 1);
+            let space: u32 = (0..7)
+                .map(|chunk| u32::from(CLAIMED[(packed >> (9 * chunk)) as usize & 511]))
+                .sum();
+            let single = || (0..19).filter(|i| (packed >> (3 * i)) & 7 != 0).count() == 1;
+            if space != 128 && !(space == 64 && single()) {
+                continue;
+            }
+            let mut bits = Bits::at(data, bit + 17);
+            let mut lens = [0u8; 19];
+            for &i in &CODE_ORDER[..hclen] {
+                lens[i] = bits.take(3) as u8;
+            }
+            if !tables.lengths.lengths(&lens) {
+                continue;
+            }
+            let Some(scratch) = scratch.as_deref_mut() else {
+                let mut header = Bits::at(data, bit + 3);
+                if dynamic_tables(&mut header, &mut tables) && !header.overrun() {
+                    return Some(bit);
+                }
+                continue;
+            };
+            let mut inflater = Inflater {
+                bits: Bits::at(data, bit),
+                fixed: None,
+                dynamic: std::mem::take(&mut tables),
+            };
+            let (mut n, mut last_window) = (0, 0);
+            if inflater.block(scratch, &mut n, &mut last_window).is_ok() {
+                return Some(bit);
+            }
+            tables = inflater.dynamic;
         }
-        // The code-length code must be complete or a single one-bit code.
-        let hclen = ((w >> 13) & 15) as usize + 4;
-        let mut bits = Bits::at(data, bit + 17);
-        let mut lens = [0u8; 19];
-        for &i in &CODE_ORDER[..hclen] {
-            lens[i] = bits.take(3) as u8;
-        }
-        if Huffman::new(&lens).is_none() {
-            continue;
-        }
-        let mut inflater = Inflater {
-            bits: Bits::at(data, bit),
-            fixed: None,
-        };
-        let (mut n, mut last_window) = (0, 0);
-        if inflater.block(scratch, &mut n, &mut last_window).is_ok() {
-            return Some(bit);
-        }
+        byte += 1;
     }
     None
 }
@@ -826,6 +1052,14 @@ fn read_range(src: &dyn Source, from: usize, to: usize) -> io::Result<Vec<u8>> {
 fn read_range_into(src: &dyn Source, from: usize, to: usize, buf: &mut Vec<u8>) -> io::Result<()> {
     buf.resize(to - from, 0);
     src.read_at(buf, from)
+}
+
+/// CRC-32 of `data`. libdeflate's is several times faster than crc32fast's
+/// on Arm, and every decoded byte goes through it.
+fn checksum(data: &[u8]) -> u32 {
+    let mut crc = libdeflater::Crc::new();
+    crc.update(data);
+    crc.sum()
 }
 
 fn invalid(message: &str) -> io::Error {
@@ -921,6 +1155,52 @@ fn region(
     result
 }
 
+/// Whether the bits from `pos` to `to` are whole empty blocks, none of them
+/// final. pigz ends each of its chunks with an empty stored block, as zlib
+/// does at a flush. A region whose first block comes after such blocks
+/// starts where the stream had got to all the same: they hold no output.
+fn only_empty_blocks(src: &dyn Source, pos: usize, to: usize) -> io::Result<bool> {
+    // A stored block is at most 43 bits and a fixed one 10; flushes do not
+    // put many in a row.
+    if to <= pos || to - pos > 8 * 64 {
+        return Ok(false);
+    }
+    let from = pos / 8;
+    let data = read_range(src, from, (to.div_ceil(8) + 4).min(src.len()))?;
+    let take = |bit: usize, count: usize| -> Option<u32> {
+        (bit + count <= data.len() * 8).then(|| {
+            (0..count).fold(0, |value, i| {
+                value | u32::from(data[(bit + i) / 8] >> ((bit + i) % 8) & 1) << i
+            })
+        })
+    };
+    let (mut bit, target) = (pos - from * 8, to - from * 8);
+    while bit < target {
+        // BFINAL, then BTYPE.
+        let ends = match take(bit, 3) {
+            // Stored: padding to a byte, a zero length and its complement.
+            Some(0b000) => {
+                let length = (bit + 3).div_ceil(8) * 8;
+                (take(length, 32) == Some(0xffff_0000)).then_some(length + 32)
+            }
+            // Fixed codes: the end-of-block code alone, seven zero bits.
+            Some(0b010) => (take(bit + 3, 7) == Some(0)).then_some(bit + 10),
+            _ => None,
+        };
+        match ends {
+            Some(end) => bit = end,
+            None => return Ok(false),
+        }
+    }
+    Ok(bit == target)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Regions the coordinator on this thread decoded again from a known start.
+    static REDONE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// A resolved region: its dispatch number, the head's CRC32 (or the error
 /// resolving it), the head's length, and the region.
 type Resolved = (usize, io::Result<u32>, usize, Decoded);
@@ -949,7 +1229,22 @@ fn resolve(head: &[u16], window: &[u8], out: &mut [u8]) -> io::Result<()> {
     {
         return Err(invalid("Invalid deflate distance"));
     }
-    for (o, &s) in out.iter_mut().zip(head) {
+    // Most groups of symbols hold no placeholder and only need narrowing,
+    // which compiles to vector code; the rest go through the table.
+    let mut bytes = out.chunks_exact_mut(32);
+    let mut symbols = head.chunks_exact(32);
+    for (bytes, symbols) in (&mut bytes).zip(&mut symbols) {
+        if symbols.iter().fold(0, |all, &s| all | s) < 256 {
+            for (o, &s) in bytes.iter_mut().zip(symbols) {
+                *o = s as u8;
+            }
+        } else {
+            for (o, &s) in bytes.iter_mut().zip(symbols) {
+                *o = lut[usize::from(s)];
+            }
+        }
+    }
+    for (o, &s) in bytes.into_remainder().iter_mut().zip(symbols.remainder()) {
         *o = lut[usize::from(s)];
     }
     Ok(())
@@ -991,11 +1286,13 @@ pub(crate) fn decompress_source(
     }
 }
 
-/// Region size for files: `REGION`, unless tests asked for smaller regions
-/// so that small inputs cross many of them.
+/// Region size for files: `REGION` shared between the inputs being decoded,
+/// unless tests asked for smaller regions so that small inputs cross many of
+/// them. Two inputs with full regions each ran no faster and held twice the
+/// decoded output in memory.
 fn region_size() -> usize {
     match crate::io::forced_split_region() {
-        0 => REGION,
+        0 => REGION / crate::io::split_region_shares().max(1),
         size => size,
     }
 }
@@ -1063,8 +1360,8 @@ fn run(
                                 decoded.out.truncate(n);
                             }
                             let head = &mut decoded.out[..n];
-                            let crc = resolve(&decoded.head, &window, head)
-                                .map(|()| crc32fast::hash(head));
+                            let crc =
+                                resolve(&decoded.head, &window, head).map(|()| checksum(head));
                             // Keep only the length; the buffer is free now.
                             let head = std::mem::take(&mut decoded.head);
                             let _ = resolved_tx.send((k, crc, n, decoded));
@@ -1169,8 +1466,10 @@ fn run(
                 continue;
             }
             let decoded = match result {
-                Ok(Some(d)) if d.start == pos => d,
+                Ok(Some(d)) if d.start == pos || only_empty_blocks(src, pos, d.start)? => d,
                 other => {
+                    #[cfg(test)]
+                    REDONE.with(|n| n.set(n.get() + 1));
                     // A false start: its buffers are reused for the redo.
                     if let Ok(Some(d)) = other {
                         pool.give_words(d.head);
@@ -1256,9 +1555,541 @@ fn run(
     Ok(())
 }
 
+// exact regions
+
+/// Bytes read ahead of a reader and handed back to it: what is taken with
+/// `peek` and not consumed is read again, by `peek` or as a normal reader.
+pub(crate) struct Carry<R> {
+    held: Vec<u8>,
+    at: usize,
+    inner: R,
+    ended: bool,
+}
+
+impl<R: Read> Carry<R> {
+    pub(crate) fn new(inner: R) -> Self {
+        Self {
+            held: Vec::new(),
+            at: 0,
+            inner,
+            ended: false,
+        }
+    }
+
+    /// The bytes held, and where the next unread one is in them: at least
+    /// `want` unread unless the input ends first, after at least `HEADROOM`
+    /// bytes the caller may overwrite. It may also change unread bytes, if it
+    /// puts them back before the next call.
+    fn peek(&mut self, want: usize) -> io::Result<(&mut [u8], usize)> {
+        if self.held.len() - self.at < want && !self.ended || self.at < HEADROOM {
+            let unread = self.held.len() - self.at;
+            if self.at < HEADROOM {
+                let grow = HEADROOM - self.at;
+                self.held.resize(self.held.len() + grow, 0);
+                self.held.copy_within(self.at..self.at + unread, HEADROOM);
+            } else {
+                self.held.copy_within(self.at.., HEADROOM);
+            }
+            self.at = HEADROOM;
+            let mut filled = HEADROOM + unread;
+            let end = HEADROOM + want.max(unread);
+            self.held.resize(end, 0);
+            while filled < end && !self.ended {
+                match self.inner.read(&mut self.held[filled..]) {
+                    Ok(0) => self.ended = true,
+                    Ok(n) => filled += n,
+                    Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                    Err(e) => {
+                        self.held.truncate(filled);
+                        return Err(e);
+                    }
+                }
+            }
+            self.held.truncate(filled);
+        }
+        Ok((&mut self.held, self.at))
+    }
+
+    fn skip(&mut self, n: usize) {
+        self.at += n;
+        debug_assert!(self.at <= self.held.len());
+    }
+}
+
+impl<R: Read> Read for Carry<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if self.at < self.held.len() {
+            let n = buf.len().min(self.held.len() - self.at);
+            buf[..n].copy_from_slice(&self.held[self.at..self.at + n]);
+            self.at += n;
+            return Ok(n);
+        }
+        self.inner.read(buf)
+    }
+}
+
+impl<R: io::BufRead> io::BufRead for Carry<R> {
+    fn fill_buf(&mut self) -> io::Result<&[u8]> {
+        if self.at < self.held.len() {
+            return Ok(&self.held[self.at..]);
+        }
+        self.inner.fill_buf()
+    }
+
+    fn consume(&mut self, n: usize) {
+        if self.at < self.held.len() {
+            self.at += n;
+        } else {
+            self.inner.consume(n);
+        }
+    }
+}
+
+/// Room before the unread bytes of a `Carry`: a region's window as a stored
+/// block and the empty blocks before its first byte are written there.
+const HEADROOM: usize = WINDOW + 32;
+
+/// Compressed bytes an exact region aims for, and how far past them a block
+/// start is looked for.
+const EXACT_REGION: usize = 1 << 20;
+const EXACT_SEARCH: usize = 256 << 10;
+
+/// Empty deflate blocks whose lengths add up to `shift` bits more than whole
+/// bytes: `(bits, count)`, least significant bit first. They move a decoder
+/// from a byte boundary to the bit a region starts at without writing output.
+fn filler(shift: usize) -> (Vec<u8>, usize) {
+    let mut bytes = Vec::new();
+    let mut count = 0usize;
+    let mut put = |value: u32, bits: usize| {
+        for i in 0..bits {
+            if count % 8 == 0 {
+                bytes.push(0);
+            }
+            *bytes.last_mut().unwrap() |= ((value >> i & 1) as u8) << (count % 8);
+            count += 1;
+        }
+    };
+    if shift % 2 == 1 {
+        // A dynamic block with only an end-of-block code, 97 bits: one more
+        // than whole bytes. Literal 0 and end-of-block get one bit each; the
+        // code lengths are written with 18 (one bit), 0 and 1 (two bits).
+        put(0, 1);
+        put(2, 2);
+        put(0, 5);
+        put(0, 5);
+        put(15, 4);
+        for symbol in CODE_ORDER {
+            put(
+                match symbol {
+                    18 => 1,
+                    0 | 1 => 2,
+                    _ => 0,
+                },
+                3,
+            );
+        }
+        put(0b11, 2); // literal 0: length 1
+        put(0, 1); // 18: 138 zeros
+        put(127, 7);
+        put(0, 1); // 18: 117 zeros
+        put(106, 7);
+        put(0b11, 2); // end of block: length 1
+        put(0b01, 2); // the one distance code: length 0
+        put(1, 1); // end of block
+    }
+    // An empty fixed block is 10 bits: two more than a whole byte.
+    for _ in 0..shift / 2 {
+        put(0, 1);
+        put(1, 2);
+        put(0, 7);
+    }
+    (bytes, count)
+}
+
+enum Attempt {
+    /// The region decoded up to the block start it was cut at.
+    Region,
+    /// The stream's final block ended after this many of the bytes given.
+    Ended(usize),
+    /// The cut was not a block start.
+    Miss,
+}
+
+/// Decodes one deflate stream in order, a region of about a megabyte at a
+/// time, with libdeflate, which is faster than a streaming inflater but only
+/// decodes whole streams. Each region is made into one: the 32 KiB before it
+/// as a stored block, empty blocks up to the bit it starts at, its own bytes
+/// as they are, and an empty final block where the next region starts.
+///
+/// The next region's start is found as in parallel decoding, by looking for
+/// a block that decodes. A wrong one cannot pass: decoding from a true start
+/// reaches the appended final block only at a true block boundary. Streams
+/// with no block start to find, or damaged ones, go through `Inflater`.
+pub(crate) struct ExactRegions {
+    decompressor: *mut libdeflate_sys::libdeflate_decompressor,
+    /// Output before the next region, at most 32 KiB.
+    window: Vec<u8>,
+    /// The bit of the next input byte at which the next region starts.
+    shift: usize,
+    fillers: [(Vec<u8>, usize); 8],
+    /// Output bytes per input byte last seen, to size the output buffer.
+    ratio: usize,
+    /// Compressed bytes a region aims for, and how far past them a block
+    /// start is looked for.
+    region: usize,
+    search: usize,
+}
+
+// SAFETY: the decompressor is owned and only used through `&mut self`.
+unsafe impl Send for ExactRegions {}
+
+impl Drop for ExactRegions {
+    fn drop(&mut self) {
+        // SAFETY: allocated in `new` and freed once.
+        unsafe { libdeflate_sys::libdeflate_free_decompressor(self.decompressor) }
+    }
+}
+
+impl ExactRegions {
+    pub(crate) fn new() -> Self {
+        Self {
+            // SAFETY: plain allocation; a null result is checked on use.
+            decompressor: unsafe { libdeflate_sys::libdeflate_alloc_decompressor() },
+            window: Vec::new(),
+            shift: 0,
+            fillers: std::array::from_fn(filler),
+            ratio: 6,
+            region: EXACT_REGION,
+            search: EXACT_SEARCH,
+        }
+    }
+
+    /// Start a new stream at the reader's next byte.
+    pub(crate) fn start(&mut self) {
+        self.window.clear();
+        self.shift = 0;
+    }
+
+    /// Decode further into `out`, replacing its contents with the next
+    /// output, which may be empty. Returns whether the stream ended; the
+    /// reader is then just past its last byte.
+    pub(crate) fn next<R: Read>(
+        &mut self,
+        input: &mut Carry<R>,
+        out: &mut Vec<u8>,
+    ) -> io::Result<bool> {
+        let (region, search) = (self.region, self.search);
+        let mut want = region + search + 16;
+        loop {
+            let (held, at) = input.peek(want)?;
+            let whole = held.len() - at < want;
+            if held.len() == at {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "Truncated gzip input",
+                ));
+            }
+            // Try block starts after the region's target until one holds.
+            let mut from = region * 8;
+            let mut tries = 0;
+            while !self.decompressor.is_null() && tries < 8 {
+                let cut = if whole {
+                    None
+                } else {
+                    find_start(&held[at..], from, (region + search) * 8, None)
+                };
+                if cut.is_none() && !whole {
+                    break;
+                }
+                match self.attempt(held, at, cut, out) {
+                    Some(Attempt::Region) => {
+                        let cut = cut.expect("a region ends at a cut");
+                        self.finish(out, false);
+                        self.shift = cut % 8;
+                        input.skip(cut / 8);
+                        return Ok(false);
+                    }
+                    Some(Attempt::Ended(used)) => {
+                        self.finish(out, true);
+                        input.skip(used);
+                        return Ok(true);
+                    }
+                    Some(Attempt::Miss) if whole => break,
+                    Some(Attempt::Miss) => {
+                        from = cut.expect("a miss has a cut") + 1;
+                        tries += 1;
+                    }
+                    None => break,
+                }
+            }
+            // No block start to cut at, or damaged input: decode exactly.
+            match self.slow(&held[at..], out) {
+                Ok((end, last)) => {
+                    self.finish(out, last);
+                    if last {
+                        input.skip(end.div_ceil(8));
+                    } else {
+                        self.shift = end % 8;
+                        input.skip(end / 8);
+                    }
+                    return Ok(last);
+                }
+                Err(Error::More) if !whole => want *= 2,
+                Err(Error::More) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "Truncated gzip input",
+                    ))
+                }
+                Err(Error::Bad) => return Err(invalid("Invalid deflate data")),
+            }
+        }
+    }
+
+    /// `out` holds the window followed by the region. The window was held
+    /// back from the region before, so `out` is passed on from its start,
+    /// without moving the region down; in turn the end of it that is the
+    /// next region's window is held back, unless the stream ended.
+    fn finish(&mut self, out: &mut Vec<u8>, ended: bool) {
+        let keep = out.len().min(WINDOW);
+        self.window.clear();
+        self.window.extend_from_slice(&out[out.len() - keep..]);
+        if !ended {
+            out.truncate(out.len() - keep);
+        }
+    }
+
+    /// Decode `held[at..]` from `self.shift` up to the bit `cut`, or to the
+    /// end of the stream when there is no cut, into `out` after the window.
+    /// `None` means libdeflate could not be used at all.
+    ///
+    /// The stream is built around the region's bytes where they lie: the
+    /// blocks before it go in the room before `at`, and the final block
+    /// overwrites a few bytes after the cut, which are put back.
+    fn attempt(
+        &mut self,
+        held: &mut [u8],
+        at: usize,
+        cut: Option<usize>,
+        out: &mut Vec<u8>,
+    ) -> Option<Attempt> {
+        let window = self.window.len();
+        let (fill, bits) = &self.fillers[self.shift];
+        debug_assert_eq!(bits % 8, self.shift);
+        // Where the stream starts, and where `held[at]` is in it.
+        let offset = 5 + window + bits / 8;
+        let begin = at - offset;
+        held[begin] = 0;
+        held[begin + 1..begin + 3].copy_from_slice(&(window as u16).to_le_bytes());
+        held[begin + 3..begin + 5].copy_from_slice(&(!(window as u16)).to_le_bytes());
+        held[begin + 5..begin + 5 + window].copy_from_slice(&self.window);
+        held[at - bits / 8..at].copy_from_slice(&fill[..bits / 8]);
+        let first = held[at];
+        if self.shift != 0 {
+            held[at] = fill[bits / 8] | first & (0xff << self.shift);
+        }
+        let real = match cut {
+            Some(cut) => cut.div_ceil(8),
+            None => held.len() - at,
+        };
+        // An empty stored final block at the cut: its three header bits,
+        // padding to a byte, then a zero length and its complement.
+        let mut saved = [0u8; 8];
+        let mut end = at + real;
+        let tail = match cut {
+            Some(cut) => {
+                let bit = cut % 8;
+                let from = at + cut / 8;
+                saved.copy_from_slice(&held[from..from + 8]);
+                if bit == 0 {
+                    held[from] = 1;
+                    end = from + 1;
+                } else {
+                    held[from] = held[from] & ((1 << bit) - 1) | 1 << bit;
+                    end = from + 1;
+                    if bit + 3 > 8 {
+                        held[end] = 0;
+                        end += 1;
+                    }
+                }
+                held[end..end + 4].copy_from_slice(&[0, 0, 0xff, 0xff]);
+                end += 4;
+                Some(from)
+            }
+            None => None,
+        };
+        let crafted = &held[begin..end];
+        let result = self.inflate(crafted, window, real, offset, cut.is_some(), out);
+        if let Some(from) = tail {
+            held[from..from + 8].copy_from_slice(&saved);
+        }
+        held[at] = first;
+        result
+    }
+
+    fn inflate(
+        &mut self,
+        crafted: &[u8],
+        window: usize,
+        real: usize,
+        offset: usize,
+        cut: bool,
+        out: &mut Vec<u8>,
+    ) -> Option<Attempt> {
+        let mut room = window + real * self.ratio + (64 << 10);
+        loop {
+            out.clear();
+            out.reserve(room);
+            let (mut used, mut written) = (0usize, 0usize);
+            // SAFETY: `crafted` is initialized for its length and `out` has
+            // `room` bytes of capacity; libdeflate writes at most that many
+            // and reports how many it wrote.
+            let result = unsafe {
+                libdeflate_sys::libdeflate_deflate_decompress_ex(
+                    self.decompressor,
+                    crafted.as_ptr().cast(),
+                    crafted.len(),
+                    out.as_mut_ptr().cast(),
+                    room,
+                    &mut used,
+                    &mut written,
+                )
+            };
+            match result {
+                libdeflate_sys::libdeflate_result_LIBDEFLATE_SUCCESS => {
+                    // SAFETY: libdeflate initialized `written <= room` bytes.
+                    unsafe { out.set_len(written) };
+                    if written < window {
+                        return Some(Attempt::Miss);
+                    }
+                    self.ratio = ((written - window) / real.max(1) + 2).clamp(4, 1100);
+                    return Some(if cut && used == crafted.len() {
+                        Attempt::Region
+                    } else if used > offset && used - offset <= real {
+                        Attempt::Ended(used - offset)
+                    } else {
+                        Attempt::Miss
+                    });
+                }
+                libdeflate_sys::libdeflate_result_LIBDEFLATE_INSUFFICIENT_SPACE
+                    if room < window + real * 1100 =>
+                {
+                    room *= 2;
+                }
+                _ => return Some(Attempt::Miss),
+            }
+        }
+    }
+
+    /// Decode with `Inflater` from `self.shift` to the first block end at or
+    /// past the region's target: the bit it stopped at, and whether that was
+    /// the stream's end. `out` receives the window followed by the output.
+    fn slow(&mut self, data: &[u8], out: &mut Vec<u8>) -> Result<(usize, bool), Error> {
+        out.clear();
+        out.extend_from_slice(&self.window);
+        let mut n = out.len();
+        let mut inflater = Inflater {
+            bits: Bits::at(data, self.shift),
+            fixed: None,
+            dynamic: Tables::default(),
+        };
+        let mut last_window = 0;
+        loop {
+            let last = inflater.block(out, &mut n, &mut last_window)?;
+            let at = inflater.bits.bit_pos();
+            if last || at >= self.region * 8 {
+                out.truncate(n);
+                return Ok((at, last));
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Decode a raw deflate stream block by block, as bytes or as symbols
+    /// with window placeholders.
+    fn inflate_all<T: Symbol>(deflated: &[u8]) -> Result<Vec<T>, Error> {
+        let mut inflater = Inflater {
+            bits: Bits::at(deflated, 0),
+            fixed: None,
+            dynamic: Tables::default(),
+        };
+        let mut out = Vec::new();
+        let (mut n, mut last_window) = (0, 0);
+        while !inflater.block(&mut out, &mut n, &mut last_window)? {}
+        out.truncate(n);
+        Ok(out)
+    }
+
+    #[test]
+    fn inflater_matches_the_input_for_every_block_type_and_survives_damage() {
+        use std::io::Write;
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut random = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let mut inputs: Vec<Vec<u8>> = vec![
+            Vec::new(),
+            b"a".to_vec(),
+            b"abcabcabcabcabcabc".to_vec(),
+            vec![b'A'; 70_000],
+            fastq(3000, 5),
+        ];
+        // Incompressible bytes are stored; skewed ones need long codes and
+        // subtables; short periods give overlapping copies at every distance.
+        inputs.push((0..40_000).map(|_| random() as u8).collect());
+        inputs.push(
+            (0..120_000)
+                .map(|_| (random() % 97).min(random() % 251) as u8)
+                .collect(),
+        );
+        for period in [1usize, 2, 3, 7, 15, 16, 17, 31, 255, 300] {
+            let unit: Vec<u8> = (0..period).map(|_| random() as u8).collect();
+            inputs.push(unit.iter().cycle().take(5000 + period).copied().collect());
+        }
+        for input in &inputs {
+            for level in [0, 1, 4, 6, 9] {
+                let mut encoder =
+                    flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::new(level));
+                encoder.write_all(input).unwrap();
+                let deflated = encoder.finish().unwrap();
+                let bytes: Vec<u8> = inflate_all(&deflated).ok().unwrap();
+                assert!(
+                    bytes == *input,
+                    "bytes, level {level}, {} long",
+                    input.len()
+                );
+                let symbols: Vec<u16> = inflate_all(&deflated).ok().unwrap();
+                assert!(
+                    symbols.iter().map(|&s| s as u8).eq(input.iter().copied())
+                        && symbols.iter().all(|&s| s < 256),
+                    "symbols, level {level}, {} long",
+                    input.len()
+                );
+                // Damaged and truncated streams may decode to anything or
+                // fail, but must not read or write out of bounds.
+                for _ in 0..40 {
+                    let mut damaged = deflated.clone();
+                    if damaged.is_empty() {
+                        break;
+                    }
+                    for _ in 0..1 + random() % 3 {
+                        let at = random() as usize % damaged.len();
+                        damaged[at] ^= 1 << (random() % 8);
+                    }
+                    damaged.truncate(1 + random() as usize % damaged.len());
+                    let _ = inflate_all::<u8>(&damaged);
+                    let _ = inflate_all::<u16>(&damaged);
+                }
+            }
+        }
+    }
     use std::io::Write;
 
     fn fastq(n: usize, seed: u64) -> Vec<u8> {
@@ -1302,6 +2133,142 @@ mod tests {
         Err(invalid("no end"))
     }
 
+    /// Decode gzip member `gz` in exact regions of `region` compressed bytes.
+    /// Returns the output and how many bytes followed the deflate stream.
+    fn exact(gz: &[u8], region: usize) -> io::Result<(Vec<u8>, usize)> {
+        let start = header_len(gz)? / 8;
+        let mut input = Carry::new(&gz[start..]);
+        let mut regions = ExactRegions::new();
+        regions.region = region;
+        regions.search = region.max(64 << 10);
+        regions.start();
+        let (mut out, mut piece) = (Vec::new(), Vec::new());
+        loop {
+            let ended = regions.next(&mut input, &mut piece)?;
+            out.extend_from_slice(&piece);
+            if ended {
+                let mut rest = Vec::new();
+                input.read_to_end(&mut rest)?;
+                return Ok((out, rest.len()));
+            }
+        }
+    }
+
+    /// `PGZIP_BENCH=file.gz cargo test --release exact_throughput -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn exact_throughput() {
+        let gz = std::fs::read(std::env::var("PGZIP_BENCH").unwrap()).unwrap();
+        let start = header_len(&gz).unwrap() / 8;
+        for region in [256 << 10, 512 << 10, 1 << 20, 2 << 20] {
+            let t = std::time::Instant::now();
+            let mut input = Carry::new(&gz[start..]);
+            let mut regions = ExactRegions::new();
+            regions.region = region;
+            let (mut total, mut pieces, mut piece) = (0usize, 0usize, Vec::new());
+            while !regions.next(&mut input, &mut piece).unwrap() {
+                total += piece.len();
+                pieces += 1;
+            }
+            total += piece.len();
+            let seconds = t.elapsed().as_secs_f64();
+            eprintln!(
+                "region {region}: {seconds:.3}s, {:.0} MB/s, {pieces} regions",
+                total as f64 / 1e6 / seconds
+            );
+        }
+    }
+
+    #[test]
+    fn filler_blocks_are_empty_and_end_at_their_bit() {
+        for shift in 0..8 {
+            let (mut bytes, count) = filler(shift);
+            assert_eq!(count % 8, shift);
+            // A final fixed block with only an end-of-block code, then a
+            // marker byte that must be left unread.
+            let mut bit = count;
+            for value in [1u8, 1, 0, 0, 0, 0, 0, 0, 0, 0] {
+                if bit % 8 == 0 {
+                    bytes.push(0);
+                }
+                *bytes.last_mut().unwrap() |= value << (bit % 8);
+                bit += 1;
+            }
+            let used = bytes.len();
+            bytes.push(0xa5);
+            let mut zlib = flate2::Decompress::new(false);
+            let mut out = [0u8; 16];
+            let status = zlib
+                .decompress(&bytes, &mut out, flate2::FlushDecompress::Finish)
+                .unwrap();
+            assert_eq!(status, flate2::Status::StreamEnd, "shift {shift}");
+            assert_eq!((zlib.total_out(), zlib.total_in() as usize), (0, used));
+            let mut libdeflate = libdeflater::Decompressor::new();
+            assert_eq!(libdeflate.deflate_decompress(&bytes, &mut out), Ok(0));
+        }
+    }
+
+    #[test]
+    fn exact_regions_match_the_input_for_every_kind_of_stream() {
+        let data = fastq(60_000, 11);
+        let mut noise = data.clone();
+        let mut state = 3u64;
+        for b in noise.iter_mut().step_by(3) {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(7);
+            *b = (state >> 40) as u8;
+        }
+        let small = &data[..700];
+        for (name, input) in [
+            ("fastq", &data[..]),
+            ("noise", &noise[..]),
+            ("small", small),
+            ("empty", &[][..]),
+        ] {
+            for level in [0, 1, 4, 9] {
+                let gz = zlib_gzip(input, level);
+                for region in [1 << 20, 64 << 10, 9000, 1500] {
+                    let (out, rest) = exact(&gz, region)
+                        .unwrap_or_else(|e| panic!("{name} level {level} region {region}: {e}"));
+                    assert!(out == input, "{name} level {level} region {region}");
+                    // The trailer is left for the caller.
+                    assert_eq!(rest, 8, "{name} level {level} region {region}");
+                }
+            }
+        }
+        // libdeflate's blocks are larger than zlib's, and a member may be
+        // followed by another.
+        let mut gz = Vec::new();
+        let mut compressor =
+            libdeflater::Compressor::new(libdeflater::CompressionLvl::new(6).unwrap());
+        gz.resize(compressor.gzip_compress_bound(data.len()), 0);
+        let n = compressor.gzip_compress(&data, &mut gz).unwrap();
+        gz.truncate(n);
+        gz.extend_from_slice(&zlib_gzip(small, 6));
+        let (out, rest) = exact(&gz, 20_000).unwrap();
+        assert!(out == data);
+        assert_eq!(rest, 8 + zlib_gzip(small, 6).len());
+    }
+
+    #[test]
+    fn exact_regions_reject_damaged_and_truncated_streams() {
+        let data = fastq(20_000, 5);
+        let gz = zlib_gzip(&data, 6);
+        assert!(exact(&gz[..gz.len() / 2], 9000).is_err());
+        assert!(exact(&gz[..gz.len() - 9], 9000).is_err());
+        let mut x = 77u64;
+        for _ in 0..200 {
+            x = x.wrapping_mul(6364136223846793005).wrapping_add(11);
+            let mut damaged = gz.clone();
+            let at = 12 + (x >> 33) as usize % (gz.len() - 24);
+            damaged[at] ^= 1 << ((x >> 20) % 8);
+            // Damage must never be decoded as the original; the caller's
+            // CRC check catches output that decodes to something else.
+            if let Ok((out, _)) = exact(&damaged, 9000) {
+                assert!(out != data || damaged == gz);
+            }
+        }
+    }
+
     fn zlib_gzip(data: &[u8], level: u32) -> Vec<u8> {
         let mut e = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::new(level));
         e.write_all(data).unwrap();
@@ -1325,6 +2292,65 @@ mod tests {
         let n = c.gzip_compress(&data, &mut gz).unwrap();
         gz.truncate(n);
         assert_eq!(decompress_bytes(&gz, 3).unwrap(), data, "libdeflate");
+    }
+
+    #[test]
+    fn regions_after_flushes_are_not_decoded_again() {
+        // A sync flush every few thousand bytes, as pigz writes between its
+        // chunks: an empty stored block follows each run of blocks.
+        let data = fastq(60_000, 9);
+        let mut gz = vec![0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 3];
+        let mut deflate = flate2::Compress::new(flate2::Compression::new(4), false);
+        let mut buf = vec![0u8; 1 << 16];
+        for (i, chunk) in data.chunks(40_000).enumerate() {
+            let last = (i + 1) * 40_000 >= data.len();
+            let mut chunk = chunk;
+            loop {
+                let (read, written) = (deflate.total_in(), deflate.total_out());
+                let flush = if last {
+                    flate2::FlushCompress::Finish
+                } else {
+                    flate2::FlushCompress::Sync
+                };
+                let status = deflate.compress(chunk, &mut buf, flush).unwrap();
+                chunk = &chunk[(deflate.total_in() - read) as usize..];
+                let n = (deflate.total_out() - written) as usize;
+                gz.extend_from_slice(&buf[..n]);
+                if status == flate2::Status::StreamEnd
+                    || (!last && chunk.is_empty() && n < buf.len())
+                {
+                    break;
+                }
+            }
+        }
+        gz.extend_from_slice(&crc32fast::hash(&data).to_le_bytes());
+        gz.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        for region in [8_000, 20_000, 64_000] {
+            let (sender, receiver) = crossbeam_channel::unbounded();
+            REDONE.with(|n| n.set(0));
+            decompress_source(&&gz[..], region, 3, sender, crossbeam_channel::bounded(1));
+            let mut out = Vec::new();
+            for part in receiver {
+                out.extend(part.unwrap());
+            }
+            assert!(out == data, "region {region}");
+            // Most regions start after a flush here. Only the few whose
+            // guessed start was no block at all are decoded again.
+            let redone = REDONE.with(|n| n.get());
+            assert!(
+                redone * 50 <= gz.len() / region,
+                "region {region}: {redone}"
+            );
+        }
+        // Blocks that are not empty, or that end the stream, are not skipped.
+        let stored = [
+            0b000, 0, 0, 0xff, 0xff, 0b010, 0, 1, 0, 0xfe, 0xff, b'x', 0b011, 0,
+        ];
+        assert!(only_empty_blocks(&&stored[..], 0, 40).unwrap());
+        assert!(only_empty_blocks(&&stored[..], 0, 50).unwrap());
+        assert!(!only_empty_blocks(&&stored[..], 0, 45).unwrap());
+        assert!(!only_empty_blocks(&&stored[..], 50, 12 * 8).unwrap());
+        assert!(!only_empty_blocks(&&stored[..], 12 * 8, 12 * 8 + 10).unwrap());
     }
 
     /// `PGZIP_BENCH=file.gz cargo test --release pgzip_throughput -- --ignored --nocapture`

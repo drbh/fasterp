@@ -7,6 +7,9 @@
 //!   matches cost more bits than they save, and searching for them is where
 //!   general compressors spend most of their time. One probe per read finds
 //!   a duplicate of an earlier read that starts at the same base;
+//! * in runs sorted by alignment position, where reads overlap their
+//!   neighbours, sequence lines are matched against earlier ones through
+//!   anchors every few bases;
 //! * header lines are matched against the previous header (common prefix
 //!   and suffix), with the hash matcher for the part that changes;
 //! * `+` lines and quality strings go through a four-way hash matcher
@@ -19,43 +22,70 @@
 const WINDOW: usize = 32768;
 const MIN_MATCH: usize = 4;
 const MAX_MATCH: usize = 258;
-const NICE_MATCH: usize = 64;
+/// Candidates are tried until one is this long. Above the longest match
+/// there is, so the longest candidate always wins: a quality line that
+/// repeats an earlier one whole is one match, which the first long
+/// candidate may fall short of.
+const NICE_MATCH: usize = MAX_MATCH * 4;
 const INSERT_IN_MATCH: usize = 16;
+/// With binned qualities matches are long and alike, and four positions find
+/// nearly all that sixteen do: 12% faster for files 0.5% larger, which still
+/// leaves them the size of level 4's.
+const INSERT_IN_BINNED_MATCH: usize = 4;
 
 const HASH_BITS: u32 = 12;
+/// Bytes hashed at a position. Binned qualities have so few values that
+/// four bytes send most positions to a few buckets; six spread them out,
+/// and the matches found are at least that long: 1% smaller output.
+const CONTEXT: u32 = 4;
+const BINNED_CONTEXT: u32 = 6;
 
 /// Quality strings with at most this many distinct characters are binned,
 /// as NovaSeq and NextSeq 2000 write them (four values). There this encoder
 /// matches libdeflate level 4 in size at about 2.4 times its speed. With eight
 /// bins or full-range qualities level 4 finds matches in the qualities that
-/// greedy hashing misses, and is 2-8% smaller, so those blocks stay with it.
+/// greedy hashing misses: this encoder's output is about 3% and 4% larger
+/// there, at about twice the speed.
 const MAX_BINS: u32 = 6;
 const SAMPLE_RECORDS: usize = 64;
 
-/// Reads from a run sorted by alignment position overlap their neighbours,
-/// and level 4 finds those matches where this encoder does not: on a sorted
-/// 30x NovaSeq run its output was twice level 4's. There most reads share 16
-/// bases with one of the previous few; elsewhere almost none do outside
-/// duplicates. Blocks where more than a quarter of the tested reads do stay
-/// with libdeflate.
+/// Reads from a run sorted by alignment position overlap their neighbours:
+/// most share 16 bases with one of the previous few, where elsewhere almost
+/// none do outside duplicates. Blocks where more than one in sixteen of the
+/// tested reads do are sorted, and their sequence lines are matched against
+/// earlier reads (see `Tokenizer::overlapping`).
 const OVERLAP_READS: usize = 8;
 const OVERLAP_KEY: usize = 16;
 
-/// Whether the FASTQ-aware encoder should compress `input` instead of
-/// libdeflate: the block's first records have binned qualities and do not
-/// overlap each other like sorted reads. The choice depends only on the
-/// block, so output is the same on every run and thread count.
-pub(crate) fn suits(input: &[u8]) -> bool {
-    binned_unsorted(input)
+/// What the first records of a block say about how to compress it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Kind {
+    /// The qualities are binned, which decode and compress much faster than
+    /// full-range ones.
+    pub(crate) binned: bool,
+    /// The reads overlap their neighbours, as in a run sorted by position.
+    pub(crate) sorted: bool,
 }
 
-fn binned_unsorted(data: &[u8]) -> bool {
+/// How the FASTQ-aware encoder should compress `input`, or `None` when it
+/// does not start with FASTQ records and libdeflate should. The choice
+/// depends only on the block, so output is the same on every run and thread
+/// count.
+impl Kind {
+    /// For input that is not FASTQ, when this encoder is asked for anyway.
+    pub(crate) const PLAIN: Kind = Kind {
+        binned: false,
+        sorted: false,
+    };
+}
+
+pub(crate) fn kind(data: &[u8]) -> Option<Kind> {
     let n = data.len();
     let mut pos = 0;
     while !record_starts(data, pos) {
         match memchr::memchr(b'\n', &data[pos.min(n)..]) {
             Some(i) => pos += i + 1,
-            None => return false,
+            None => return None,
         }
     }
     let mut seen = [0u64; 4];
@@ -91,10 +121,12 @@ fn binned_unsorted(data: &[u8]) -> bool {
         records += 1;
         pos = end + 1;
     }
-    records > 0
-        && seen.iter().map(|w| w.count_ones()).sum::<u32>() <= MAX_BINS
-        // Every fourth record is tested.
-        && overlapping * 16 <= records
+    let values: u32 = seen.iter().map(|w| w.count_ones()).sum();
+    // Every fourth record is tested.
+    (records > 0).then_some(Kind {
+        binned: values <= MAX_BINS,
+        sorted: overlapping * 16 > records,
+    })
 }
 
 // ---- static tables --------------------------------------------------------
@@ -178,11 +210,40 @@ fn dist_symbol(t: &Tables, d: usize) -> usize {
 
 // ---- tokens ---------------------------------------------------------------
 
-/// A literal run (its length, bit 31 clear) or a match: bit 31 set, length
-/// in bits 16..25, distance - 1 in bits 0..15. Tokens consume the input in
-/// order, so the writer walks the input alongside them.
+/// A literal run (its length, bit 31 clear) or a match: bit 31 set, the
+/// distance symbol in bits 25..30, length in bits 16..25, distance - 1 in
+/// bits 0..15. Tokens consume the input in order, so the writer walks the
+/// input alongside them.
 type Token = u32;
 const MATCH: u32 = 1 << 31;
+/// A literal run of bases, which the writer codes four at a time.
+const BASES: u32 = 1 << 30;
+
+/// The two bits that tell A, C, T and G apart, in that order.
+const BASE_ORDER: [u8; 4] = *b"ACTG";
+
+/// Four bases as one byte, two bits each, the first in the low bits.
+#[inline(always)]
+fn quad_index(word: u32) -> usize {
+    let two = (word >> 1) & 0x0303_0303;
+    ((two | two >> 6 | two >> 12 | two >> 18) & 0xff) as usize
+}
+
+/// The four bases each index stands for, to tell them from other bytes
+/// that share the same two bits, such as N.
+const QUAD_BYTES: [u32; 256] = {
+    let mut table = [0u32; 256];
+    let mut index = 0;
+    while index < 256 {
+        let mut k = 0;
+        while k < 4 {
+            table[index] |= (BASE_ORDER[(index >> (2 * k)) & 3] as u32) << (8 * k);
+            k += 1;
+        }
+        index += 1;
+    }
+    table
+};
 
 #[inline(always)]
 fn token_match(len: usize, dist: usize) -> Token {
@@ -195,6 +256,8 @@ struct Tokens {
     lit_freq: [u32; 512],
     /// Literal counts from `literals`, added into `lit_freq` at the end.
     lit4: [[u32; 256]; 4],
+    /// Counts of four bases at once from `bases`, by `quad_index`.
+    quads: [u32; 256],
     dist_freq: [u32; 32],
     /// Length of the literal run being accumulated.
     run: u32,
@@ -222,6 +285,31 @@ impl Tokens {
         }
         self.run += bytes.len() as u32;
     }
+    /// Literals from a sequence line. Counted four at a time: one increment
+    /// for each four bases, shared out between the bases at the end.
+    #[inline(always)]
+    fn bases(&mut self, bytes: &[u8]) {
+        if bytes.is_empty() {
+            return;
+        }
+        self.end_run();
+        let mut quads = bytes.chunks_exact(4);
+        for q in &mut quads {
+            let word = u32::from_le_bytes(q.try_into().unwrap());
+            let index = quad_index(word);
+            if QUAD_BYTES[index] == word {
+                self.quads[index] += 1;
+            } else {
+                for &b in q {
+                    self.lit_freq[b as usize] += 1;
+                }
+            }
+        }
+        for &b in quads.remainder() {
+            self.lit_freq[b as usize] += 1;
+        }
+        self.buf.push(bytes.len() as u32 | BASES);
+    }
     #[inline(always)]
     fn end_run(&mut self) {
         if self.run > 0 {
@@ -229,6 +317,29 @@ impl Tokens {
             self.run = 0;
         }
     }
+    /// Lengthen the match just emitted by `more` bytes, when it has this
+    /// distance and nothing came after it. One match then covers what two
+    /// would, as when a quality line and the header after it both repeat the
+    /// record before.
+    #[inline(always)]
+    fn lengthen(&mut self, t: &Tables, more: usize, dist: usize) -> bool {
+        let Some(last) = self.buf.last_mut() else {
+            return false;
+        };
+        let len = ((*last >> 16) & 0x1ff) as usize;
+        if self.run != 0
+            || *last & MATCH == 0
+            || (*last & 0xffff) as usize != dist - 1
+            || len + more > MAX_MATCH
+        {
+            return false;
+        }
+        *last += (more as u32) << 16;
+        self.lit_freq[t.len_sym[len] as usize & 511] -= 1;
+        self.lit_freq[t.len_sym[len + more] as usize & 511] += 1;
+        true
+    }
+
     /// Emits a match of any length >= 3, split into deflate matches.
     #[inline(always)]
     fn matched(&mut self, t: &Tables, mut len: usize, dist: usize) {
@@ -245,9 +356,11 @@ impl Tokens {
             } else {
                 len
             };
-            self.buf.push(token_match(take, dist));
+            let symbol = dist_symbol(t, dist) & 31;
+            self.buf
+                .push(token_match(take, dist) | (symbol as u32) << 25);
             self.lit_freq[t.len_sym[take] as usize & 511] += 1;
-            self.dist_freq[dist_symbol(t, dist) & 31] += 1;
+            self.dist_freq[symbol] += 1;
             len -= take;
         }
     }
@@ -261,16 +374,49 @@ pub struct Matcher {
     table: Box<[u128; 1 << HASH_BITS]>,
     /// Where each read starting with a given 16 bases was last seen.
     reads: Box<[u32; 1 << READ_BITS]>,
+    /// Where 16 bases were last seen at an anchor of a sequence line.
+    anchors: Box<[u32; 1 << ANCHOR_BITS]>,
+    /// Whether sequence lines are matched against earlier ones.
+    sorted: bool,
+    /// Where a few bases were last seen in a sequence line of sorted reads.
+    kmers: Box<[u32; 1 << KMER_BITS]>,
     /// Positions are stored as `base + pos + 1`. Each block raises `base`
     /// past everything stored before, which retires old entries without
     /// clearing the tables.
     base: u32,
     /// Token buffer, kept between blocks.
     tokens: Vec<Token>,
+    /// Positions inserted inside each match.
+    insert_in_match: usize,
+    /// Mask of the bytes hashed at a position.
+    context: u64,
 }
 
 const READ_KEY: usize = 16;
 const READ_BITS: u32 = 12;
+
+/// Sorted reads: every eighth position of a sequence line is an anchor,
+/// remembered by the 16 bases there. A later read that overlaps the line
+/// has those bases at some position, so it looks each of its own up until
+/// one is an anchor. A 32 KiB window holds about two thousand anchors.
+const ANCHOR_KEY: usize = 16;
+const ANCHOR_STEP: usize = 8;
+const ANCHOR_BITS: u32 = 13;
+/// What is left of a header after a repeated read number, such as `/1`, is
+/// cheaper as literals than as a match when it is this short.
+const SHORT_TAIL: usize = 6;
+/// Bases no earlier read overlaps still repeat short stretches of the window
+/// by chance, and a match there keeps literals rare, which makes every
+/// other code in the block shorter. Positions are remembered by their `KMER`
+/// bases when they are new: bases that are matched were new once.
+const KMER: usize = 6;
+const KMER_BITS: u32 = 14;
+const KMER_MASK: u64 = u64::MAX >> (64 - 8 * KMER);
+/// A match shorter than this costs more bits than the bases as literals.
+const MIN_OVERLAP: usize = 16;
+/// After a match ends at a base that differs, the same earlier read usually
+/// goes on matching. Shorter continuations than this are not worth a match.
+const MIN_CONTINUE: usize = 12;
 
 impl Matcher {
     fn new() -> Self {
@@ -283,8 +429,19 @@ impl Matcher {
                 .into_boxed_slice()
                 .try_into()
                 .unwrap(),
+            anchors: vec![0u32; 1 << ANCHOR_BITS]
+                .into_boxed_slice()
+                .try_into()
+                .unwrap(),
+            sorted: false,
+            kmers: vec![0u32; 1 << KMER_BITS]
+                .into_boxed_slice()
+                .try_into()
+                .unwrap(),
             base: 0,
             tokens: Vec::new(),
+            insert_in_match: INSERT_IN_MATCH,
+            context: u64::MAX >> (64 - 8 * CONTEXT),
         }
     }
 
@@ -293,6 +450,8 @@ impl Matcher {
         if self.base as usize + len + 1 >= u32::MAX as usize {
             self.table.fill(0);
             self.reads.fill(0);
+            self.anchors.fill(0);
+            self.kmers.fill(0);
             self.base = 0;
         }
     }
@@ -339,9 +498,23 @@ impl Matcher {
         (extend(data, cand, start, end - start), dist)
     }
 
+    /// The 16 bases at `pos` and where the anchor table keeps them.
+    #[inline(always)]
+    fn anchor(data: &[u8], pos: usize) -> ([u64; 2], usize) {
+        let a = u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap());
+        let b = u64::from_le_bytes(data[pos + 8..pos + 16].try_into().unwrap());
+        let h = (a ^ b.rotate_left(29)).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> (64 - ANCHOR_BITS);
+        ([a, b], h as usize)
+    }
+
     #[inline(always)]
     fn hash(bytes: u32) -> usize {
         (bytes.wrapping_mul(0x9E37_79B1) >> (32 - HASH_BITS)) as usize
+    }
+    /// The bucket for the bytes at a position, of which `self.context` count.
+    #[inline(always)]
+    fn bucket(&self, word: u64) -> usize {
+        ((word & self.context).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> (64 - HASH_BITS)) as usize
     }
     #[inline(always)]
     fn load4(data: &[u8], pos: usize) -> u32 {
@@ -349,13 +522,72 @@ impl Matcher {
     }
     #[inline(always)]
     fn insert(&mut self, data: &[u8], pos: usize) {
-        let h = Self::hash(Self::load4(data, pos));
+        if pos + 8 > data.len() {
+            return;
+        }
+        let h = self.bucket(u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap()));
         self.table[h] = self.table[h] << 32 | u128::from(self.stored(pos));
     }
 
     /// Longest match at `pos` among the bucket candidates (and inserts `pos`).
+    ///
+    /// Whether a candidate matches is close to a coin toss on quality
+    /// strings, so testing them one by one mispredicts constantly. This
+    /// compares eight bytes of all four without branching and branches once
+    /// on the best; only candidates that match all eight are extended.
     #[inline(always)]
     fn find(&mut self, data: &[u8], pos: usize, end: usize) -> (usize, usize) {
+        if pos + 8 > data.len() {
+            return self.find_near_end(data, pos, end);
+        }
+        let cur = u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap());
+        let h = self.bucket(cur);
+        let bucket = self.table[h];
+        let stored = self.stored(pos);
+        self.table[h] = bucket << 32 | u128::from(stored);
+        let max = (end - pos).min(MAX_MATCH * 4);
+        // Entries from earlier blocks are further back than `pos`.
+        let reach = pos.min(WINDOW);
+        let mut lens = [0u32; 4];
+        let mut dists = [0usize; 4];
+        // Longest prefix first, then the most recent candidate.
+        let mut best = 0u32;
+        for way in 0..4 {
+            let dist = stored.wrapping_sub((bucket >> (32 * way)) as u32) as usize;
+            let valid = dist.wrapping_sub(1) < reach;
+            // An invalid candidate reads `pos` itself, and counts as no match.
+            let cand = pos - if valid { dist } else { 0 };
+            let diff = u64::from_le_bytes(data[cand..cand + 8].try_into().unwrap()) ^ cur;
+            let len = if valid { diff.trailing_zeros() / 8 } else { 0 };
+            lens[way] = len;
+            dists[way] = dist;
+            best = best.max(len << 2 | (3 - way as u32));
+        }
+        let len = (best >> 2) as usize;
+        if len < MIN_MATCH {
+            return (0, 0);
+        }
+        if len < 8 || max <= 8 {
+            return (len.min(max), dists[3 - (best & 3) as usize]);
+        }
+        let mut best = (0usize, 0usize);
+        for way in 0..4 {
+            if lens[way] == 8 {
+                let len = extend(data, pos - dists[way], pos, max);
+                if len > best.0 {
+                    best = (len, dists[way]);
+                    if len >= NICE_MATCH {
+                        break;
+                    }
+                }
+            }
+        }
+        best
+    }
+
+    /// `find` for the last bytes of a block, where eight cannot be loaded.
+    #[inline(never)]
+    fn find_near_end(&mut self, data: &[u8], pos: usize, end: usize) -> (usize, usize) {
         let cur = Self::load4(data, pos);
         let h = Self::hash(cur);
         let bucket = self.table[h];
@@ -393,6 +625,20 @@ impl Matcher {
         // A match needs MIN_MATCH bytes up to `end`.
         let limit = (end + 1).saturating_sub(MIN_MATCH);
         while pos < limit {
+            // Eight bytes equal to the eight before them start a run of one
+            // byte, as most of a binned quality line is. A match at distance
+            // one is its cheapest coding and needs no search; what follows
+            // the run finds earlier runs through positions outside them.
+            if pos > 0 && pos + 8 <= end {
+                let here = u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap());
+                let before = u64::from_le_bytes(data[pos - 1..pos + 7].try_into().unwrap());
+                if here == before {
+                    let len = extend(data, pos - 1, pos, (end - pos).min(MAX_MATCH * 4));
+                    tok.matched(t, len, 1);
+                    pos += len;
+                    continue;
+                }
+            }
             let (len, dist) = self.find(data, pos, end);
             if len == 0 {
                 tok.literal(data[pos]);
@@ -405,7 +651,7 @@ impl Matcher {
             // costs 10% of the speed for 0.5% of the size.
             let stop = (pos + len).min(limit);
             let mut p = pos + 1;
-            let insert_until = (pos + 1 + INSERT_IN_MATCH).min(stop);
+            let insert_until = (pos + 1 + self.insert_in_match).min(stop);
             while p < insert_until {
                 self.insert(data, p);
                 p += 1;
@@ -422,6 +668,25 @@ fn extend(data: &[u8], cand: usize, pos: usize, max: usize) -> usize {
     // Slice once so the loops need no bounds checks.
     let (a, b) = (&data[cand..cand + max], &data[pos..pos + max]);
     let mut len = 4;
+    while len + 8 <= max {
+        let x = u64::from_le_bytes(a[len..len + 8].try_into().unwrap())
+            ^ u64::from_le_bytes(b[len..len + 8].try_into().unwrap());
+        if x != 0 {
+            return len + (x.trailing_zeros() / 8) as usize;
+        }
+        len += 8;
+    }
+    while len < max && a[len] == b[len] {
+        len += 1;
+    }
+    len
+}
+
+/// Match length between `data[cand..]` and `data[pos..]`, at most `max`.
+#[inline(always)]
+fn common(data: &[u8], cand: usize, pos: usize, max: usize) -> usize {
+    let (a, b) = (&data[cand..cand + max], &data[pos..pos + max]);
+    let mut len = 0;
     while len + 8 <= max {
         let x = u64::from_le_bytes(a[len..len + 8].try_into().unwrap())
             ^ u64::from_le_bytes(b[len..len + 8].try_into().unwrap());
@@ -495,7 +760,9 @@ impl<'a> Tokenizer<'a> {
             }
             let dist = start - pstart;
             if lcp >= MIN_MATCH && dist <= WINDOW {
-                self.tok.matched(self.t, lcp, dist);
+                if !self.tok.lengthen(self.t, lcp, dist) {
+                    self.tok.matched(self.t, lcp, dist);
+                }
                 let lim = (start + lcp + 1).saturating_sub(MIN_MATCH);
                 let mut p = start;
                 while p < lim {
@@ -503,6 +770,35 @@ impl<'a> Tokenizer<'a> {
                     p += 1;
                 }
                 pos = start + lcp;
+                // Names from the SRA give the read number twice, as in
+                // `@ERR3239279.17 17/1`. The second is the first again, a
+                // few bytes back, which is far cheaper than finding most of
+                // it in the previous header.
+                let mut first = pos;
+                while first > start && data[first - 1].is_ascii_digit() {
+                    first -= 1;
+                }
+                let mut after = pos;
+                while after < end && data[after].is_ascii_digit() {
+                    after += 1;
+                }
+                let digits = after - first;
+                let again = after + 1;
+                if digits >= 3
+                    && again + digits <= end
+                    && data[again..again + digits] == data[first..after]
+                {
+                    self.tok.literals(&data[pos..again]);
+                    self.tok.matched(self.t, digits, digits + 1);
+                    pos = again + digits;
+                    if end - pos <= SHORT_TAIL {
+                        self.tok.literals(&data[pos..end]);
+                    } else {
+                        self.matcher.encode(self.t, data, pos, end, &mut self.tok);
+                    }
+                    self.prev_header = Some((start, end - start));
+                    return;
+                }
             }
             // Common suffix (at least 3 bytes) that does not overlap the prefix.
             let mut lcs = 0;
@@ -523,15 +819,107 @@ impl<'a> Tokenizer<'a> {
         self.prev_header = Some((start, end - start));
     }
 
+    /// Bases of a sorted read that no earlier read overlaps: short matches
+    /// where the window happens to hold the same bases, literals otherwise.
+    fn novel(&mut self, from: usize, to: usize) {
+        let data = self.data;
+        let (mut literals, mut pos) = (from, from);
+        while pos + KMER <= to && pos + 8 <= data.len() {
+            let word = u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap()) & KMER_MASK;
+            let h = (word.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> (64 - KMER_BITS)) as usize;
+            let found = self
+                .matcher
+                .position(self.matcher.kmers[h], pos)
+                .filter(|&cand| {
+                    pos - cand <= WINDOW
+                        && u64::from_le_bytes(data[cand..cand + 8].try_into().unwrap()) & KMER_MASK
+                            == word
+                });
+            let Some(cand) = found else {
+                pos += 1;
+                continue;
+            };
+            let len = common(data, cand, pos, to - pos);
+            self.tok.bases(&data[literals..pos]);
+            self.tok.matched(self.t, len, pos - cand);
+            pos += len;
+            literals = pos;
+        }
+        self.tok.bases(&data[literals..to]);
+        // Bases that are matched were remembered when they were new.
+        let mut at = from.saturating_sub(KMER - 1);
+        while at < to && at + 8 <= data.len() {
+            let word = u64::from_le_bytes(data[at..at + 8].try_into().unwrap()) & KMER_MASK;
+            let h = (word.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> (64 - KMER_BITS)) as usize;
+            self.matcher.kmers[h] = self.matcher.stored(at);
+            at += 1;
+        }
+    }
+
+    /// A sequence line of sorted reads: the parts found in earlier lines
+    /// become matches and the rest literals. The most recent line holding an
+    /// anchor is the one that reaches furthest, so one candidate is enough.
+    fn overlapping(&mut self, start: usize, end: usize) {
+        let data = self.data;
+        let (mut literals, mut pos) = (start, start);
+        while pos + ANCHOR_KEY <= end {
+            let (key, h) = Matcher::anchor(data, pos);
+            let found = self
+                .matcher
+                .position(self.matcher.anchors[h], pos)
+                .filter(|&cand| pos - cand <= WINDOW && Matcher::anchor(data, cand).0 == key);
+            let Some(cand) = found else {
+                pos += 1;
+                continue;
+            };
+            let dist = pos - cand;
+            let len = extend(data, cand, pos, end - pos);
+            // The match may have begun before the anchor.
+            let mut back = 0;
+            while pos - back > literals
+                && cand > back
+                && data[cand - back - 1] == data[pos - back - 1]
+            {
+                back += 1;
+            }
+            debug_assert!(back + len >= MIN_OVERLAP);
+            self.novel(literals, pos - back);
+            self.tok.matched(self.t, back + len, dist);
+            pos += len;
+            // One base differs, in this read or the earlier one, and the
+            // overlap goes on behind it.
+            while pos + 1 + MIN_CONTINUE <= end {
+                let len = common(data, pos + 1 - dist, pos + 1, end - pos - 1);
+                if len < MIN_CONTINUE {
+                    break;
+                }
+                self.tok.bases(&data[pos..pos + 1]);
+                self.tok.matched(self.t, len, dist);
+                pos += 1 + len;
+            }
+            literals = pos;
+        }
+        self.novel(literals, end);
+        let mut at = start;
+        while at + ANCHOR_KEY <= end {
+            let (_, h) = Matcher::anchor(data, at);
+            self.matcher.anchors[h] = self.matcher.stored(at);
+            at += ANCHOR_STEP;
+        }
+    }
+
     fn sequence(&mut self, start: usize, end: usize) {
+        if self.matcher.sorted {
+            return self.overlapping(start, end);
+        }
         let (len, dist) = self.matcher.duplicate(self.data, start, end);
         // Below about 24 bases a match costs more bits than two-bit literals.
         if len >= 24 {
             self.tok.matched(self.t, len, dist);
-            self.tok.literals(&self.data[start + len..end]);
+            self.tok.bases(&self.data[start + len..end]);
             return;
         }
-        self.tok.literals(&self.data[start..end]);
+        self.tok.bases(&self.data[start..end]);
     }
 
     fn generic(&mut self, start: usize, end: usize) {
@@ -571,25 +959,50 @@ impl<'a> Tokenizer<'a> {
                 self.generic(phase_start, hdr_start);
             }
             pos = hdr_start;
+            // Line ends already found for the record about to be read.
+            let mut known: Option<(usize, usize)> = None;
             // Records loop.
             loop {
                 // header unit: data[pos..h_end]
-                let h_end = line_end(data, if data[pos] == b'\n' { pos + 1 } else { pos });
+                let (h_end, s_end) = match known.take() {
+                    Some(ends) => ends,
+                    None => {
+                        let h_end = line_end(data, if data[pos] == b'\n' { pos + 1 } else { pos });
+                        (
+                            h_end,
+                            if h_end >= n {
+                                n
+                            } else {
+                                line_end(data, h_end + 1)
+                            },
+                        )
+                    }
+                };
                 if h_end >= n {
                     self.header(pos, n);
                     break 'outer;
                 }
                 self.header(pos, h_end + 1);
                 // sequence unit: bases only
-                let s_end = line_end(data, h_end + 1);
                 self.sequence(h_end + 1, s_end);
                 if s_end >= n {
                     break 'outer;
                 }
-                // plus + quality unit: "\n+...\n" + quals (no trailing newline)
-                let p_end = line_end(data, s_end + 1);
+                // plus + quality unit: "\n+...\n" + quals (no trailing newline).
+                // The plus line is nearly always bare and the qualities as
+                // long as the sequence: look there before searching.
+                let p_end = if data.get(s_end + 2) == Some(&b'\n') {
+                    s_end + 2
+                } else {
+                    line_end(data, s_end + 1)
+                };
+                let same = p_end + 1 + (s_end - h_end - 1);
                 let q_end = if p_end >= n {
                     n
+                } else if data.get(same) == Some(&b'\n')
+                    && data.get(same + 1).is_none_or(|&b| b == b'@')
+                {
+                    same
                 } else {
                     line_end(data, p_end + 1)
                 };
@@ -602,14 +1015,14 @@ impl<'a> Tokenizer<'a> {
                 if next < n && data[next] == b'@' && {
                     // cheap shape check: a '+' two lines later
                     let e1 = line_end(data, next);
-                    e1 + 1 >= n || {
-                        let e2 = line_end(data, e1 + 1);
-                        e2 + 1 >= n || data[e2 + 1] == b'+'
-                    }
+                    let e2 = if e1 >= n { n } else { line_end(data, e1 + 1) };
+                    known = Some((e1, e2));
+                    e1 + 1 >= n || e2 + 1 >= n || data[e2 + 1] == b'+'
                 } {
                     pos = q_end; // header unit includes the newline
                     continue;
                 }
+                known = None;
                 // Lost the phase (or the block ends at a record boundary):
                 // the newline joins the generic segment.
                 if next >= n {
@@ -805,6 +1218,7 @@ pub fn deflate(input: &[u8], matcher: &mut Matcher, out: &mut Vec<u8>) {
             buf,
             lit_freq: [0; 512],
             lit4: [[0; 256]; 4],
+            quads: [0; 256],
             dist_freq: [0; 32],
             run: 0,
         },
@@ -818,6 +1232,11 @@ pub fn deflate(input: &[u8], matcher: &mut Matcher, out: &mut Vec<u8>) {
     for table in &tok.lit4 {
         for (f, &c) in tok.lit_freq.iter_mut().zip(table) {
             *f += c;
+        }
+    }
+    for (index, &count) in tok.quads.iter().enumerate() {
+        for k in 0..4 {
+            tok.lit_freq[BASE_ORDER[(index >> (2 * k)) & 3] as usize] += count;
         }
     }
     tok.lit_freq[256] = 1;
@@ -924,11 +1343,77 @@ pub fn deflate(input: &[u8], matcher: &mut Matcher, out: &mut Vec<u8>) {
     // Code and length in one entry: one load per literal.
     let lit_table: [u32; 256] =
         std::array::from_fn(|b| u32::from(lit_codes[b]) | u32::from(lit_lens[b]) << 24);
+    // A match length's code and extra bits, and how many bits they take.
+    let len_table: [(u32, u32); 259] = std::array::from_fn(|len| {
+        if len < 3 {
+            return (0, 0);
+        }
+        let symbol = t.len_sym[len] as usize;
+        let count = lit_lens[symbol] as u32;
+        let extra = (len - LEN_BASE[symbol - 257] as usize) as u32;
+        (
+            u32::from(lit_codes[symbol]) | extra << count,
+            count + LEN_EXTRA[symbol - 257] as u32,
+        )
+    });
+    // Four bases' codes together, and their length, when that fits 32 bits.
+    let base_lens = BASE_ORDER.map(|b| lit_lens[b as usize] as u32);
+    let quads_fit = base_lens.iter().all(|&len| (1..=8).contains(&len));
+    let quad_table: [(u32, u32); 256] = std::array::from_fn(|index| {
+        let (mut bits, mut count) = (0u32, 0u32);
+        if quads_fit {
+            for k in 0..4 {
+                let base = BASE_ORDER[(index >> (2 * k)) & 3] as usize;
+                bits |= u32::from(lit_codes[base]) << count;
+                count += lit_lens[base] as u32;
+            }
+        }
+        (bits, count)
+    });
     let mut ip = 0usize;
     for &tk in &tok.buf {
-        if tk & MATCH == 0 {
-            let run = &input[ip..ip + tk as usize];
-            ip += tk as usize;
+        if tk & MATCH == 0 && tk & BASES != 0 && quads_fit {
+            let len = (tk & !BASES) as usize;
+            let run = &input[ip..ip + len];
+            ip += len;
+            let (mut pending, mut held) = (0u64, 0u32);
+            let mut quads = run.chunks_exact(4);
+            for q in &mut quads {
+                let word = u32::from_le_bytes(q.try_into().unwrap());
+                let index = quad_index(word);
+                let (bits, count) = if QUAD_BYTES[index] == word {
+                    quad_table[index]
+                } else {
+                    // Not four bases: at most 60 bits, written on their own.
+                    if held > 0 {
+                        w.put_small(pending, held);
+                        (pending, held) = (0, 0);
+                    }
+                    for &b in &q[..3] {
+                        let e = lit_table[b as usize];
+                        w.put_small(u64::from(e & 0xff_ffff), e >> 24);
+                    }
+                    let e = lit_table[q[3] as usize];
+                    (e & 0xff_ffff, e >> 24)
+                };
+                if held + count > 56 {
+                    w.put_small(pending, held);
+                    (pending, held) = (0, 0);
+                }
+                pending |= u64::from(bits) << held;
+                held += count;
+            }
+            if held > 0 {
+                w.put_small(pending, held);
+            }
+            for &b in quads.remainder() {
+                let e = lit_table[b as usize];
+                w.put_small(u64::from(e & 0xff_ffff), e >> 24);
+            }
+        } else if tk & MATCH == 0 {
+            let len = (tk & !BASES) as usize;
+            let run = &input[ip..ip + len];
+            ip += len;
             // Several codes per put: up to 56 bits fit.
             let code = |b: u8| {
                 let e = lit_table[b as usize];
@@ -959,18 +1444,18 @@ pub fn deflate(input: &[u8], matcher: &mut Matcher, out: &mut Vec<u8>) {
                 w.put_small(c, l);
             }
         } else {
-            ip += ((tk >> 16) & 0x1ff) as usize;
             let len = ((tk >> 16) & 0x1ff) as usize;
-            let dist = (tk & 0xffff) as usize + 1;
-            let ls = t.len_sym[len] as usize;
-            let li = ls - 257;
-            let count = lit_lens[ls] as u32;
-            let bits = lit_codes[ls] as u64 | (((len - LEN_BASE[li] as usize) as u64) << count);
-            w.put_small(bits, count + LEN_EXTRA[li] as u32);
-            let ds = dist_symbol(t, dist);
+            ip += len;
+            let dist = (tk & 0x7fff) as usize + 1;
+            let (lbits, lcount) = len_table[len];
+            let ds = ((tk >> 25) & 31) as usize;
             let count = dist_lens[ds] as u32;
-            let bits = dist_codes[ds] as u64 | (((dist - DIST_BASE[ds] as usize) as u64) << count);
-            w.put_small(bits, count + DIST_EXTRA[ds] as u32);
+            let dbits = dist_codes[ds] as u64 | (((dist - DIST_BASE[ds] as usize) as u64) << count);
+            // At most 20 bits of length and 28 of distance.
+            w.put_small(
+                u64::from(lbits) | dbits << lcount,
+                lcount + count + DIST_EXTRA[ds] as u32,
+            );
         }
     }
     w.put_small(lit_codes[256] as u64, lit_lens[256] as u32);
@@ -980,7 +1465,8 @@ pub fn deflate(input: &[u8], matcher: &mut Matcher, out: &mut Vec<u8>) {
 
 /// A complete gzip member for `input`, carrying the `FP` member-size extra
 /// field that `io` uses to decompress members in parallel.
-pub(crate) fn gzip_member(input: &[u8], out: &mut Vec<u8>) {
+/// `kind` is what [`kind`] found in the block; it only tunes the matcher.
+pub(crate) fn gzip_member(input: &[u8], kind: Kind, out: &mut Vec<u8>) {
     thread_local! {
         static MATCHER: std::cell::RefCell<Matcher> = std::cell::RefCell::new(Matcher::new());
     }
@@ -995,7 +1481,18 @@ pub(crate) fn gzip_member(input: &[u8], out: &mut Vec<u8>) {
     out.extend_from_slice(&4u16.to_le_bytes());
     let size_at = out.len();
     out.extend_from_slice(&[0; 4]);
-    MATCHER.with(|m| deflate(input, &mut m.borrow_mut(), out));
+    MATCHER.with(|m| {
+        let mut matcher = m.borrow_mut();
+        matcher.sorted = kind.sorted;
+        let context = if kind.binned { BINNED_CONTEXT } else { CONTEXT };
+        matcher.context = u64::MAX >> (64 - 8 * context);
+        matcher.insert_in_match = if kind.binned {
+            INSERT_IN_BINNED_MATCH
+        } else {
+            INSERT_IN_MATCH
+        };
+        deflate(input, &mut matcher, out)
+    });
     let mut crc = libdeflater::Crc::new();
     crc.update(input);
     out.extend_from_slice(&crc.sum().to_le_bytes());
@@ -1010,8 +1507,14 @@ mod tests {
     use std::io::Read;
 
     fn roundtrip(data: &[u8]) {
+        for (binned, sorted) in [(false, false), (true, false), (false, true), (true, true)] {
+            roundtrip_as(data, Kind { binned, sorted });
+        }
+    }
+
+    fn roundtrip_as(data: &[u8], kind: Kind) -> usize {
         let mut out = Vec::new();
-        gzip_member(data, &mut out);
+        gzip_member(data, kind, &mut out);
         let mut back = Vec::new();
         flate2::read::MultiGzDecoder::new(&out[..])
             .read_to_end(&mut back)
@@ -1021,6 +1524,7 @@ mod tests {
         let mut buf = vec![0u8; data.len() + 1];
         let n = d.gzip_decompress(&out, &mut buf).unwrap();
         assert_eq!(&buf[..n], data);
+        out.len()
     }
 
     #[test]
@@ -1091,31 +1595,156 @@ mod tests {
     }
 
     #[test]
-    fn sorted_reads_stay_with_libdeflate() {
-        // A genome and binned qualities; reads start at random positions, or
-        // at increasing ones as in a run sorted by alignment position.
+    fn bases_four_at_a_time_match_one_at_a_time() {
+        // Every index names its own four bases, and nothing else passes.
+        for index in 0..256 {
+            assert_eq!(quad_index(QUAD_BYTES[index]), index);
+        }
+        assert_ne!(
+            QUAD_BYTES[quad_index(u32::from_le_bytes(*b"ACNT"))],
+            u32::from_le_bytes(*b"ACNT")
+        );
+        assert_ne!(
+            QUAD_BYTES[quad_index(u32::from_le_bytes(*b"acgt"))],
+            u32::from_le_bytes(*b"acgt")
+        );
+        // Sequence lines of every length, with N, lower case and other bytes
+        // at every position of a group of four.
+        let mut x = 99u64;
+        let mut next = |n: usize| {
+            x = x.wrapping_mul(6364136223846793005).wrapping_add(1);
+            (x >> 33) as usize % n
+        };
+        for odd in [b'N', b'a', b'.', b'G'] {
+            let mut data = Vec::new();
+            for record in 0..300 {
+                let len = 1 + record % 37;
+                data.extend_from_slice(format!("@r{record}\n").as_bytes());
+                for k in 0..len {
+                    data.push(if next(9) == 0 { odd } else { b"ACGT"[next(4)] });
+                    let _ = k;
+                }
+                data.extend_from_slice(b"\n+\n");
+                data.extend(std::iter::repeat_n(b'F', len));
+                data.push(b'\n');
+            }
+            roundtrip(&data);
+        }
+    }
+
+    /// A genome and binned qualities; reads are numbered from `first` and
+    /// start where `starts` says.
+    fn reads(
+        first: usize,
+        count: usize,
+        starts: &mut dyn FnMut(usize) -> usize,
+        genome: &[u8],
+    ) -> Vec<u8> {
+        let mut out = Vec::new();
+        for i in first..first + count {
+            let at = starts(i - first);
+            out.extend_from_slice(format!("@ERR3239279.{i} {i}/1\n").as_bytes());
+            out.extend_from_slice(&genome[at..at + 150]);
+            out.extend_from_slice(b"\n+\n");
+            out.extend((0..150).map(|k| b"?5+%"[(k * 7 + i) % 4]));
+            out.push(b'\n');
+        }
+        out
+    }
+
+    #[test]
+    fn sorted_reads_are_matched_against_earlier_ones() {
+        // Reads start at random positions, or at increasing ones as in a run
+        // sorted by alignment position.
         let mut x = 7u64;
         let mut next = |n: usize| {
             x = x.wrapping_mul(6364136223846793005).wrapping_add(1);
             (x >> 33) as usize % n
         };
         let genome: Vec<u8> = (0..1 << 20).map(|_| b"ACGT"[next(4)]).collect();
-        let fastq = |starts: &mut dyn FnMut(usize) -> usize| {
-            let mut out = Vec::new();
-            for i in 0..800 {
-                let at = starts(i);
-                out.extend_from_slice(format!("@ERR3239279.{i} {i}/1\n").as_bytes());
-                out.extend_from_slice(&genome[at..at + 150]);
-                out.extend_from_slice(b"\n+\n");
-                out.extend((0..150).map(|k| b"?5+%"[(k * 7 + i) % 4]));
-                out.push(b'\n');
-            }
-            out
+        let unsorted = reads(0, 800, &mut |_| next(genome.len() - 150), &genome);
+        let mut sorted = reads(0, 800, &mut |i| i * 5, &genome);
+        let binned = |sorted| Kind {
+            binned: true,
+            sorted,
         };
-        let unsorted = fastq(&mut |_| next(genome.len() - 150));
-        let sorted = fastq(&mut |i| i * 5);
-        assert!(suits(&unsorted));
-        assert!(!suits(&sorted));
+        assert_eq!(kind(&unsorted), Some(binned(false)));
+        assert_eq!(kind(&sorted), Some(binned(true)));
+        // Full-range qualities are not binned.
+        let mut full = unsorted.clone();
+        let mut at = 0;
+        for (line, text) in unsorted.split_inclusive(|&b| b == b'\n').enumerate() {
+            if line % 4 == 3 {
+                for (k, q) in full[at..at + text.len() - 1].iter_mut().enumerate() {
+                    *q = b'!' + ((k * 7 + line) % 41) as u8;
+                }
+            }
+            at += text.len();
+        }
+        assert_eq!(kind(&full), Some(Kind::PLAIN));
+        assert_eq!(kind(b"not a fastq file\n"), None);
+
+        // A base that differs in every tenth read splits its overlap in two.
+        let mut at = 0;
+        for (line, text) in sorted.clone().split_inclusive(|&b| b == b'\n').enumerate() {
+            if line % 40 == 1 {
+                sorted[at + 70] = if text[70] == b'A' { b'C' } else { b'A' };
+            }
+            at += text.len();
+        }
+        // Each read adds five bases to what the reads before it hold, so
+        // matching them takes far less than coding all 150.
+        let matched = roundtrip_as(&sorted, binned(true));
+        let literal = roundtrip_as(&sorted, binned(false));
+        assert!(matched * 2 < literal, "{matched} against {literal}");
+        // Either way of coding the sequences is valid for any input.
+        roundtrip(&unsorted);
+        roundtrip(&full);
+    }
+
+    #[test]
+    fn a_repeated_read_number_is_coded_from_its_first_copy() {
+        let genome: Vec<u8> = (0..40_000u32)
+            .map(|i| b"ACGT"[(i.wrapping_mul(2654435761) >> 13) as usize % 4])
+            .collect();
+        let mut at = 0;
+        let twice = reads(
+            7_654_321,
+            200,
+            &mut |_| {
+                at += 151;
+                at
+            },
+            &genome,
+        );
+        // The same names with a second number that is not the first.
+        let once: Vec<u8> = twice
+            .split_inclusive(|&b| b == b'\n')
+            .flat_map(|line| match line.strip_prefix(b"@ERR3239279.") {
+                Some(rest) => {
+                    let digits = rest.iter().position(|&b| b == b' ').unwrap();
+                    let number: usize = std::str::from_utf8(&rest[..digits])
+                        .unwrap()
+                        .parse()
+                        .unwrap();
+                    format!("@ERR3239279.{number} {}/1\n", number + 1_111_111).into_bytes()
+                }
+                None => line.to_vec(),
+            })
+            .collect();
+        assert_eq!(once.len(), twice.len());
+        let kind = Kind {
+            binned: true,
+            sorted: false,
+        };
+        assert!(roundtrip_as(&twice, kind) < roundtrip_as(&once, kind));
+        // Numbers of one to five digits, and a name that is only a number.
+        let mut short = Vec::new();
+        for i in [0u32, 7, 9, 10, 99, 100, 101, 999, 1000, 54321, 54322] {
+            short.extend_from_slice(format!("@S.{i} {i}\nACGTACGTAC\n+\nFFFFFFFFFF\n").as_bytes());
+            short.extend_from_slice(format!("@{i} {i}\nACGTACGTAC\n+\nFFFFFFFFFF\n").as_bytes());
+        }
+        roundtrip(&short);
     }
 }
 
@@ -1219,7 +1848,11 @@ mod fuzz {
         for it in 0..iters {
             let data = sample(&mut r);
             gz.clear();
-            super::gzip_member(&data, &mut gz);
+            super::gzip_member(
+                &data,
+                super::kind(&data).unwrap_or(super::Kind::PLAIN),
+                &mut gz,
+            );
             let mut back = Vec::with_capacity(data.len());
             flate2::read::GzDecoder::new(&gz[..])
                 .read_to_end(&mut back)
@@ -1258,7 +1891,7 @@ mod corpus {
         let mut fq = 0;
         for c in &chunks {
             out.clear();
-            super::gzip_member(c, &mut out);
+            super::gzip_member(c, super::kind(c).unwrap_or(super::Kind::PLAIN), &mut out);
             fq += out.len();
         }
         let fq_t = t.elapsed().as_secs_f64();
@@ -1274,9 +1907,9 @@ mod corpus {
         let t = std::time::Instant::now();
         let (mut gated, mut picked) = (0, 0);
         for c in &chunks {
-            if super::suits(c) {
+            if let Some(kind) = super::kind(c) {
                 out.clear();
-                super::gzip_member(c, &mut out);
+                super::gzip_member(c, kind, &mut out);
                 gated += out.len();
                 picked += 1;
             } else {

@@ -20,6 +20,7 @@ const cases = {
   'single-end': [...se, '-o', 'out.fq'],
   'single-end-trim': [...se, '-x', '-y', '-5', '-3', '-l', '30', '--failed_out', 'failed.fq', '-o', 'out.fq.gz'],
   'paired-end': [...pe, '-o', 'out1.fq', '-O', 'out2.fq'],
+  'paired-gzip': [...pe, '-o', 'out1.fq.gz', '-O', 'out2.fq.gz'],
   'paired-correct-merge': [...pe, '-c', '-m', '--merged_out', 'merged.fq.gz', '-o', 'out1.fq.gz', '-O', 'out2.fq.gz'],
   'paired-dedup-overrep': [...pe, '-D', '-p', '-o', 'out1.fq', '-O', 'out2.fq'],
 };

@@ -59,19 +59,30 @@ pub struct CorrectionStats {
 /// Reverse complement a single base
 #[inline]
 fn complement_base(base: u8) -> u8 {
-    match base {
-        b'A' => b'T',
-        b'T' => b'A',
-        b'C' => b'G',
-        b'G' => b'C',
-        b'N' => b'N',
-        _ => base,
-    }
+    // An XOR swaps each uppercase pair. The two masks leave every other
+    // byte alone, including lowercase bases and ambiguous symbols.
+    let at = 0u8.wrapping_sub(u8::from((base == b'A') | (base == b'T')));
+    let cg = 0u8.wrapping_sub(u8::from((base == b'C') | (base == b'G')));
+    base ^ ((at & (b'A' ^ b'T')) | (cg & (b'C' ^ b'G')))
 }
 
-/// Reverse complement a sequence in-place
+fn reverse_complement_into(seq: &[u8], out: &mut Vec<u8>) {
+    out.clear();
+    out.reserve(seq.len());
+    let chunks = seq.rchunks_exact(16);
+    let tail = chunks.remainder();
+    for chunk in chunks {
+        let block: [u8; 16] = std::array::from_fn(|i| complement_base(chunk[15 - i]));
+        out.extend_from_slice(&block);
+    }
+    out.extend(tail.iter().rev().map(|&b| complement_base(b)));
+}
+
+/// Return the reverse complement of a sequence.
 pub fn reverse_complement(seq: &[u8]) -> Vec<u8> {
-    seq.iter().rev().map(|&b| complement_base(b)).collect()
+    let mut result = Vec::new();
+    reverse_complement_into(seq, &mut result);
+    result
 }
 
 /// Detect overlap between R1 and reverse-complement of R2
@@ -86,42 +97,6 @@ pub fn detect_overlap(
     detect_overlap_reusing(r1_seq, r2_seq, config, &mut Vec::new())
 }
 
-const FILTER: usize = 16;
-
-/// Try `check` at every offset `s < count` whose window `seq[s..s + 16]`
-/// equals `fixed` in at least `need` bytes, in increasing order. Sixteen
-/// offsets are scored at once, one per lane: for each position j, compare
-/// bytes j..j + 16 of the block with `fixed[j]` and add the result, so there
-/// is no horizontal add per offset. `seq` must be padded by 32 bytes.
-#[inline(always)]
-fn scan(
-    seq: &[u8],
-    count: usize,
-    fixed: &[u8; FILTER],
-    need: u8,
-    mut check: impl FnMut(usize) -> Option<OverlapResult>,
-) -> Option<OverlapResult> {
-    for base in (0..count).step_by(FILTER) {
-        let block: &[u8; 2 * FILTER] = seq[base..base + 2 * FILTER].try_into().unwrap();
-        let mut score = [0u8; FILTER];
-        for (j, &f) in fixed.iter().enumerate() {
-            for (lane, &b) in score.iter_mut().zip(&block[j..j + FILTER]) {
-                *lane += u8::from(b == f);
-            }
-        }
-        if score.iter().any(|&n| n >= need) {
-            for (lane, &n) in score.iter().enumerate().take(count - base) {
-                if n >= need {
-                    if let Some(result) = check(base + lane) {
-                        return Some(result);
-                    }
-                }
-            }
-        }
-    }
-    None
-}
-
 /// Same overlap search with worker-owned reverse-complement storage.
 /// Reusing capacity avoids an allocation for every input pair.
 pub(crate) fn detect_overlap_reusing(
@@ -133,71 +108,108 @@ pub(crate) fn detect_overlap_reusing(
     if r1_seq.is_empty() || r2_seq.is_empty() {
         return None;
     }
-    // Scratch holds the reverse complement and, for the scans below, padded
-    // copies of both sequences so 32-byte blocks can be read past the end.
-    rc.clear();
-    rc.extend(r2_seq.iter().rev().map(|&b| complement_base(b)));
-    let n2 = rc.len();
-    rc.extend([0; 2 * FILTER]);
-    rc.extend_from_slice(r1_seq);
-    rc.extend([0; 2 * FILTER]);
-    let (rc_padded, r1_padded) = rc.split_at(n2 + 2 * FILTER);
-    let rc = &rc_padded[..n2];
+    reverse_complement_into(r2_seq, rc);
     let forward = r1_seq.len().saturating_sub(config.min_overlap_len);
     let reverse = r2_seq.len().saturating_sub(config.min_overlap_len);
-    // Every overlap checked is at least `min_overlap_len` long and the limit is
-    // at most `max_diff`, so an offset with more than `max_diff` mismatches in
-    // its first 16 bases cannot pass. In each direction one side of that window
-    // is the same for every offset, so the scan is one 16-byte compare per
-    // offset and only the few offsets that survive get the exact check.
-    if config.max_diff < FILTER
-        && config.min_overlap_len >= FILTER
-        && r1_seq.len() >= FILTER
-        && rc.len() >= FILTER
-    {
-        let need = (FILTER - config.max_diff) as u8;
-        let fixed = rc[..FILTER].try_into().unwrap();
-        if let Some(result) = scan(r1_padded, forward, fixed, need, |s| {
-            check(r1_seq, rc, s as isize, config)
-        }) {
-            return Some(result);
+    let check = |offset: isize| {
+        let start1 = offset.max(0) as usize;
+        let start2 = (-offset).max(0) as usize;
+        let len = (r1_seq.len() - start1).min(rc.len() - start2);
+        let a = &r1_seq[start1..start1 + len];
+        let b = &rc[start2..start2 + len];
+        let limit = config.max_diff.min(len * config.max_diff_percent / 100);
+        let protected = len.min(50);
+        // fastp protects the first 50 bases and counts all later mismatches.
+        let (prefix, _) =
+            crate::simd::count_mismatches(&a[..protected], &b[..protected], limit, protected);
+        if prefix > limit {
+            return None;
         }
-        let fixed = r1_seq[..FILTER].try_into().unwrap();
-        return scan(rc_padded, reverse, fixed, need, |s| {
-            check(r1_seq, rc, -(s as isize), config)
-        });
+        let (tail, _) =
+            crate::simd::count_mismatches(&a[protected..], &b[protected..], usize::MAX, 0);
+        Some(OverlapResult {
+            overlapped: true,
+            offset,
+            overlap_len: len,
+            diff: prefix + tail,
+        })
+    };
+
+    let protected = config.min_overlap_len.min(r1_seq.len()).min(rc.len());
+    if config.max_diff <= 5 && protected >= 30 {
+        search_offsets::<30>(r1_seq, rc, forward, |s| check(s as isize))
+            .or_else(|| search_offsets::<30>(rc, r1_seq, reverse, |s| check(-(s as isize))))
+    } else if config.max_diff <= 5 && protected >= 24 {
+        search_offsets::<24>(r1_seq, rc, forward, |s| check(s as isize))
+            .or_else(|| search_offsets::<24>(rc, r1_seq, reverse, |s| check(-(s as isize))))
+    } else {
+        (0..forward)
+            .map(|s| s as isize)
+            .chain((0..reverse).map(|s| -(s as isize)))
+            .find_map(check)
     }
-    let forward = (0..forward).map(|n| n as isize);
-    let reverse = (0..reverse).map(|n| -(n as isize));
-    forward
-        .chain(reverse)
-        .find_map(|offset| check(r1_seq, rc, offset, config))
 }
 
-/// The exact test at one offset: at most the limit of mismatches in the first
-/// 50 bases of the overlap, then every remaining mismatch is counted.
-fn check(r1_seq: &[u8], rc: &[u8], offset: isize, config: &OverlapConfig) -> Option<OverlapResult> {
-    let start1 = offset.max(0) as usize;
-    let start2 = (-offset).max(0) as usize;
-    let len = (r1_seq.len() - start1).min(rc.len() - start2);
-    let a = &r1_seq[start1..start1 + len];
-    let b = &rc[start2..start2 + len];
-    let limit = config.max_diff.min(len * config.max_diff_percent / 100);
-    let protected = len.min(50);
-    // fastp 1.3.x protects the first 50 bases, then counts every remaining
-    // mismatch for correction/reporting, even when the total exceeds limit.
-    let (prefix, _) =
-        crate::simd::count_mismatches(&a[..protected], &b[..protected], limit, protected);
-    if prefix > limit {
-        return None;
+// Six disjoint seeds cover the first 24 or 30 protected bases. With at most
+// five mismatches, one of those seeds must match in its entirety. Two
+// bits per byte distinguish A/C/G/T; any collisions on other bytes are
+// harmless because every surviving offset gets the original exact test.
+fn search_offsets<const PREFIX: usize>(
+    moving: &[u8],
+    fixed: &[u8],
+    count: usize,
+    mut check: impl FnMut(usize) -> Option<OverlapResult>,
+) -> Option<OverlapResult> {
+    if count < 8 {
+        return (0..count).find_map(check);
     }
-    let (tail, _) = crate::simd::count_mismatches(&a[protected..], &b[protected..], usize::MAX, 0);
-    Some(OverlapResult {
-        overlapped: true,
-        offset,
-        overlap_len: len,
-        diff: prefix + tail,
-    })
+    let key: [usize; PREFIX] = std::array::from_fn(|i| ((fixed[i] >> 1) & 3) as usize);
+    // All offsets and their seed suffixes fit in one pair of bit planes.
+    let block = 64 - PREFIX;
+    let width = PREFIX / 6;
+    for start in (0..count).step_by(block) {
+        let n = block.min(count - start);
+        let bytes = &moving[start..start + n + PREFIX - 1];
+        let mut planes = [0u64; 2];
+        let mut pack = |offset: usize| {
+            let word = u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap());
+            for (bit, plane) in planes.iter_mut().enumerate() {
+                // Gather one bit from each byte into the low eight bits.
+                let lanes = (word >> (bit + 1)) & 0x0101_0101_0101_0101;
+                *plane |= (lanes.wrapping_mul(0x0102_0408_1020_4080) >> 56) << offset;
+            }
+        };
+        for offset in (0..=bytes.len() - 8).step_by(8) {
+            pack(offset);
+        }
+        if bytes.len() % 8 != 0 {
+            pack(bytes.len() - 8);
+        }
+        let [a, b] = planes;
+        let masks = [!a & !b, a & !b, !a & b, a & b];
+        let mut hits = 0;
+        for (i, seed) in key.chunks_exact(width).enumerate() {
+            let matching = masks[seed[0]]
+                & (masks[seed[1]] >> 1)
+                & (masks[seed[2]] >> 2)
+                & (masks[seed[3]] >> 3);
+            let matching = if width == 5 {
+                matching & (masks[seed[4]] >> 4)
+            } else {
+                matching
+            };
+            hits |= matching >> (i * width);
+        }
+        hits &= (1u64 << n) - 1;
+        while hits != 0 {
+            let offset = hits.trailing_zeros() as usize;
+            if let Some(result) = check(start + offset) {
+                return Some(result);
+            }
+            hits &= hits - 1;
+        }
+    }
+    None
 }
 
 /// Correct bases in overlapping region using quality scores
@@ -336,8 +348,8 @@ pub fn merge_reads(
 
 #[cfg(test)]
 mod tests {
+    use super::*;
 
-    /// The search without the 16-byte prefilter, as it was before it.
     fn unfiltered(r1: &[u8], r2: &[u8], config: &OverlapConfig) -> Option<(isize, usize, usize)> {
         let rc = reverse_complement(r2);
         if r1.is_empty() || r2.is_empty() {
@@ -412,7 +424,6 @@ mod tests {
         }
         assert!(found > 2000, "too few overlaps exercised: {found}");
     }
-    use super::*;
 
     #[test]
     fn bounded_overlap_matches_scalar_reference() {
@@ -444,7 +455,14 @@ mod tests {
 
         let mut rng = StdRng::seed_from_u64(140);
         for case in 0..2000 {
-            let dna: Vec<u8> = (0..600).map(|_| b"ACGT"[rng.gen_range(0..4)]).collect();
+            let alphabet = if case % 4 == 0 {
+                &b"ACGTNacgt?"[..]
+            } else {
+                &b"ACGT"[..]
+            };
+            let dna: Vec<u8> = (0..600)
+                .map(|_| alphabet[rng.gen_range(0..alphabet.len())])
+                .collect();
             let len1 = rng.gen_range(1..=300);
             let len2 = rng.gen_range(1..=300);
             let start2 = rng.gen_range(20..=180);
@@ -461,9 +479,15 @@ mod tests {
                     .for_each(|b| *b = b"ACGT"[rng.gen_range(0..4)]);
             }
             let r2 = reverse_complement(&rc);
-            for (min_overlap_len, max_diff, max_diff_percent) in
-                [(1, 0, 0), (30, 5, 20), (50, 10, 50)]
-            {
+            for (min_overlap_len, max_diff, max_diff_percent) in [
+                (1, 0, 0),
+                (23, 5, 100),
+                (24, 0, 0),
+                (24, 5, 100),
+                (25, 6, 100),
+                (30, 5, 20),
+                (50, 10, 50),
+            ] {
                 let config = OverlapConfig {
                     min_overlap_len,
                     max_diff,
@@ -487,6 +511,27 @@ mod tests {
         assert_eq!(complement_base(b'C'), b'G');
         assert_eq!(complement_base(b'G'), b'C');
         assert_eq!(complement_base(b'N'), b'N');
+    }
+
+    #[test]
+    fn reverse_complement_blocks_and_tail_preserve_every_byte() {
+        let bytes: Vec<_> = (0..=255).collect();
+        let mut output = Vec::new();
+        for end in 0..=bytes.len() {
+            let expected: Vec<_> = bytes[..end]
+                .iter()
+                .rev()
+                .map(|&b| match b {
+                    b'A' => b'T',
+                    b'C' => b'G',
+                    b'G' => b'C',
+                    b'T' => b'A',
+                    _ => b,
+                })
+                .collect();
+            reverse_complement_into(&bytes[..end], &mut output);
+            assert_eq!(output, expected);
+        }
     }
 
     #[test]

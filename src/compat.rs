@@ -7,6 +7,8 @@ use crate::{adapter, auto_adapter, html, io, overlap, simd, split, stats, Args};
 use anyhow::{ensure, Context, Result};
 use rayon::prelude::*;
 use rustc_hash::FxHashMap;
+#[cfg(test)]
+use rustc_hash::FxHashSet;
 use serde_json::{json, Value};
 use std::borrow::Cow;
 use std::collections::{BTreeMap, VecDeque};
@@ -15,17 +17,23 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 mod block;
+#[cfg(feature = "native")]
+mod direct_writer;
+#[cfg(target_arch = "aarch64")]
+mod duplication_neon;
+#[cfg(feature = "native")]
+mod paired_gzip;
 
 pub const FASTP_VERSION: &str = "1.4.0";
 
 #[derive(Clone, Debug, Default)]
 struct Read<'a> {
+    // Canonical LF-delimited input, while all four fields still match it.
+    verbatim: Option<&'a [u8]>,
     name: Cow<'a, [u8]>,
     seq: Cow<'a, [u8]>,
     plus: Cow<'a, [u8]>,
     qual: Cow<'a, [u8]>,
-    original: Option<Box<(Cow<'a, [u8]>, Cow<'a, [u8]>)>>,
-    track_changes: bool,
 }
 
 impl<'a> Read<'a> {
@@ -53,22 +61,24 @@ impl<'a> Read<'a> {
             record
         );
         if phred64 {
+            self.verbatim = None;
             self.qual.to_mut().iter_mut().for_each(|q| *q -= 31);
         }
         Ok(())
     }
 
+    fn name_mut(&mut self) -> &mut Vec<u8> {
+        self.verbatim = None;
+        self.name.to_mut()
+    }
+
     fn into_owned(self) -> Read<'static> {
         Read {
+            verbatim: None,
             name: Cow::Owned(self.name.into_owned()),
             seq: Cow::Owned(self.seq.into_owned()),
             plus: Cow::Owned(self.plus.into_owned()),
             qual: Cow::Owned(self.qual.into_owned()),
-            original: self.original.map(|b| {
-                let (seq, qual) = *b;
-                Box::new((Cow::Owned(seq.into_owned()), Cow::Owned(qual.into_owned())))
-            }),
-            track_changes: self.track_changes,
         }
     }
 
@@ -83,7 +93,7 @@ impl<'a> Read<'a> {
     }
     fn resize(&mut self, len: usize) {
         if len < self.seq.len() {
-            self.save_original();
+            self.verbatim = None;
         }
         for field in [&mut self.seq, &mut self.qual] {
             match field {
@@ -96,7 +106,7 @@ impl<'a> Read<'a> {
     fn trim_front(&mut self, len: usize) {
         let len = len.min(self.seq.len());
         if len > 0 {
-            self.save_original();
+            self.verbatim = None;
         }
         for field in [&mut self.seq, &mut self.qual] {
             match field {
@@ -108,13 +118,18 @@ impl<'a> Read<'a> {
         }
     }
 
-    fn save_original(&mut self) {
-        if self.track_changes && self.original.is_none() {
-            self.original = Some(Box::new((self.seq.clone(), self.qual.clone())));
+    fn borrowed_bases(&self) -> Option<(&'a [u8], &'a [u8])> {
+        match (&self.seq, &self.qual) {
+            (Cow::Borrowed(seq), Cow::Borrowed(qual)) => Some((seq, qual)),
+            _ => None,
         }
     }
 
     fn write(&self, writer: &mut impl Write, tag: Option<&str>) -> Result<()> {
+        if let (Some(bytes), None) = (self.verbatim, tag) {
+            writer.write_all(bytes)?;
+            return Ok(());
+        }
         writer.write_all(&self.name)?;
         if let Some(tag) = tag {
             writer.write_all(b" ")?;
@@ -182,8 +197,7 @@ impl Reader {
     }
 
     fn read_into(&mut self, read: &mut Read) -> Result<bool> {
-        read.original = None;
-        read.track_changes = false;
+        read.verbatim = None;
         let mut lines = [
             read.name.to_mut(),
             read.seq.to_mut(),
@@ -245,50 +259,57 @@ fn valid_quality(qual: &[u8], offset: u8) -> bool {
     }) == 0
 }
 
-/// 5-mer codes A=0 C=1 G=2 T=3 (either case); 4 for anything else.
-const KMER_CODE: [u8; 256] = {
-    let mut lut = [4u8; 256];
-    let bases = *b"ACGTacgt";
-    let mut i = 0;
-    while i < 8 {
-        lut[bases[i] as usize] = (i % 4) as u8;
-        i += 1;
-    }
-    lut
-};
+// A, C, G, T, and all other bytes. One observation touches only one adjacent
+// pair of counters; totals including ambiguous bases are derived at reporting.
+#[derive(Clone, Copy, Default)]
+struct BaseStats {
+    count: u64,
+    quality_sum: u64,
+}
+type Cycle = [BaseStats; 5];
 
-// Keep the counters touched for one cycle together. The reporting structure
-// stores each counter in a separate vector, which is expensive in this hot loop.
-#[derive(Clone, Default)]
-struct Cycle {
-    total_sum: u64,
-    total_cnt: u64,
-    base_sum: [u64; 4],
-    base_cnt: [u64; 4],
+#[derive(Default)]
+struct KmerWindow {
+    code: usize,
+    valid: usize,
 }
 
-/// Per-cycle counters for the reads added since the last flush, in narrow
-/// integers and one array per counter, so the per-base loop is a handful of
-/// independent vector adds. Totals per cycle come from the read lengths.
-/// Flushed into `Sample::cycles` every 255 reads, before a u8 count or a u16
-/// quality sum (at most 255 * 93) can overflow.
-#[derive(Clone, Default)]
-struct Pending {
-    reads: u32,
-    lengths: Vec<u32>,
-    count: [Vec<u8>; 4],
-    sum: [Vec<u16>; 5],
-    /// Reads per (cycle, quality), 94 qualities per cycle. Consecutive bases
-    /// land in different counters even when their qualities repeat, so the
-    /// increments do not wait on each other like a single histogram's do.
-    quals: Vec<u8>,
+impl KmerWindow {
+    fn add(&mut self, base: u8, counts: &mut [usize; 1024]) {
+        if base < 4 {
+            self.code = ((self.code << 2) | usize::from(base)) & 1023;
+            self.valid += 1;
+            if self.valid >= 5 {
+                counts[self.code] += 1;
+            }
+        } else {
+            self.valid = 0;
+            self.code = 0;
+        }
+    }
+
+    fn add_four(&mut self, bases: [u8; 4], counts: &mut [usize; 1024]) {
+        let [a, b, c, d] = bases;
+        if self.valid >= 4 && (a | b | c | d) < 4 {
+            // The previous four bases and these four contain four overlapping
+            // 5-mers. Extract each independently from the packed eight bases.
+            let next = (a << 6) | (b << 4) | (c << 2) | d;
+            self.code = ((self.code & 255) << 8) | usize::from(next);
+            for shift in [6, 4, 2, 0] {
+                counts[(self.code >> shift) & 1023] += 1;
+            }
+        } else {
+            for base in bases {
+                self.add(base, counts);
+            }
+        }
+    }
 }
 
 #[derive(Clone)]
 struct Sample {
     simple: stats::SimpleStats,
     cycles: Vec<Cycle>,
-    pending: Pending,
     // Separate adjacent updates so long runs of one quality score do not form
     // a dependency chain on a single histogram counter.
     qual_hist: [[usize; 94]; 4],
@@ -302,7 +323,6 @@ impl Default for Sample {
         Self {
             simple: stats::SimpleStats::default(),
             cycles: Vec::new(),
-            pending: Pending::default(),
             qual_hist: [[0; 94]; 4],
             kmers: [0; 1024],
             max_len: 0,
@@ -323,9 +343,7 @@ impl Sample {
         }
     }
 
-    fn merge(&mut self, mut other: Self) {
-        self.flush();
-        other.flush();
+    fn merge(&mut self, other: Self) {
         self.simple.total_reads += other.simple.total_reads;
         self.simple.total_bases += other.simple.total_bases;
         self.simple.q20_bases += other.simple.q20_bases;
@@ -340,11 +358,9 @@ impl Sample {
             self.cycles.resize(other.cycles.len(), Cycle::default());
         }
         for (dst, src) in self.cycles.iter_mut().zip(other.cycles) {
-            dst.total_sum += src.total_sum;
-            dst.total_cnt += src.total_cnt;
-            for base in 0..4 {
-                dst.base_sum[base] += src.base_sum[base];
-                dst.base_cnt[base] += src.base_cnt[base];
+            for (dst, src) in dst.iter_mut().zip(src) {
+                dst.count += src.count;
+                dst.quality_sum += src.quality_sum;
             }
         }
         for (dst, src) in self.qual_hist.iter_mut().zip(other.qual_hist) {
@@ -371,112 +387,79 @@ impl Sample {
                 ora.add(seq);
             }
         }
-        let n = seq.len().min(qual.len());
-        let (seq, qual) = (&seq[..n], &qual[..n]);
-        self.simple.total_reads += 1;
-        self.simple.total_bases += seq.len();
-        self.max_len = self.max_len.max(n);
-        let p = &mut self.pending;
-        if p.lengths.len() <= n {
-            p.lengths.resize(n + 1, 0);
-            for count in &mut p.count {
-                count.resize(n, 0);
-            }
-            for sum in &mut p.sum {
-                sum.resize(n, 0);
-            }
-            p.quals.resize(n * 94, 0);
-        }
-        p.lengths[n] += 1;
-        cycle_counts(p, seq, qual);
-        quality_cycles(&mut p.quals, qual);
-        p.reads += 1;
-        if p.reads == 255 {
-            self.flush();
-        }
-        if !no_kmer {
-            count_kmers(&mut self.kmers, seq);
-        }
-    }
-
-    /// The straightforward per-base version `add_parts` must match.
-    #[cfg(test)]
-    fn add_parts_reference(&mut self, seq: &[u8], qual: &[u8], no_kmer: bool, index: usize) {
-        if let Some(ora) = self.overrep.as_mut() {
-            if index % ora.sampling == 0 {
-                ora.add(seq);
-            }
-        }
         self.simple.total_reads += 1;
         self.simple.total_bases += seq.len();
         self.max_len = self.max_len.max(seq.len());
         if self.cycles.len() < seq.len() {
             self.cycles.resize(seq.len(), Cycle::default());
         }
-        let mut kmer_code = 0usize;
-        let mut valid = 0usize;
-        for (index, ((&b, &q), cycle)) in seq.iter().zip(qual).zip(&mut self.cycles).enumerate() {
+        let mut window = KmerWindow::default();
+        let (bases, remaining_bases) = seq.as_chunks::<4>();
+        let (qualities, remaining_qualities) = qual.as_chunks::<4>();
+        let (cycles, remaining_cycles) = self.cycles[..seq.len()].as_chunks_mut::<4>();
+        let base_index = |b| crate::kmer::base_to_2bit(b).unwrap_or(4) as u8;
+
+        for ((bases, qualities), cycles) in bases.iter().zip(qualities).zip(cycles) {
+            let codes = bases.map(base_index);
+            for i in 0..4 {
+                let q = usize::from(qualities[i] - 33);
+                let base = &mut cycles[i][usize::from(codes[i])];
+                base.count += 1;
+                base.quality_sum += q as u64;
+                self.qual_hist[i][q] += 1;
+            }
+            if !no_kmer {
+                window.add_four(codes, &mut self.kmers);
+            }
+        }
+        for (i, ((&b, &q), cycle)) in remaining_bases
+            .iter()
+            .zip(remaining_qualities)
+            .zip(remaining_cycles)
+            .enumerate()
+        {
+            let code = base_index(b);
             let q = usize::from(q - 33);
-            cycle.total_sum += q as u64;
-            cycle.total_cnt += 1;
-            self.qual_hist[index & 3][q] += 1;
-            if let Some(base) = crate::kmer::base_idx(b) {
-                cycle.base_sum[base] += q as u64;
-                cycle.base_cnt[base] += 1;
-                if !no_kmer {
-                    kmer_code = ((kmer_code << 2) | [0, 3, 1, 2][base]) & 1023;
-                    valid += 1;
-                    if valid >= 5 {
-                        self.kmers[kmer_code] += 1;
-                    }
-                }
-            } else {
-                kmer_code = 0;
-                valid = 0;
+            let base = &mut cycle[usize::from(code)];
+            base.count += 1;
+            base.quality_sum += q as u64;
+            self.qual_hist[i][q] += 1;
+            if !no_kmer {
+                window.add(code, &mut self.kmers);
             }
         }
     }
 
-    /// Move the pending narrow counters into the per-cycle totals.
-    fn flush(&mut self) {
-        let p = &mut self.pending;
-        if p.reads == 0 {
-            return;
+    // A passing prefix contributes to both reports via the shared sample.
+    // Only the removed suffix still needs to be counted before filtering.
+    fn add_removed_tail(&mut self, seq: &[u8], qual: &[u8], kept: usize, no_kmer: bool) {
+        self.simple.total_bases += seq.len() - kept;
+        self.max_len = self.max_len.max(seq.len());
+        if self.cycles.len() < seq.len() {
+            self.cycles.resize(seq.len(), Cycle::default());
         }
-        let cycles = p.lengths.len().saturating_sub(1);
-        if self.cycles.len() < cycles {
-            self.cycles.resize(cycles, Cycle::default());
-        }
-        // Reads longer than cycle i, counted from the longest down.
-        let mut longer = 0u64;
-        for i in (0..cycles).rev() {
-            longer += u64::from(p.lengths[i + 1]);
-            let cycle = &mut self.cycles[i];
-            cycle.total_cnt += longer;
-            cycle.total_sum += u64::from(p.sum[4][i]);
-            for base in 0..4 {
-                cycle.base_cnt[base] += u64::from(p.count[base][i]);
-                cycle.base_sum[base] += u64::from(p.sum[base][i]);
+        let mut window = KmerWindow::default();
+        let code = |b| crate::kmer::base_to_2bit(b).unwrap_or(4) as u8;
+        if !no_kmer {
+            // Seed the window without counting any 5-mer from the prefix.
+            for &b in &seq[kept.saturating_sub(4)..kept] {
+                window.add(code(b), &mut self.kmers);
             }
         }
-        for row in p.quals.chunks_exact(94) {
-            for (dst, &src) in self.qual_hist[0].iter_mut().zip(row) {
-                *dst += usize::from(src);
+        for pos in kept..seq.len() {
+            let b = code(seq[pos]);
+            let q = usize::from(qual[pos] - 33);
+            let base = &mut self.cycles[pos][usize::from(b)];
+            base.count += 1;
+            base.quality_sum += q as u64;
+            self.qual_hist[pos & 3][q] += 1;
+            if !no_kmer {
+                window.add(b, &mut self.kmers);
             }
-        }
-        p.quals.fill(0);
-        p.reads = 0;
-        p.lengths.fill(0);
-        for count in &mut p.count {
-            count.fill(0);
-        }
-        for sum in &mut p.sum {
-            sum.fill(0);
         }
     }
 
     fn finish_summary(&mut self) {
-        self.flush();
         // Derive totals from the histograms instead of rescanning reads.
         self.simple.q20_bases = self
             .qual_hist
@@ -496,7 +479,7 @@ impl Sample {
         self.simple.gc_bases = self
             .cycles
             .iter()
-            .map(|c| (c.base_cnt[2] + c.base_cnt[3]) as usize)
+            .map(|cycle| (cycle[1].count + cycle[2].count) as usize)
             .sum();
     }
 
@@ -505,11 +488,12 @@ impl Sample {
         p.ensure_capacity(self.cycles.len());
         p.qual_hist = std::array::from_fn(|q| self.qual_hist.iter().map(|h| h[q]).sum());
         for (i, cycle) in self.cycles.iter().enumerate() {
-            p.total_sum[i] = cycle.total_sum;
-            p.total_cnt[i] = cycle.total_cnt;
-            for base in 0..4 {
-                p.base_sum[base][i] = cycle.base_sum[base];
-                p.base_cnt[base][i] = cycle.base_cnt[base];
+            p.total_sum[i] = cycle.iter().map(|base| base.quality_sum).sum();
+            p.total_cnt[i] = cycle.iter().map(|base| base.count).sum();
+            // PositionStats uses A, T, C, G order.
+            for (dst, src) in [0, 3, 1, 2].into_iter().enumerate() {
+                p.base_sum[dst][i] = cycle[src].quality_sum;
+                p.base_cnt[dst][i] = cycle[src].count;
             }
         }
         let mut content = p.to_content_curves();
@@ -544,62 +528,6 @@ impl Sample {
     }
 }
 
-/// Base counts and quality sums per cycle. Branch-free: every lane adds 0 or 1
-/// and its quality or 0, so this vectorizes across cycles. `| 0x20` folds
-/// lowercase bases onto uppercase.
-fn cycle_counts(p: &mut Pending, seq: &[u8], qual: &[u8]) {
-    let n = seq.len();
-    let [a, t, c, g] = &mut p.count;
-    let (a, t, c, g) = (&mut a[..n], &mut t[..n], &mut c[..n], &mut g[..n]);
-    let [sa, st, sc, sg, all] = &mut p.sum;
-    let (sa, st, sc, sg, all) = (
-        &mut sa[..n],
-        &mut st[..n],
-        &mut sc[..n],
-        &mut sg[..n],
-        &mut all[..n],
-    );
-    for i in 0..n {
-        let b = seq[i] | 0x20;
-        let q = qual[i].wrapping_sub(33);
-        let is = [b == b'a', b == b't', b == b'c', b == b'g'].map(u8::from);
-        a[i] += is[0];
-        t[i] += is[1];
-        c[i] += is[2];
-        g[i] += is[3];
-        sa[i] += u16::from(q & is[0].wrapping_neg());
-        st[i] += u16::from(q & is[1].wrapping_neg());
-        sc[i] += u16::from(q & is[2].wrapping_neg());
-        sg[i] += u16::from(q & is[3].wrapping_neg());
-        all[i] += u16::from(q);
-    }
-}
-
-fn quality_cycles(quals: &mut [u8], qual: &[u8]) {
-    // Qualities are validated to 33..=126, so `min` only removes the bounds check.
-    for (row, &q) in quals.chunks_exact_mut(94).zip(qual) {
-        row[usize::from(q - 33).min(93)] += 1;
-    }
-}
-
-fn count_kmers(kmers: &mut [usize; 1024], seq: &[u8]) {
-    let mut kmer_code = 0usize;
-    let mut valid = 0usize;
-    for &b in seq {
-        let code = KMER_CODE[usize::from(b)];
-        if code < 4 {
-            kmer_code = ((kmer_code << 2) | usize::from(code)) & 1023;
-            valid += 1;
-            if valid >= 5 {
-                kmers[kmer_code] += 1;
-            }
-        } else {
-            kmer_code = 0;
-            valid = 0;
-        }
-    }
-}
-
 #[derive(Clone)]
 struct Overrep {
     counts: BTreeMap<Vec<u8>, usize>,
@@ -608,40 +536,73 @@ struct Overrep {
 }
 
 impl Overrep {
-    fn candidates<'a>(
-        reads: impl Iterator<Item = &'a Read<'a>>,
-        len: usize,
-    ) -> BTreeMap<Vec<u8>, usize> {
+    fn candidates(reads: &[&Read], len: usize) -> BTreeMap<Vec<u8>, usize> {
         let mut counts = BTreeMap::new();
         let mut bases = 0;
-        let steps = [10, 20, 40, 100, 150.min(len.saturating_sub(2)).max(1)];
+        let mut sampled = 0;
         for r in reads {
             if bases >= 151 * 10000 {
                 break;
             }
             bases += r.seq.len();
-            for step in steps {
-                for i in 0..r.seq.len().saturating_sub(step) {
-                    *counts.entry(r.seq[i..i + step].to_vec()).or_insert(0usize) += 1;
+            sampled += 1;
+        }
+        // The evaluation reads outlive this scan. Borrow each distinct window
+        // from them and keep only one length's frequency table in memory.
+        let mut steps = [10, 20, 40, 100, 150.min(len.saturating_sub(2)).max(1)];
+        steps.sort_unstable();
+        for group in steps.chunk_by(|a, b| a == b) {
+            let step = group[0];
+            let threshold: usize = match step {
+                n if n >= len.saturating_sub(1) => 3,
+                100.. => 5,
+                40.. => 20,
+                20.. => 100,
+                10.. => 500,
+                _ => continue,
+            };
+            // fastp excludes the window ending exactly at the read end.
+            let windows = || {
+                reads[..sampled]
+                    .iter()
+                    .flat_map(|read| read.seq[..read.seq.len().saturating_sub(1)].windows(step))
+            };
+            let window_count: usize = reads[..sampled]
+                .iter()
+                .map(|read| read.seq.len().saturating_sub(step))
+                .sum();
+            let mut frequencies = FxHashMap::default();
+            if step >= 8 && window_count >= 4096 {
+                // Every occurrence of a sequence increments the same bucket.
+                // Collisions can only admit extra windows to the exact count.
+                let buckets = window_count.min(1 << 20).next_power_of_two() * 2;
+                let shift = 64 - buckets.trailing_zeros();
+                let bucket = |w: &[u8]| {
+                    let prefix = u64::from_le_bytes(w[..8].try_into().unwrap());
+                    let suffix = u64::from_le_bytes(w[w.len() - 8..].try_into().unwrap());
+                    ((prefix ^ suffix.rotate_left(29)).wrapping_mul(0x9e3779b97f4a7c15) >> shift)
+                        as usize
+                };
+                let mut estimates = vec![0u16; buckets];
+                let cutoff = threshold.div_ceil(group.len()) as u16;
+                for window in windows() {
+                    let count = &mut estimates[bucket(window)];
+                    *count = count.saturating_add(1);
+                }
+                for window in windows().filter(|w| estimates[bucket(w)] >= cutoff) {
+                    *frequencies.entry(window).or_insert(0usize) += group.len();
+                }
+            } else {
+                for window in windows() {
+                    *frequencies.entry(window).or_insert(0usize) += group.len();
+                }
+            }
+            for (seq, n) in frequencies {
+                if n >= threshold {
+                    counts.insert(seq.to_vec(), n);
                 }
             }
         }
-        counts.retain(|seq, count| {
-            *count
-                >= if seq.len() >= len.saturating_sub(1) {
-                    3
-                } else if seq.len() >= 100 {
-                    5
-                } else if seq.len() >= 40 {
-                    20
-                } else if seq.len() >= 20 {
-                    100
-                } else if seq.len() >= 10 {
-                    500
-                } else {
-                    usize::MAX
-                }
-        });
         // Match upstream's lexicographic removal of redundant substrings.
         let keys: Vec<_> = counts.keys().cloned().collect();
         for seq in keys {
@@ -662,12 +623,18 @@ impl Overrep {
     fn new(candidates: &BTreeMap<Vec<u8>, usize>, len: usize, sampling: usize) -> Self {
         Self {
             counts: candidates.keys().cloned().map(|s| (s, 0)).collect(),
-            steps: [10, 20, 40, 100, 150.min(len.saturating_sub(2)).max(1)],
+            steps: [10, 20, 40, 100, 150.min(len.saturating_sub(2)).max(1)].map(|step| {
+                if candidates.keys().any(|seq| seq.len() == step) {
+                    step
+                } else {
+                    0
+                }
+            }),
             sampling,
         }
     }
     fn add(&mut self, seq: &[u8]) {
-        for step in self.steps {
+        for step in self.steps.into_iter().filter(|&step| step != 0) {
             let mut i = 0;
             while i < seq.len().saturating_sub(step) {
                 if let Some(n) = self.counts.get_mut(&seq[i..i + step]) {
@@ -940,7 +907,7 @@ fn add_umi(r: &mut Read, umi: &[u8], a: &Args) {
         tag.push(b'_');
     }
     tag.extend_from_slice(umi);
-    r.name.to_mut().splice(pos..pos, tag);
+    r.name_mut().splice(pos..pos, tag);
 }
 
 fn umi(r1: &mut Read, r2: Option<&mut Read>, a: &Args) {
@@ -1013,49 +980,144 @@ struct Duplication {
 }
 
 enum BloomPages {
-    Dense(Vec<BloomPage>),
-    Sparse(FxHashMap<u64, BloomPage>),
+    Dense(BucketTable),
+    Sparse(SparseBuckets),
 }
 
-// Most 4 KiB pages contain only a few set bits on ordinary FASTQ inputs.
-// Store those exact bit offsets inline, promoting a populated page to the
-// original bitmap. This changes storage, never hashes or membership decisions.
+// Keep small sets of exact offsets inline, then a small table of them that
+// grows with the page. A full bitmap bounds the storage for a dense page.
 enum BloomPage {
     Small {
         len: u8,
-        bits: [u16; 32],
-        summary: u64,
+        bits: [u16; 24],
+    },
+    /// Open addressing over a power-of-two table, at most three quarters
+    /// full. Where an offset belongs is known from the offset alone, so it
+    /// can be requested from memory before it is looked up.
+    Sparse {
+        slots: Box<[u16]>,
+        len: u16,
     },
     Bitmap(Box<[u8; 4096]>),
+}
+
+/// The largest table of a sparse page. When it is three quarters full the
+/// page becomes a bitmap.
+const SPARSE_SLOTS: usize = 512;
+
+/// A free slot of a sparse page: offsets are below 32768.
+const NO_OFFSET: u16 = u16::MAX;
+
+/// Ask for the memory at `ptr` ahead of its use.
+#[inline(always)]
+fn prefetch<T>(ptr: *const T) {
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: the hint does not dereference or modify memory.
+    unsafe {
+        std::arch::asm!("prfm pldl1keep, [{ptr}]", ptr = in(reg) ptr,
+            options(nostack, preserves_flags, readonly));
+    }
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: a cache hint; the address is never dereferenced.
+    unsafe {
+        std::arch::x86_64::_mm_prefetch::<{ std::arch::x86_64::_MM_HINT_T0 }>(ptr.cast());
+    }
+    let _ = ptr;
 }
 
 impl Default for BloomPage {
     fn default() -> Self {
         Self::Small {
             len: 0,
-            bits: [0; 32],
-            summary: 0,
+            bits: [u16::MAX; 24],
         }
     }
 }
 
 impl BloomPage {
+    /// Where `bit` starts its search in a sparse table of `slots` slots.
+    #[inline(always)]
+    fn home(bit: u16, slots: usize) -> usize {
+        (u32::from(bit).wrapping_mul(0x9E37_79B1) >> (32 - slots.trailing_zeros())) as usize
+    }
+
+    /// Insert into a sparse table with room. Returns whether it was there.
+    #[inline(always)]
+    fn probe(slots: &mut [u16], bit: u16) -> bool {
+        let mask = slots.len() - 1;
+        let mut at = Self::home(bit, slots.len());
+        loop {
+            match slots[at] {
+                seen if seen == bit => return true,
+                NO_OFFSET => {
+                    slots[at] = bit;
+                    return false;
+                }
+                _ => at = (at + 1) & mask,
+            }
+        }
+    }
+
+    fn sparse(offsets: impl Iterator<Item = u16>, slots: usize) -> Box<[u16]> {
+        let mut table = vec![NO_OFFSET; slots].into_boxed_slice();
+        for offset in offsets {
+            Self::probe(&mut table, offset);
+        }
+        table
+    }
+
+    /// Request the memory `check_and_set(bit)` will read.
+    #[inline(always)]
+    fn prefetch(&self, bit: u16) {
+        match self {
+            Self::Small { .. } => {}
+            Self::Sparse { slots, .. } => {
+                prefetch(slots.as_ptr().wrapping_add(Self::home(bit, slots.len())));
+            }
+            Self::Bitmap(bitmap) => prefetch(bitmap.as_ptr().wrapping_add(usize::from(bit) / 8)),
+        }
+    }
+
     fn check_and_set(&mut self, bit: u16) -> bool {
         match self {
-            Self::Small { len, bits, summary } => {
-                let mask = 1u64 << (bit % 64);
-                // An unset summary bit proves absence. A hit still checks the
-                // exact offsets, so this shortcut cannot create false positives.
-                if *summary & mask != 0 && bits[..usize::from(*len)].contains(&bit) {
+            Self::Small { len, bits } => {
+                // Unused slots contain a value outside the 15-bit page.
+                // Searching a fixed-size array lets the compiler use SIMD.
+                if bits.contains(&bit) {
                     return true;
                 }
                 if usize::from(*len) < bits.len() {
                     bits[usize::from(*len)] = bit;
                     *len += 1;
-                    *summary |= mask;
                 } else {
+                    let all = bits.iter().copied().chain(std::iter::once(bit));
+                    *self = Self::Sparse {
+                        slots: Self::sparse(all, 64),
+                        len: 25,
+                    };
+                }
+                false
+            }
+            Self::Sparse { slots, len } => {
+                if Self::probe(slots, bit) {
+                    return true;
+                }
+                *len += 1;
+                if usize::from(*len) * 4 <= slots.len() * 3 {
+                    return false;
+                }
+                let held = slots.iter().copied().filter(|&o| o != NO_OFFSET);
+                if slots.len() < SPARSE_SLOTS {
+                    *slots = Self::sparse(held, slots.len() * 2);
+                } else {
+                    // The next table would be half the size of the bitmap,
+                    // and the one after as large. Every growth reads the
+                    // whole table from memory, and in a large file all the
+                    // pages grow at about the same time: going on to the
+                    // largest tables made checks seven times slower while
+                    // they did.
                     let mut bitmap = Box::new([0; 4096]);
-                    for &offset in bits.iter().chain(std::iter::once(&bit)) {
+                    for offset in held {
                         bitmap[usize::from(offset) / 8] |= 1 << (offset % 8);
                     }
                     *self = Self::Bitmap(bitmap);
@@ -1073,11 +1135,217 @@ impl BloomPage {
     }
 }
 
+// Pack fixed-width offsets in a word, using zero as the empty-slot marker.
+// The top bit records membership of offset zero.
+#[derive(Default)]
+struct Bucket<const WIDTH: u32 = 11>(u64);
+
+impl<const WIDTH: u32> Bucket<WIDTH> {
+    const MASK: u64 = (1 << WIDTH) - 1;
+    const LANES: u32 = 63 / WIDTH;
+    const ONES: u64 = ((1 << (WIDTH * Self::LANES)) - 1) / Self::MASK;
+
+    /// A full bucket returns None for an unseen nonzero offset.
+    fn check_and_set(&mut self, offset: u16) -> Option<bool> {
+        const ZERO: u64 = 1 << 63;
+        if offset == 0 {
+            let seen = self.0 & ZERO != 0;
+            self.0 |= ZERO;
+            return Some(seen);
+        }
+        let value = u64::from(offset);
+        let diff = self.0 ^ (value * Self::ONES);
+        // Subtract one in every lane. A zero lane borrows into its high bit.
+        if diff.wrapping_sub(Self::ONES) & !diff & (Self::ONES << (WIDTH - 1)) != 0 {
+            return Some(true);
+        }
+        if self.0 & (Self::MASK << (WIDTH * (Self::LANES - 1))) != 0 {
+            return None;
+        }
+        self.0 = (self.0 & ZERO) | (self.0 << WIDTH) | value;
+        Some(false)
+    }
+
+    /// Every offset the bucket holds.
+    fn offsets(&self) -> impl Iterator<Item = u16> + '_ {
+        let zero = (self.0 >> 63 != 0).then_some(0);
+        let lanes = (0..Self::LANES).map(|lane| ((self.0 >> (WIDTH * lane)) & Self::MASK) as u16);
+        zero.into_iter().chain(lanes.filter(|&offset| offset != 0))
+    }
+}
+
+/// Reads in a batch below which the two directories are checked in turn: a
+/// thread costs more to start than they take.
+const LANE_PAIRS: usize = 8192;
+/// How many checks ahead a lane requests memory. A lane does half the work
+/// of checking both directories, so it looks twice as far ahead.
+const LANE_AHEAD: usize = 16;
+
+/// Whether a second thread for the duplicate filter has a core to run on.
+fn lanes_available() -> bool {
+    std::thread::available_parallelism().is_ok_and(|n| n.get() > 2)
+}
+
+struct BucketTable {
+    buckets: Vec<Bucket>,
+    overflow: Vec<Option<Box<BloomPage>>>,
+    /// Pages that hold all of their bits as a bitmap. A page that grows into
+    /// a bitmap takes in what its sixteen buckets held, so a check there
+    /// reads the bitmap alone: late in a large file, that is every check.
+    bitmaps: Vec<Option<Box<[u8; 4096]>>>,
+}
+
+impl BucketTable {
+    // Default-level hashes use 32 address bits. Reversing the bytes spreads
+    // clustered hashes across buckets while preserving every bit identity.
+    #[inline]
+    fn address(pos: u64) -> u64 {
+        u64::from((pos as u32).swap_bytes())
+    }
+
+    fn new(pages: usize) -> Self {
+        Self {
+            buckets: std::iter::repeat_with(Bucket::default)
+                .take(pages * 16)
+                .collect(),
+            overflow: std::iter::repeat_with(|| None).take(pages).collect(),
+            bitmaps: std::iter::repeat_with(|| None).take(pages).collect(),
+        }
+    }
+
+    /// The reads a check may make depend on one another: the directories,
+    /// then the bitmap, or else the bucket and the page the directory points
+    /// at, then the page's own storage. Each is requested a few checks
+    /// before the one that needs it, so a check rarely waits for memory.
+    #[inline(always)]
+    fn prefetch(&self, bit: u64) {
+        prefetch(self.bitmaps.as_ptr().wrapping_add((bit >> 15) as usize));
+        prefetch(self.overflow.as_ptr().wrapping_add((bit >> 15) as usize));
+    }
+
+    #[inline(always)]
+    fn prefetch_page(&self, bit: u64) {
+        if let Some(bitmap) = &self.bitmaps[(bit >> 15) as usize] {
+            prefetch(bitmap.as_ptr().wrapping_add((bit & 32767) as usize / 8));
+            return;
+        }
+        prefetch(self.buckets.as_ptr().wrapping_add((bit >> 11) as usize));
+        if let Some(page) = &self.overflow[(bit >> 15) as usize] {
+            prefetch::<BloomPage>(&**page);
+        }
+    }
+
+    #[inline(always)]
+    fn prefetch_entry(&self, bit: u64) {
+        if let Some(page) = &self.overflow[(bit >> 15) as usize] {
+            page.prefetch((bit & 32767) as u16);
+        }
+    }
+
+    /// Check and set position `lane` of every pair in `chunks`, in order:
+    /// one bit per pair, set where the position had been seen.
+    fn seen(&mut self, chunks: &[&[u64]], lane: usize) -> Vec<Vec<u64>> {
+        const AHEAD: usize = LANE_AHEAD;
+        chunks
+            .iter()
+            .map(|positions| {
+                let (pairs, _) = positions.as_chunks::<2>();
+                let mut bits = vec![0u64; pairs.len().div_ceil(64)];
+                for (i, pair) in pairs.iter().enumerate() {
+                    if let Some(later) = pairs.get(i + 3 * AHEAD) {
+                        self.prefetch(Self::address(later[lane]));
+                    }
+                    if let Some(later) = pairs.get(i + 2 * AHEAD) {
+                        self.prefetch_page(Self::address(later[lane]));
+                    }
+                    if let Some(later) = pairs.get(i + AHEAD) {
+                        self.prefetch_entry(Self::address(later[lane]));
+                    }
+                    let seen = self.check_and_set(Self::address(pair[lane]));
+                    bits[i / 64] |= u64::from(seen) << (i % 64);
+                }
+                bits
+            })
+            .collect()
+    }
+
+    fn check_and_set(&mut self, bit: u64) -> bool {
+        let page = (bit >> 15) as usize;
+        if let Some(bitmap) = &mut self.bitmaps[page] {
+            let byte = &mut bitmap[(bit & 32767) as usize / 8];
+            let mask = 1 << (bit % 8);
+            let seen = *byte & mask != 0;
+            *byte |= mask;
+            return seen;
+        }
+        if let Some(seen) = self.buckets[(bit >> 11) as usize].check_and_set((bit & 2047) as u16) {
+            return seen;
+        }
+        let slot = self.overflow[page].get_or_insert_with(Default::default);
+        let seen = slot.check_and_set((bit & 32767) as u16);
+        if matches!(**slot, BloomPage::Bitmap(_)) {
+            self.settle(page);
+        }
+        seen
+    }
+
+    /// Move what the buckets of `page` hold into its bitmap, and keep the
+    /// bitmap where checks find it first.
+    fn settle(&mut self, page: usize) {
+        let Some(BloomPage::Bitmap(mut bitmap)) = self.overflow[page].take().map(|page| *page)
+        else {
+            unreachable!("only a bitmap page settles");
+        };
+        for (index, bucket) in self.buckets[page * 16..(page + 1) * 16]
+            .iter_mut()
+            .enumerate()
+        {
+            for offset in bucket.offsets() {
+                let bit = index << 11 | usize::from(offset);
+                bitmap[bit / 8] |= 1 << (bit % 8);
+            }
+            *bucket = Bucket::default();
+        }
+        self.bitmaps[page] = Some(bitmap);
+    }
+}
+
+// A sparse directory across each larger address space. Allocate the 256-byte
+// groups on first access. Four 13-bit offsets fit in a bucket, so most probes
+// finish there. Crowded buckets share an overflow page per 32768 bits.
+struct SparseBuckets {
+    groups: Vec<Option<Box<[Bucket<13>; 32]>>>,
+    overflow: FxHashMap<u64, BloomPage>,
+}
+
+impl SparseBuckets {
+    fn new(bits: u64) -> Self {
+        Self {
+            groups: std::iter::repeat_with(|| None)
+                .take((bits >> 18) as usize)
+                .collect(),
+            overflow: FxHashMap::default(),
+        }
+    }
+
+    fn check_and_set(&mut self, bit: u64) -> bool {
+        let group = self.groups[(bit >> 18) as usize]
+            .get_or_insert_with(|| Box::new(std::array::from_fn(|_| Bucket::default())));
+        if let Some(seen) = group[((bit >> 13) & 31) as usize].check_and_set((bit & 8191) as u16) {
+            return seen;
+        }
+        self.overflow
+            .entry(bit >> 15)
+            .or_default()
+            .check_and_set((bit & 32767) as u16)
+    }
+}
+
 impl BloomPages {
-    fn page(&mut self, index: u64) -> &mut BloomPage {
+    fn check_and_set(&mut self, bit: u64) -> bool {
         match self {
-            Self::Dense(pages) => &mut pages[index as usize],
-            Self::Sparse(pages) => pages.entry(index).or_default(),
+            Self::Dense(table) => table.check_and_set(BucketTable::address(bit)),
+            Self::Sparse(table) => table.check_and_set(bit),
         }
     }
 }
@@ -1110,20 +1378,16 @@ impl Duplication {
         }
         let bits = (1u64 << 32) * scale;
         let pages = (bits / 8 / 4096) as usize;
-        // Direct lookup for ordinary accuracy levels, without committing the
-        // Bloom data itself. Keep high-accuracy directories sparse and bounded.
-        let dense = pages * n * std::mem::size_of::<BloomPage>() <= 32 * 1024 * 1024;
+        // Direct lookup for the default two directories. Higher accuracies
+        // allocate groups of buckets on demand.
+        let dense = pages * n <= 2 * (1 << 17);
         Self {
             buffers: (0..n)
                 .map(|_| {
                     if dense {
-                        BloomPages::Dense(
-                            std::iter::repeat_with(BloomPage::default)
-                                .take(pages)
-                                .collect(),
-                        )
+                        BloomPages::Dense(BucketTable::new(pages))
                     } else {
-                        BloomPages::Sparse(FxHashMap::default())
+                        BloomPages::Sparse(SparseBuckets::new(bits))
                     }
                 })
                 .collect(),
@@ -1132,39 +1396,116 @@ impl Duplication {
         }
     }
     fn hasher(&self) -> DuplicationHash {
-        #[cfg(target_arch = "aarch64")]
-        let (pair_primes, pair_bias) = if self.buffers.len() == 2 {
-            // For two hashes every prime * nucleotide code fits in u32. The
-            // position-only term is independent of the read and is added once.
-            let primes: Vec<u32> = self.primes.iter().map(|&p| p as u32).collect();
-            assert!(primes.iter().all(|&p| p <= u32::MAX / 222));
-            let mut bias = vec![[0u64; 8]; 513];
-            for pos in 0..512 {
-                bias[pos + 1] = bias[pos];
-                for i in 0..2 {
-                    bias[pos + 1][i] += self.primes[pos * 2 + i] * pos as u64;
-                }
-            }
-            (primes, bias)
-        } else {
-            (Vec::new(), Vec::new())
-        };
         DuplicationHash {
             buffers: self.buffers.len(),
             primes: self.primes.clone(),
             #[cfg(target_arch = "aarch64")]
-            pair_primes,
-            #[cfg(target_arch = "aarch64")]
-            pair_bias,
+            pair: (self.buffers.len() == 2).then(|| duplication_neon::PairHash::new(&self.primes)),
         }
     }
 
-    fn check_positions(&mut self, positions: [u64; 8]) -> bool {
+    /// `count_packed` for each of `chunks`, in order.
+    ///
+    /// The two default directories never read each other, so each can check
+    /// its own position of every read on its own thread, in input order,
+    /// and the answers are the same as checking them in turn. A read is a
+    /// duplicate when both had seen it.
+    fn count_chunks(&mut self, chunks: &[&[u64]]) -> Vec<usize> {
+        let pairs: usize = chunks.iter().map(|c| c.len() / 2).sum();
+        if let [BloomPages::Dense(a), BloomPages::Dense(b)] = self.buffers.as_mut_slice() {
+            if pairs >= LANE_PAIRS && lanes_available() {
+                let (first, second) = std::thread::scope(|scope| {
+                    let first = scope.spawn(|| a.seen(chunks, 0));
+                    let second = b.seen(chunks, 1);
+                    (first.join().expect("duplicate lane panicked"), second)
+                });
+                return first
+                    .iter()
+                    .zip(&second)
+                    .map(|(x, y)| {
+                        x.iter()
+                            .zip(y)
+                            .map(|(x, y)| (x & y).count_ones() as usize)
+                            .sum()
+                    })
+                    .collect();
+            }
+        }
+        chunks.iter().map(|c| self.count_packed(c)).collect()
+    }
+
+    fn count_packed(&mut self, positions: &[u64]) -> usize {
+        // The two default hash directories fit in a flat table. Bring later
+        // buckets into cache while preserving the original check-and-set order.
+        if let [BloomPages::Dense(a), BloomPages::Dense(b)] = self.buffers.as_mut_slice() {
+            let (pairs, tail) = positions.as_chunks::<2>();
+            debug_assert!(tail.is_empty());
+            let check = |a: &mut BucketTable, b: &mut BucketTable, pair: &[u64; 2]| {
+                usize::from(
+                    a.check_and_set(BucketTable::address(pair[0]))
+                        & b.check_and_set(BucketTable::address(pair[1])),
+                )
+            };
+            const AHEAD: usize = 8;
+            let mut count = 0;
+            for (i, pair) in pairs.iter().enumerate() {
+                if let Some(later) = pairs.get(i + 3 * AHEAD) {
+                    a.prefetch(BucketTable::address(later[0]));
+                    b.prefetch(BucketTable::address(later[1]));
+                }
+                if let Some(later) = pairs.get(i + 2 * AHEAD) {
+                    a.prefetch_page(BucketTable::address(later[0]));
+                    b.prefetch_page(BucketTable::address(later[1]));
+                }
+                if let Some(later) = pairs.get(i + AHEAD) {
+                    a.prefetch_entry(BucketTable::address(later[0]));
+                    b.prefetch_entry(BucketTable::address(later[1]));
+                }
+                count += check(a, b, pair);
+            }
+            return count;
+        }
+        positions
+            .chunks_exact(self.buffers.len())
+            .map(|pair| usize::from(self.check_positions(pair)))
+            .sum()
+    }
+
+    /// Whether each read is a duplicate, in input order. The tables are far
+    /// larger than the cache, so the buckets of later reads are requested
+    /// while earlier ones are checked.
+    fn check_batch(&mut self, positions: &[[u64; 8]]) -> Vec<bool> {
+        const AHEAD: usize = 8;
+        let mask = self.bits - 1;
+        let dense = |buffers: &[BloomPages], positions: &[u64; 8], stage: usize| {
+            for (buf, pos) in buffers.iter().zip(positions) {
+                if let BloomPages::Dense(table) = buf {
+                    let bit = BucketTable::address(pos & mask);
+                    match stage {
+                        3 => table.prefetch(bit),
+                        2 => table.prefetch_page(bit),
+                        _ => table.prefetch_entry(bit),
+                    }
+                }
+            }
+        };
+        (0..positions.len())
+            .map(|i| {
+                for stage in 1..=3 {
+                    if let Some(later) = positions.get(i + stage * AHEAD) {
+                        dense(&self.buffers, later, stage);
+                    }
+                }
+                self.check_positions(&positions[i])
+            })
+            .collect()
+    }
+
+    fn check_positions(&mut self, positions: &[u64]) -> bool {
         let mut duplicate = true;
         for (buf, pos) in self.buffers.iter_mut().zip(positions) {
-            let bit = pos % self.bits;
-            let page = buf.page(bit / 32768);
-            duplicate &= page.check_and_set((bit % 32768) as u16);
+            let bit = pos & (self.bits - 1);
+            duplicate &= buf.check_and_set(bit);
         }
         duplicate
     }
@@ -1174,18 +1515,16 @@ struct DuplicationHash {
     buffers: usize,
     primes: Vec<u64>,
     #[cfg(target_arch = "aarch64")]
-    pair_primes: Vec<u32>,
-    #[cfg(target_arch = "aarch64")]
-    pair_bias: Vec<[u64; 8]>,
+    pair: Option<Box<duplication_neon::PairHash>>,
 }
 
 impl DuplicationHash {
-    fn positions(&self, r1: &Read, r2: Option<&Read>) -> [u64; 8] {
+    fn positions(&self, r1: &[u8], r2: Option<&[u8]>) -> [u64; 8] {
         #[cfg(target_arch = "aarch64")]
-        if self.buffers == 2 && r1.seq.len() + r2.map_or(0, |r| r.seq.len()) <= 512 {
-            // NEON is part of the aarch64 baseline. Longer reads retain the
-            // wrapping scalar algorithm, including its repeated prime table.
-            return unsafe { self.positions_two_neon(r1, r2) };
+        if let Some(table) = &self.pair {
+            if r1.len() + r2.map_or(0, <[u8]>::len) <= 512 {
+                return table.positions(r1, r2, &self.primes);
+            }
         }
         match self.buffers {
             2 => self.positions_with::<2>(r1, r2),
@@ -1195,11 +1534,11 @@ impl DuplicationHash {
         }
     }
 
-    fn positions_with<const N: usize>(&self, r1: &Read, r2: Option<&Read>) -> [u64; 8] {
+    fn positions_with<const N: usize>(&self, r1: &[u8], r2: Option<&[u8]>) -> [u64; 8] {
         let mut positions = [0u64; 8];
         let mut offset = 0;
         for r in std::iter::once(r1).chain(r2) {
-            for (p, &b) in r.seq.iter().enumerate() {
+            for (p, &b) in r.iter().enumerate() {
                 let base = match b {
                     b'A' => 7,
                     b'T' => 222,
@@ -1212,77 +1551,29 @@ impl DuplicationHash {
                     *pos = pos.wrapping_add(prime.wrapping_mul(base + (p + offset) as u64));
                 }
             }
-            offset += r.seq.len();
+            offset += r.len();
         }
         positions
-    }
-
-    #[cfg(target_arch = "aarch64")]
-    unsafe fn positions_two_neon(&self, r1: &Read, r2: Option<&Read>) -> [u64; 8] {
-        use std::arch::aarch64::*;
-        // Each load is bounded by a full 16-byte sequence chunk; the prime
-        // table covers both reads combined (at most 512 bases). Widening sums
-        // preserve the exact u64 hash rather than wrapping intermediate u32s.
-        unsafe {
-            let mut sums = [vdupq_n_u64(0); 2];
-            let mut positions = self.pair_bias[r1.seq.len() + r2.map_or(0, |r| r.seq.len())];
-            let mut offset = 0;
-            for read in std::iter::once(r1).chain(r2) {
-                let mut p = 0;
-                while p + 16 <= read.seq.len() {
-                    let bytes = vld1q_u8(read.seq.as_ptr().add(p));
-                    let mut bases = vdupq_n_u8(13);
-                    for (letter, value) in [(b'A', 7), (b'T', 222), (b'C', 74), (b'G', 31)] {
-                        bases = vbslq_u8(
-                            vceqq_u8(bytes, vdupq_n_u8(letter)),
-                            vdupq_n_u8(value),
-                            bases,
-                        );
-                    }
-                    let low = vmovl_u8(vget_low_u8(bases));
-                    let high = vmovl_high_u8(bases);
-                    let groups = [
-                        vmovl_u16(vget_low_u16(low)),
-                        vmovl_high_u16(low),
-                        vmovl_u16(vget_low_u16(high)),
-                        vmovl_high_u16(high),
-                    ];
-                    for (group, codes) in groups.into_iter().enumerate() {
-                        let primes =
-                            vld2q_u32(self.pair_primes.as_ptr().add((offset + p + group * 4) * 2));
-                        sums[0] = vpadalq_u32(sums[0], vmulq_u32(codes, primes.0));
-                        sums[1] = vpadalq_u32(sums[1], vmulq_u32(codes, primes.1));
-                    }
-                    p += 16;
-                }
-                for (p, &base) in read.seq.iter().enumerate().skip(p) {
-                    let base = match base {
-                        b'A' => 7,
-                        b'T' => 222,
-                        b'C' => 74,
-                        b'G' => 31,
-                        _ => 13,
-                    };
-                    for i in 0..2 {
-                        positions[i] += u64::from(self.pair_primes[(offset + p) * 2 + i]) * base;
-                    }
-                }
-                offset += read.seq.len();
-            }
-            for i in 0..2 {
-                positions[i] = positions[i].wrapping_add(vaddvq_u64(sums[i]));
-            }
-            positions
-        }
     }
 }
 
 struct Config {
+    packed_output: bool,
     args: Args,
-    adapters: [Option<Vec<u8>>; 2],
-    fasta: Vec<Vec<u8>>,
+    adapters: [Option<adapter::AdapterMatcher>; 2],
+    fasta: Vec<adapter::AdapterMatcher>,
     blacklist: [Vec<Vec<u8>>; 2],
     poly_g: bool,
+}
+
+impl Config {
+    fn dedup_before_filtering(&self) -> bool {
+        self.packed_output && self.args.dedup
+    }
+
+    fn profile_after_in_worker(&self) -> bool {
+        self.packed_output || (!self.args.dedup && !self.args.overrepresentation_analysis)
+    }
 }
 
 fn blacklisted(r: &Read, c: &Config, last: bool) -> bool {
@@ -1400,7 +1691,7 @@ struct Chunk<'a> {
 
 struct PackedChunk {
     output: [Vec<u8>; 3],
-    positions: Vec<[u64; 8]>,
+    positions: Vec<u64>,
     duplicates: usize,
     recycled: ReadPool,
     count: usize,
@@ -1427,24 +1718,30 @@ fn spare_output() -> Vec<u8> {
     spare.unwrap_or_default()
 }
 
+/// Return a written output buffer for a later chunk to reuse.
+fn recycle_output(mut out: Vec<u8>) {
+    if out.capacity() > 0 {
+        let mut spare = SPARE_OUTPUT.lock().unwrap_or_else(|e| e.into_inner());
+        if spare.len() < SPARE_OUTPUTS {
+            out.clear();
+            spare.push(out);
+        }
+    }
+}
+
 impl Drop for PackedChunk {
     fn drop(&mut self) {
-        let mut spare = SPARE_OUTPUT.lock().unwrap_or_else(|e| e.into_inner());
         for out in &mut self.output {
-            if out.capacity() > 0 && spare.len() < SPARE_OUTPUTS {
-                let mut out = std::mem::take(out);
-                out.clear();
-                spare.push(out);
-            }
+            recycle_output(std::mem::take(out));
         }
     }
 }
 
 impl PackedChunk {
-    fn new(records: usize, recycle_limit: usize, duplication: bool) -> Self {
+    fn new(records: usize, recycle_limit: usize, hashes: usize) -> Self {
         Self {
             output: std::array::from_fn(|_| spare_output()),
-            positions: Vec::with_capacity(if duplication { records } else { 0 }),
+            positions: Vec::with_capacity(records * hashes),
             duplicates: 0,
             recycled: ReadPool {
                 reads: Vec::with_capacity(if recycle_limit == 0 { 0 } else { records }),
@@ -1465,11 +1762,9 @@ impl PackedChunk {
         }
     }
 
-    fn add(&mut self, mut p: Processed, a: &Args, duplication: bool) {
+    fn add(&mut self, mut p: Processed, a: &Args) {
         self.count += 1;
-        if duplication {
-            self.positions.push(p.duplicate_positions);
-        }
+        self.duplicates += usize::from(p.duplicate);
         if !p.skipped {
             self.adapter_reads += p.adapter_reads;
             self.adapter_bases += p.adapter_bases;
@@ -1489,7 +1784,7 @@ impl PackedChunk {
             }
             if let Some(merged) = &p.merged {
                 self.failures[p.failures[0] as usize] += 2;
-                if p.failures[0] == Failure::Pass {
+                if p.failures[0] == Failure::Pass && !p.duplicate {
                     self.merged_pairs += 1;
                     if a.stdout || a.merged_out.is_some() {
                         merged
@@ -1501,7 +1796,10 @@ impl PackedChunk {
                 for (i, read) in p.reads.iter().enumerate() {
                     if let Some(read) = read {
                         self.failures[p.failures[i] as usize] += 1;
-                        if p.failures[i] == Failure::Pass && (a.stdout || a.merged_out.is_some()) {
+                        if p.failures[i] == Failure::Pass
+                            && !p.duplicate
+                            && (a.stdout || a.merged_out.is_some())
+                        {
                             read.write(&mut self.output[2], None)
                                 .expect("writing to Vec cannot fail");
                         }
@@ -1514,7 +1812,7 @@ impl PackedChunk {
                     p.failures[0]
                 };
                 self.failures[failure as usize] += if paired { 2 } else { 1 };
-                if failure == Failure::Pass {
+                if failure == Failure::Pass && !p.duplicate {
                     for (i, read) in p.reads.iter().enumerate() {
                         if let Some(read) = read {
                             if (a.stdout && !a.merge)
@@ -1534,11 +1832,7 @@ impl PackedChunk {
         }
         if self.recycled.limit > 0 {
             if let Some(first) = p.reads[0].take() {
-                let mut pair = (first, p.reads[1].take());
-                for read in std::iter::once(&mut pair.0).chain(pair.1.iter_mut()) {
-                    read.original = None;
-                    read.track_changes = false;
-                }
+                let pair = (first, p.reads[1].take());
                 self.recycled
                     .put((pair.0.into_owned(), pair.1.map(Read::into_owned)));
             }
@@ -1547,8 +1841,7 @@ impl PackedChunk {
 }
 
 fn pack_main_output(a: &Args) -> bool {
-    !a.dedup
-        && !a.overrepresentation_analysis
+    !a.overrepresentation_analysis
         && a.output != "-"
         && a.output2.as_deref() != Some("-")
         // Shared destinations (including the same S3 key) need interleaved
@@ -1567,23 +1860,35 @@ fn pack_main_output(a: &Args) -> bool {
 
 fn mark_duplicates(chunks: &mut [Chunk], duplication: Option<&mut Duplication>) {
     if let Some(duplication) = duplication {
+        if chunks.iter().all(|chunk| chunk.packed.is_some()) {
+            let positions: Vec<&[u64]> = chunks
+                .iter()
+                .flat_map(|chunk| &chunk.packed)
+                .map(|packed| packed.positions.as_slice())
+                .collect();
+            let counts = duplication.count_chunks(&positions);
+            for (chunk, count) in chunks.iter_mut().zip(counts) {
+                if let Some(packed) = &mut chunk.packed {
+                    packed.duplicates += count;
+                }
+            }
+            return;
+        }
         for chunk in chunks {
             if let Some(packed) = &mut chunk.packed {
-                for &positions in &packed.positions {
-                    packed.duplicates += usize::from(duplication.check_positions(positions));
-                }
+                packed.duplicates += duplication.count_packed(&packed.positions);
             } else {
                 for p in &mut chunk.processed {
-                    p.duplicate = duplication.check_positions(p.duplicate_positions);
+                    p.duplicate = duplication.check_positions(&p.duplicate_positions);
                 }
             }
         }
     }
 }
 
-fn trim_adapter(r: &mut Read, seq: &[u8], min: usize) -> Option<usize> {
+fn trim_adapter(r: &mut Read, seq: &adapter::AdapterMatcher, min: usize) -> Option<usize> {
     let before = r.seq.len();
-    let found = adapter::find_adapter(&r.seq, seq, min, usize::MAX)?;
+    let found = seq.find(&r.seq, min)?;
     r.resize(found.position);
     Some(if found.is_atailing {
         found.overlap_len
@@ -1650,7 +1955,7 @@ fn process<'a>(
         for r in std::iter::once(&mut r1).chain(r2.iter_mut()) {
             if r.name.ends_with(b"/1") || r.name.ends_with(b"/2") {
                 let pos = r.name.len() - 2;
-                r.name.to_mut().insert(pos, b' ');
+                r.name_mut().insert(pos, b' ');
             }
         }
     }
@@ -1700,8 +2005,8 @@ fn process<'a>(
     // Exact overlaps need no correction or mutable copies.
     if a.correction && ov.as_ref().is_some_and(|o| o.diff > 0) {
         if let (Some(r2), Some(ov)) = (r2.as_mut(), ov.as_ref()) {
-            r1.save_original();
-            r2.save_original();
+            r1.verbatim = None;
+            r2.verbatim = None;
             let seq1 = r1.seq.clone();
             let seq2 = r2.seq.clone();
             let correction = overlap::correct_by_overlap(
@@ -1837,9 +2142,53 @@ fn process<'a>(
 }
 
 struct ReadBatch {
+    duplicate_flags: Option<Vec<bool>>,
     raw: Option<[block::Records; 2]>,
     reads: Vec<(Read<'static>, Option<Read<'static>>)>,
     start: usize,
+}
+
+impl ReadBatch {
+    fn mark_duplicates(&mut self, shared: &Shared, filter: &mut Duplication) {
+        let positions = self.duplicate_positions(shared);
+        self.duplicate_flags = Some(filter.check_batch(&positions));
+    }
+
+    /// The duplicate filter's hash positions for every read, or pair.
+    fn duplicate_positions(&self, shared: &Shared) -> Vec<[u64; 8]> {
+        let raw = self
+            .raw
+            .as_ref()
+            .expect("packed output uses raw FASTQ batches");
+        let hasher = shared
+            .hasher
+            .as_ref()
+            .expect("deduplication requires hashes");
+        let interleaved = shared.config.args.interleaved_in;
+        let stride = if interleaved { 2 } else { 1 };
+        // Hash original sequences in parallel; they are marked in input order
+        // so the first occurrence still wins across worker and batch
+        // boundaries.
+        shared.pool().install(|| {
+            (0..raw[0].len() / stride)
+                .into_par_iter()
+                // A hash takes well under a microsecond: split no finer than
+                // a few hundred reads, or handing out the work costs more
+                // than doing it.
+                .with_min_len(256)
+                .map(|i| {
+                    let mate = if interleaved {
+                        Some(raw[0].sequence(2 * i + 1))
+                    } else if raw[1].len() > 0 {
+                        Some(raw[1].sequence(i))
+                    } else {
+                        None
+                    };
+                    hasher.positions(raw[0].sequence(i * stride), mate)
+                })
+                .collect()
+        })
+    }
 }
 
 struct BatchReader {
@@ -1861,15 +2210,16 @@ impl BatchReader {
         if self.eof || (self.limit != 0 && self.count >= self.limit) {
             return Ok(None);
         }
+        let stride = if self.interleaved { 2 } else { 1 };
         if let Some(mut batch) = self.sampled_raw.pop_front() {
             let raw = batch.raw.as_mut().unwrap();
             if self.limit != 0 {
-                for mate in raw.iter_mut() {
-                    mate.truncate(self.limit - self.count);
-                }
+                let remaining = self.limit - self.count;
+                raw[0].truncate(remaining.saturating_mul(stride));
+                raw[1].truncate(remaining);
             }
             batch.start = self.count;
-            self.count += raw[0].len();
+            self.count += raw[0].len() / stride;
             return Ok(Some(batch));
         }
         if self.raw && self.sampled.len() == 0 {
@@ -1893,8 +2243,9 @@ impl BatchReader {
                 return Ok(None);
             };
             let start = self.count;
-            self.count += raw[0].len() / if self.interleaved { 2 } else { 1 };
+            self.count += raw[0].len() / stride;
             return Ok(Some(ReadBatch {
+                duplicate_flags: None,
                 raw: Some(raw),
                 reads: Vec::new(),
                 start,
@@ -1961,6 +2312,7 @@ impl BatchReader {
         let start = self.count;
         self.count += batch.len();
         Ok(Some(ReadBatch {
+            duplicate_flags: None,
             raw: None,
             reads: batch,
             start,
@@ -1976,11 +2328,12 @@ fn process_chunk<'a>(
     before: &[Sample; 2],
     after: &[Sample; 2],
     duplication: Option<&DuplicationHash>,
+    duplicate_flags: Option<&[bool]>,
     recycle_limit: usize,
 ) -> Result<Chunk<'a>> {
     let a = &config.args;
-    let profile_after_in_worker = !a.dedup && !a.overrepresentation_analysis;
-    let packed_output = pack_main_output(a);
+    let profile_after_in_worker = config.profile_after_in_worker();
+    let packed_output = config.packed_output;
     let shared_stats = packed_output && !a.merge;
     let mut shared: [Sample; 2] = std::array::from_fn(|_| Sample::default());
     let mut chunk = Chunk {
@@ -1988,51 +2341,55 @@ fn process_chunk<'a>(
         after: std::array::from_fn(|i| after[i].empty_like()),
         after_offset: [0; 2],
         processed: Vec::with_capacity(if packed_output { 0 } else { records }),
-        packed: packed_output
-            .then(|| PackedChunk::new(records, recycle_limit, duplication.is_some())),
+        packed: packed_output.then(|| {
+            PackedChunk::new(records, recycle_limit, duplication.map_or(0, |d| d.buffers))
+        }),
     };
     let mut overlap_scratch = Vec::new();
     for (index, pair) in pairs.enumerate() {
-        let (mut r1, mut r2) = pair?;
+        let (r1, r2) = pair?;
         let ordinal = start + index;
-        if shared_stats {
-            r1.track_changes = true;
-            if let Some(r2) = &mut r2 {
-                r2.track_changes = true;
-            }
-        } else {
-            chunk.before[0].add_at(&r1, a.no_kmer, ordinal);
-            if let Some(r2) = &r2 {
-                chunk.before[1].add_at(r2, a.no_kmer, ordinal);
+        let mut original = [None; 2];
+        for (i, r) in [Some(&r1), r2.as_ref()].into_iter().enumerate() {
+            if let Some(r) = r {
+                if shared_stats {
+                    original[i] = r.borrowed_bases();
+                }
+                if original[i].is_none() {
+                    chunk.before[i].add_at(r, a.no_kmer, ordinal);
+                }
             }
         }
         let positions = duplication
             .as_ref()
-            .map(|d| d.positions(&r1, r2.as_ref()))
+            .map(|d| d.positions(&r1.seq, r2.as_ref().map(|r| r.seq.as_ref())))
             .unwrap_or([0; 8]);
         let mut p = process(r1, r2, &config, &mut overlap_scratch);
-        p.duplicate_positions = positions;
+        p.duplicate = duplicate_flags.is_some_and(|flags| flags[index]);
         if shared_stats {
-            let passing = !p.skipped && p.failures.iter().all(|f| *f == Failure::Pass);
+            let passing =
+                !p.duplicate && !p.skipped && p.failures.iter().all(|f| *f == Failure::Pass);
             for (i, r) in p
                 .reads
                 .iter()
                 .enumerate()
                 .filter_map(|(i, r)| r.as_ref().map(|r| (i, r)))
             {
-                if passing && r.original.is_none() {
-                    // The same bases and qualities contribute to both
-                    // reports. Count them once, then merge the totals.
-                    shared[i].add_at(r, a.no_kmer, ordinal);
-                } else {
-                    if let Some(original) = &r.original {
-                        chunk.before[i].add_parts(&original.0, &original.1, a.no_kmer, ordinal);
-                    } else {
-                        chunk.before[i].add_at(r, a.no_kmer, ordinal);
+                if let Some((seq, qual)) = original[i] {
+                    // A borrowed slice with the same start is an unchanged
+                    // prefix, even when trimming has shortened its tail.
+                    if passing && r.seq.as_ptr() == seq.as_ptr() && r.qual.as_ptr() == qual.as_ptr()
+                    {
+                        shared[i].add_at(r, a.no_kmer, ordinal);
+                        if r.seq.len() < seq.len() {
+                            chunk.before[i].add_removed_tail(seq, qual, r.seq.len(), a.no_kmer);
+                        }
+                        continue;
                     }
-                    if passing {
-                        chunk.after[i].add_at(r, a.no_kmer, 0);
-                    }
+                    chunk.before[i].add_parts(seq, qual, a.no_kmer, ordinal);
+                }
+                if passing {
+                    chunk.after[i].add_at(r, a.no_kmer, 0);
                 }
             }
         } else if profile_after_in_worker {
@@ -2041,8 +2398,12 @@ fn process_chunk<'a>(
             }
         }
         if let Some(packed) = &mut chunk.packed {
-            packed.add(p, a, duplication.is_some());
+            if let Some(d) = duplication {
+                packed.positions.extend_from_slice(&positions[..d.buffers]);
+            }
+            packed.add(p, a);
         } else {
+            p.duplicate_positions = positions;
             chunk.processed.push(p);
         }
     }
@@ -2064,7 +2425,12 @@ fn process_batch(
     duplication: Option<&DuplicationHash>,
     recycle_limit: usize,
 ) -> Result<Vec<Chunk<'static>>> {
-    let ReadBatch { raw, reads, start } = batch;
+    let ReadBatch {
+        raw,
+        reads,
+        start,
+        duplicate_flags: flags,
+    } = batch;
     let threads = pool.current_num_threads();
     let interleaved = config.args.interleaved_in;
     let stride = if interleaved { 2 } else { 1 };
@@ -2076,6 +2442,7 @@ fn process_batch(
     // per-chunk overhead.
     let chunks = (count / 4000).clamp(threads, 4 * threads);
     let chunk_size = count.div_ceil(chunks).max(1);
+    let duplication = if flags.is_some() { None } else { duplication };
     let results: Vec<Result<Chunk<'static>>> = pool.install(|| {
         if let Some(raw) = raw {
             (0..count.div_ceil(chunk_size))
@@ -2103,6 +2470,7 @@ fn process_batch(
                         before,
                         after,
                         duplication,
+                        flags.as_ref().map(|flags| &flags[offset..end]),
                         0,
                     )?;
                     // Borrowed input is used only for packed output. All output
@@ -2132,6 +2500,7 @@ fn process_batch(
                         before,
                         after,
                         duplication,
+                        None,
                         recycle_limit / threads,
                     )
                 })
@@ -2144,6 +2513,11 @@ fn process_batch(
 }
 
 struct Output {
+    #[cfg(feature = "native")]
+    paired_gzip: Option<paired_gzip::PairedGzip>,
+    /// Uncompressed local files that are not split, written on their own threads.
+    #[cfg(feature = "native")]
+    direct: BTreeMap<String, direct_writer::DirectWriter>,
     writers: BTreeMap<String, split::SplitWriter>,
     scratch: Vec<u8>,
     compression_threads: usize,
@@ -2151,7 +2525,7 @@ struct Output {
 
 impl Output {
     fn new(a: &Args) -> Self {
-        let gzip_outputs = [
+        let compressed_outputs = [
             Some(a.output.as_str()),
             a.output2.as_deref(),
             a.merged_out.as_deref(),
@@ -2165,17 +2539,65 @@ impl Output {
         .filter(|path| {
             !crate::io::is_s3_path(path)
                 && crate::io::CompressionFormat::from_path(path)
-                    == crate::io::CompressionFormat::Gzip
+                    != crate::io::CompressionFormat::None
         })
         .collect::<std::collections::BTreeSet<_>>()
         .len();
         Self {
+            #[cfg(feature = "native")]
+            paired_gzip: None,
+            #[cfg(feature = "native")]
+            direct: BTreeMap::new(),
             writers: BTreeMap::new(),
             scratch: Vec::new(),
-            compression_threads: crate::io::threads_per_output(gzip_outputs),
+            compression_threads: crate::io::threads_per_output(compressed_outputs),
         }
     }
+    fn open_main(&mut self, a: &Args, split: &split::SplitConfig) -> Result<()> {
+        #[cfg(feature = "native")]
+        if let Some(second) = a.output2.as_deref() {
+            let paths = [a.output.as_str(), second];
+            if a.parallel_compression
+                && !a.merge
+                && pack_main_output(a)
+                && paths.iter().all(|p| {
+                    !io::is_s3_path(p)
+                        && io::CompressionFormat::from_path(p) == io::CompressionFormat::Gzip
+                })
+            {
+                self.paired_gzip = Some(paired_gzip::PairedGzip::new(
+                    paths,
+                    a.compression_level.unwrap_or(4),
+                    2 * self.compression_threads,
+                )?);
+                return Ok(());
+            }
+        }
+        for path in [Some(a.output.as_str()), a.output2.as_deref()]
+            .into_iter()
+            .flatten()
+        {
+            self.open(path, a, split.clone())?;
+        }
+        Ok(())
+    }
     fn open(&mut self, path: &str, a: &Args, config: split::SplitConfig) -> Result<()> {
+        #[cfg(feature = "native")]
+        if self.direct.contains_key(path) {
+            return Ok(());
+        }
+        #[cfg(feature = "native")]
+        if !path.is_empty()
+            && path != "-"
+            && !self.writers.contains_key(path)
+            && matches!(config.mode, split::SplitMode::None)
+            && !io::is_s3_path(path)
+            && io::CompressionFormat::from_path(path) == io::CompressionFormat::None
+        {
+            let writer = direct_writer::DirectWriter::create(path, recycle_output)?;
+            self.direct.insert(path.into(), writer);
+            return Ok(());
+        }
         if !path.is_empty() && !self.writers.contains_key(path) {
             self.writers.insert(
                 path.into(),
@@ -2191,6 +2613,12 @@ impl Output {
         Ok(())
     }
     fn write(&mut self, path: Option<&str>, read: &Read, tag: Option<&str>) -> Result<()> {
+        #[cfg(feature = "native")]
+        if let Some(writer) = path.and_then(|p| self.direct.get_mut(p)) {
+            self.scratch.clear();
+            read.write(&mut self.scratch, tag)?;
+            return writer.write(&self.scratch);
+        }
         if let Some(writer) = path.and_then(|p| self.writers.get_mut(p)) {
             self.scratch.clear();
             read.write(&mut self.scratch, tag)?;
@@ -2198,13 +2626,40 @@ impl Output {
         }
         Ok(())
     }
-    fn write_packed(&mut self, path: Option<&str>, bytes: &[u8]) -> Result<()> {
+    fn write_packed_mates(
+        &mut self,
+        paths: [Option<&str>; 2],
+        data: [&mut Vec<u8>; 2],
+    ) -> Result<()> {
+        #[cfg(feature = "native")]
+        if let Some(pair) = &mut self.paired_gzip {
+            pair.write(0, data[0])?;
+            return pair.write(1, data[1]);
+        }
+        let [first, second] = data;
+        self.write_packed(paths[0], first)?;
+        self.write_packed(paths[1], second)
+    }
+    /// A direct writer takes the buffer itself; the chunk recycles an empty one.
+    fn write_packed(&mut self, path: Option<&str>, bytes: &mut Vec<u8>) -> Result<()> {
+        #[cfg(feature = "native")]
+        if let Some(writer) = path.and_then(|p| self.direct.get_mut(p)) {
+            return writer.write_owned(std::mem::take(bytes));
+        }
         if let Some(writer) = path.and_then(|p| self.writers.get_mut(p)) {
             writer.write_all(bytes)?;
         }
         Ok(())
     }
     fn finish(self) -> Result<()> {
+        #[cfg(feature = "native")]
+        if let Some(pair) = self.paired_gzip {
+            pair.finish()?;
+        }
+        #[cfg(feature = "native")]
+        for (_, w) in self.direct {
+            w.finish()?;
+        }
         for (_, w) in self.writers {
             w.finish()?;
         }
@@ -2227,6 +2682,23 @@ fn wasm_pool() -> Result<&'static rayon::ThreadPool> {
         .use_current_thread()
         .build()?;
     Ok(POOL.get_or_init(|| pool))
+}
+
+/// Stack for each worker. A worker that waits for part of a batch runs other
+/// chunks meanwhile, on the same stack, and with two batches in flight it
+/// can start the next batch there too. Each level holds a chunk's statistics,
+/// about 240 KiB; eleven levels deep was seen, past the 2 MiB a thread gets
+/// by default. This covers one level for every chunk of both batches. Only
+/// the pages a worker touches are ever backed by memory.
+#[cfg(not(target_arch = "wasm32"))]
+const WORKER_STACK: usize = 64 << 20;
+
+#[cfg(not(target_arch = "wasm32"))]
+fn worker_pool(threads: usize) -> Result<rayon::ThreadPool> {
+    Ok(rayon::ThreadPoolBuilder::new()
+        .num_threads(threads)
+        .stack_size(WORKER_STACK)
+        .build()?)
 }
 
 fn worker_threads(a: &Args) -> usize {
@@ -2681,7 +3153,23 @@ impl Shared {
     fn pool(&self) -> &rayon::ThreadPool {
         &self.pool
     }
+
+    fn process(&self, batch: ReadBatch) -> ProcessedBatch {
+        let [before, after] = &self.templates;
+        process_batch(
+            batch,
+            self.pool(),
+            &self.config,
+            before,
+            after,
+            self.hasher.as_ref(),
+            self.recycle_limit,
+        )
+    }
 }
+
+/// Batches whose reads are hashed for duplicate marking at one time.
+const HASHES_IN_FLIGHT: usize = 3;
 
 type ProcessedBatch = Result<Vec<Chunk<'static>>>;
 
@@ -2730,6 +3218,79 @@ impl Pipeline {
                 }
             }
         })];
+        let input_rx = if shared.config.dedup_before_filtering() {
+            let mut filter = duplication.take().expect("deduplication requires a filter");
+            let shared = Arc::clone(shared);
+            let (ready, prepared) = crossbeam_channel::bounded(1);
+            threads.push(std::thread::spawn(move || {
+                // Marking must follow input order on one thread, but hashing
+                // need not. Hashing a batch only when its turn came left this
+                // thread waiting for the pool on every batch, and it was the
+                // slowest stage. The next batches are hashed on the pool
+                // while this one is marked.
+                let in_flight = if shared.pool().current_num_threads() > 4 {
+                    HASHES_IN_FLIGHT
+                } else {
+                    1
+                };
+                type Hashed = Result<(ReadBatch, Vec<[u64; 8]>)>;
+                type Running = crossbeam_channel::Receiver<std::thread::Result<Hashed>>;
+                let mut running: VecDeque<Running> = VecDeque::with_capacity(in_flight);
+                let mut input = input_rx.into_iter();
+                let mut reading = true;
+                loop {
+                    while reading && running.len() < in_flight {
+                        let Some(batch) = input.next() else {
+                            reading = false;
+                            break;
+                        };
+                        let (done, result) = crossbeam_channel::bounded(1);
+                        match batch {
+                            Ok(batch) => {
+                                let job = Arc::clone(&shared);
+                                shared.pool().spawn(move || {
+                                    let hashed = std::panic::catch_unwind(
+                                        std::panic::AssertUnwindSafe(|| {
+                                            let positions = batch.duplicate_positions(&job);
+                                            Ok((batch, positions))
+                                        }),
+                                    );
+                                    let _ = done.send(hashed);
+                                });
+                            }
+                            Err(error) => {
+                                reading = false;
+                                let _ = done.send(Ok(Err(error)));
+                            }
+                        }
+                        running.push_back(result);
+                    }
+                    let Some(next) = running.pop_front() else {
+                        break;
+                    };
+                    let hashed = match next.recv() {
+                        Ok(Ok(hashed)) => hashed,
+                        Ok(Err(panic)) => std::panic::resume_unwind(panic),
+                        Err(_) => unreachable!("a hashing job always reports"),
+                    };
+                    let result = hashed.map(|(mut batch, positions)| {
+                        batch.duplicate_flags = Some(filter.check_batch(&positions));
+                        batch
+                    });
+                    let failed = result.is_err();
+                    if ready.send(result).is_err() || failed {
+                        break;
+                    }
+                }
+                // Let started jobs finish before the pipeline reports it stopped.
+                for next in running {
+                    let _ = next.recv();
+                }
+            }));
+            prepared
+        } else {
+            input_rx
+        };
         let processed_tx = if duplication.is_some() {
             let (duplicate_tx, duplicate_rx) = crossbeam_channel::bounded::<ProcessedBatch>(1);
             threads.push(std::thread::spawn(move || {
@@ -2750,23 +3311,60 @@ impl Pipeline {
         };
         let shared = Arc::clone(shared);
         threads.push(std::thread::spawn(move || {
-            for batch in input_rx {
-                let result = batch.and_then(|b| {
-                    let [before, after] = &shared.templates;
-                    process_batch(
-                        b,
-                        shared.pool(),
-                        &shared.config,
-                        before,
-                        after,
-                        shared.hasher.as_ref(),
-                        shared.recycle_limit,
-                    )
-                });
+            // A batch waits for its slowest chunk, often one on an efficiency
+            // core. Starting the next batch meanwhile gives idle workers its
+            // chunks. Results still leave in input order. A few workers are
+            // never idle for long, and a second batch only costs memory.
+            let in_flight = if shared.pool().current_num_threads() > 4 {
+                2
+            } else {
+                1
+            };
+            type Running = crossbeam_channel::Receiver<std::thread::Result<ProcessedBatch>>;
+            let mut running: VecDeque<Running> = VecDeque::with_capacity(in_flight);
+            let mut input = input_rx.into_iter();
+            let mut reading = true;
+            loop {
+                while reading && running.len() < in_flight {
+                    let Some(batch) = input.next() else {
+                        reading = false;
+                        break;
+                    };
+                    let (done, result) = crossbeam_channel::bounded(1);
+                    match batch {
+                        Ok(batch) => {
+                            let job = Arc::clone(&shared);
+                            shared.pool().spawn(move || {
+                                let result =
+                                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                        job.process(batch)
+                                    }));
+                                let _ = done.send(result);
+                            });
+                        }
+                        Err(error) => {
+                            reading = false;
+                            let _ = done.send(Ok(Err(error)));
+                        }
+                    }
+                    running.push_back(result);
+                }
+                let Some(next) = running.pop_front() else {
+                    break;
+                };
+                let result = match next.recv() {
+                    Ok(Ok(result)) => result,
+                    Ok(Err(panic)) => std::panic::resume_unwind(panic),
+                    Err(_) => unreachable!("a processing job always reports"),
+                };
                 let failed = result.is_err();
                 if processed_tx.send(result).is_err() || failed {
                     break;
                 }
+            }
+            // Let started jobs finish before the pipeline reports it stopped.
+            for next in running {
+                let _ = next.recv();
             }
         }));
         Self {
@@ -2885,15 +3483,29 @@ impl Engine {
         } else {
             None
         };
-        // Decoding one large member in parallel costs about 2.5 times zlib's CPU
-        // per byte, so it pays off only when decoding limits the run: a single
-        // input (a second brings its own decoder and the compressors need the
-        // cores) whose output is not gzip, or whose qualities are binned, which
-        // makes compressing the output cheap. Otherwise the extra CPU comes out
-        // of processing and compression.
-        let gzip_out = io::CompressionFormat::from_path(&a.output) == io::CompressionFormat::Gzip;
+        // Decoding one large member in parallel costs more CPU per byte than
+        // zlib and holds the regions in flight in memory, so it pays off only
+        // when decoding limits the run. For a single input that is output
+        // that is not gzip, or binned qualities, which make compressing the
+        // output cheap, or enough cores that compression leaves some idle
+        // (measured on 14: 10% faster). Paired inputs share the decoding
+        // threads and need uncompressed output: with two decoders already
+        // running, compression limits the run first.
+        let output = io::CompressionFormat::from_path(&a.output);
+        let split = if a.input2.is_none() {
+            output != io::CompressionFormat::Gzip
+                || num_cpus::get() >= 12
+                || io::binned_gzip_input(&a.input)
+        } else {
+            output == io::CompressionFormat::None
+        };
         io::set_split_decoding(
-            a.input2.is_none() && (!gzip_out || io::binned_gzip_input(&a.input)),
+            if split {
+                1 + usize::from(a.input2.is_some())
+            } else {
+                0
+            },
+            output != io::CompressionFormat::None,
         );
         let mut reader1 = Reader::open(&a.input, a.phred64)?;
         let mut reader2 = a
@@ -2913,9 +3525,7 @@ impl Engine {
                 .all(|path| std::fs::metadata(path).is_ok_and(|m| m.is_file()));
         // Borrowed parsing also works synchronously. Only reading ahead requires
         // regular files; pipes must stay on this thread for prompt cancellation.
-        // Interleaved stdin has no evaluation prefix. Keep local interleaved
-        // sampling on the owned path until that separate path is generalized.
-        let raw_input = pack_main_output(&a) && (!a.interleaved_in || a.input == "-");
+        let raw_input = pack_main_output(&a);
         // Read once and retain the sample: this works for pipes, HTTP, and S3 too.
         let auto = |seq: &Option<String>| seq.as_deref().is_none_or(|s| s == "auto");
         let needs_adapter_sample = !a.disable_adapter_trimming
@@ -2938,28 +3548,42 @@ impl Engine {
         let mut sample_count = 0;
         if raw_input {
             while sample_count < sample_limit && sample_bases < 151 * 256 * 1024 {
-                let Some(blocks) = block::read_sample_batch(
-                    &mut reader1,
-                    reader2.as_mut(),
-                    a.batch_bytes.min(2 * 1024 * 1024),
-                    sample_limit - sample_count,
-                    151 * 256 * 1024 - sample_bases,
-                )?
-                else {
-                    break;
+                let budget = a.batch_bytes.min(2 * 1024 * 1024);
+                let remaining = sample_limit - sample_count;
+                let base_limit = 151 * 256 * 1024 - sample_bases;
+                let block = if a.interleaved_in {
+                    block::read_sample_batch::<true>(
+                        &mut reader1,
+                        None,
+                        budget,
+                        remaining,
+                        base_limit,
+                    )?
+                } else {
+                    block::read_sample_batch::<false>(
+                        &mut reader1,
+                        reader2.as_mut(),
+                        budget,
+                        remaining,
+                        base_limit,
+                    )?
                 };
+                let Some(blocks) = block else { break };
+                let stride = if a.interleaved_in { 2 } else { 1 };
+                // Validate the entire evaluation sample even when a read limit
+                // later selects only its prefix. The base budget counts R1 only.
                 for index in 0..blocks[0].len() {
-                    // Preserve validation of the entire evaluation sample, including
-                    // when --reads_to_process subsequently processes only its prefix.
-                    for mate in &blocks {
-                        if mate.len() > 0 {
-                            mate.read(index, sample_count + index, a.phred64)?;
-                        }
+                    blocks[0].read(index, sample_count * stride + index, a.phred64)?;
+                    if blocks[1].len() > 0 {
+                        blocks[1].read(index, sample_count + index, a.phred64)?;
                     }
-                    sample_bases += blocks[0].sequence(index).len();
+                    if index % stride == 0 {
+                        sample_bases += blocks[0].sequence(index).len();
+                    }
                 }
-                sample_count += blocks[0].len();
+                sample_count += blocks[0].len() / stride;
                 sampled_raw.push_back(ReadBatch {
+                    duplicate_flags: None,
                     raw: Some(blocks),
                     reads: Vec::new(),
                     start: 0,
@@ -3011,10 +3635,17 @@ impl Engine {
         let sample_sequences = |mate: usize| -> Vec<&[u8]> {
             if raw_input {
                 sampled_raw
-                    .iter()
-                    .flat_map(|b| {
-                        let records = &b.raw.as_ref().unwrap()[mate];
-                        (0..records.len()).map(|i| records.sequence(i))
+                    .par_iter()
+                    .flat_map_iter(|b| {
+                        let blocks = b.raw.as_ref().unwrap();
+                        let (records, start, stride) = if a.interleaved_in {
+                            (&blocks[0], mate, 2)
+                        } else {
+                            (&blocks[mate], 0, 1)
+                        };
+                        (start..records.len())
+                            .step_by(stride)
+                            .map(|i| records.sequence(i))
                     })
                     .collect()
             } else {
@@ -3032,9 +3663,7 @@ impl Engine {
         };
         let threads = worker_threads(&a);
         #[cfg(not(target_arch = "wasm32"))]
-        let owned_pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(threads)
-            .build()?;
+        let owned_pool = worker_pool(threads)?;
         #[cfg(not(target_arch = "wasm32"))]
         let pool = &owned_pool;
         #[cfg(target_arch = "wasm32")]
@@ -3086,9 +3715,13 @@ impl Engine {
             a.batch_bytes
         };
         let config = Config {
+            packed_output: raw_input,
             args: a,
-            adapters,
-            fasta,
+            adapters: adapters.map(|a| a.map(adapter::AdapterMatcher::new)),
+            fasta: fasta
+                .into_iter()
+                .map(adapter::AdapterMatcher::new)
+                .collect(),
             blacklist,
             poly_g,
         };
@@ -3104,12 +3737,7 @@ impl Engine {
             prefix_digits: a.split_prefix_digits,
         };
         let mut out = Output::new(a);
-        for path in [Some(a.output.as_str()), a.output2.as_deref()]
-            .into_iter()
-            .flatten()
-        {
-            out.open(path, a, split.clone())?;
-        }
+        out.open_main(a, &split)?;
         for path in [
             a.merged_out.as_deref(),
             a.unpaired1.as_deref(),
@@ -3172,7 +3800,7 @@ impl Engine {
                     .map(|r| r.seq.len())
                     .max()
                     .unwrap_or(0);
-                let candidates = Overrep::candidates(reads.iter().copied(), len);
+                let candidates = Overrep::candidates(&reads, len);
                 stats.before[i].overrep = Some(Overrep::new(
                     &candidates,
                     len,
@@ -3191,7 +3819,7 @@ impl Engine {
         // Compact synchronous jobs use the same batch ceiling as the pipeline,
         // limiting serial parsing work before each parallel processing step.
         // Smaller batches leave the worker pool waiting between them.
-        let max_bytes = if pipelined || pack_main_output(a) {
+        let max_bytes = if pipelined || config.packed_output {
             max_bytes.min(8 * 1024 * 1024)
         } else {
             max_bytes
@@ -3268,17 +3896,17 @@ impl Engine {
                 None => return Ok(false),
             },
             Source::Serial(reader) => match reader.next_batch()? {
-                Some(batch) => {
-                    let [before, after] = &shared.templates;
-                    process_batch(
-                        batch,
-                        shared.pool(),
-                        &shared.config,
-                        before,
-                        after,
-                        shared.hasher.as_ref(),
-                        shared.recycle_limit,
-                    )?
+                Some(mut batch) => {
+                    let mut filter = self.duplication.as_mut();
+                    if shared.config.dedup_before_filtering() {
+                        batch.mark_duplicates(
+                            &shared,
+                            filter.take().expect("deduplication requires a filter"),
+                        );
+                    }
+                    let mut chunks = shared.process(batch)?;
+                    mark_duplicates(&mut chunks, filter);
+                    chunks
                 }
                 None => return Ok(false),
             },
@@ -3294,16 +3922,13 @@ impl Engine {
             targets.main2.as_deref(),
             targets.merged.as_deref(),
         );
-        if let Source::Serial(..) = self.source {
-            mark_duplicates(&mut chunks, self.duplication.as_mut());
-        }
         let mut read_pool = ReadPool {
             reads: Vec::with_capacity(chunks.iter().map(|c| c.processed.len()).sum()),
             limit: max_bytes,
             ..ReadPool::default()
         };
         let mut read_pools = Vec::with_capacity(chunks.len() + 1);
-        let profile_after_in_worker = !a.dedup && !a.overrepresentation_analysis;
+        let profile_after_in_worker = shared.config.profile_after_in_worker();
         // Bloom decisions remain ordered. Determine global after-filter indices
         // before parallel profiling so sampling is independent of chunk boundaries.
         let mut offsets = std::array::from_fn(|i| stats.after[i].simple.total_reads);
@@ -3339,9 +3964,9 @@ impl Engine {
                 dst.merge(src);
             }
             if let Some(mut packed) = chunk.packed {
-                out.write_packed(main1, &packed.output[0])?;
-                out.write_packed(main2, &packed.output[1])?;
-                out.write_packed(merged, &packed.output[2])?;
+                let [first, second, third] = &mut packed.output;
+                out.write_packed_mates([main1, main2], [first, second])?;
+                out.write_packed(merged, third)?;
                 stats.count += packed.count;
                 stats.merged_pairs += packed.merged_pairs;
                 stats.duplicates += packed.duplicates;
@@ -3666,6 +4291,62 @@ mod tests {
     use super::*;
 
     #[test]
+    fn workers_have_room_for_nested_batches() {
+        #[inline(never)]
+        fn descend(levels: usize) -> usize {
+            // One level's worth of chunk statistics.
+            let frame = std::hint::black_box([1u8; 240 << 10]);
+            if levels == 0 {
+                return frame[0] as usize;
+            }
+            descend(levels - 1) + frame[frame.len() - 1] as usize
+        }
+        // Four times the deepest nesting seen with two batches in flight.
+        let pool = worker_pool(2).unwrap();
+        assert_eq!(pool.install(|| descend(44)), 45);
+    }
+
+    #[test]
+    fn overrep_counts_repeated_window_lengths_and_excludes_final_window() {
+        let read = Read {
+            seq: Cow::Borrowed(b"AAAAAAAAAACC"),
+            ..Read::default()
+        };
+        let reads = vec![&read; 250];
+        // For twelve cycles the length-dependent step and fixed ten-base
+        // step are equal. Both contribute toward the discovery threshold.
+        assert_eq!(
+            Overrep::candidates(&reads, 12),
+            BTreeMap::from([(b"AAAAAAAAAA".to_vec(), 500), (b"AAAAAAAAAC".to_vec(), 500)])
+        );
+    }
+
+    #[test]
+    fn overrep_bucket_collisions_still_require_exact_counts() {
+        // The 20-base keys share both eight-byte ends and therefore a bucket.
+        // Only the first key reaches the threshold of 100. The trailing byte
+        // gives each read exactly one eligible 20-base window.
+        let reads: Vec<_> = (0..5000)
+            .map(|i| {
+                let mut seq = b"ACGTACGTAAAAACGTACGTN".to_vec();
+                if i >= 100 {
+                    let key = 1 + (i - 100) % 255;
+                    for (j, base) in seq[8..12].iter_mut().enumerate() {
+                        *base = b"ACGT"[(key >> (2 * j)) & 3];
+                    }
+                }
+                Read {
+                    seq: Cow::Owned(seq),
+                    ..Read::default()
+                }
+            })
+            .collect();
+        let found = Overrep::candidates(&reads.iter().collect::<Vec<_>>(), 24);
+        let exact: Vec<_> = found.iter().filter(|(seq, _)| seq.len() == 20).collect();
+        assert_eq!(exact, vec![(&reads[0].seq[..20].to_vec(), &100)]);
+    }
+
+    #[test]
     fn quality_validation_matches_scalar_at_every_byte_and_vector_boundary() {
         for offset in [33, 64] {
             for len in [0, 1, 15, 16, 17, 31, 32, 33, 51, 64, 65, 148, 513] {
@@ -3688,9 +4369,12 @@ mod tests {
 
     #[test]
     fn vectorized_sample_matches_per_base_reference() {
+        // Lengths up to 300 cover every tail of the four-base loop, and
+        // one-read samples merged in exercise flush and merge.
         let mut fast = Sample::default();
-        let mut reference = Sample::default();
         let mut merged = Sample::default();
+        let mut kmers = [0; 1024];
+        let mut cycles = vec![[(0u64, 0u64); 5]; 301];
         let mut state = 140u64;
         for ordinal in 0..2000 {
             let mut seq = Vec::new();
@@ -3701,26 +4385,65 @@ mod tests {
                 qual.push(33 + ((state >> 24) % 94) as u8);
             }
             fast.add_parts(&seq, &qual, false, ordinal);
-            reference.add_parts_reference(&seq, &qual, false, ordinal);
-            // One-read samples merged in exercise flush and merge.
             let mut part = Sample::default();
             part.add_parts(&seq, &qual, false, ordinal);
             merged.merge(part);
+            crate::kmer::count_k5_2bit(&seq, &mut kmers);
+            for (i, (&b, &q)) in seq.iter().zip(&qual).enumerate() {
+                let base = b"ACGT"
+                    .iter()
+                    .position(|&c| c == b.to_ascii_uppercase())
+                    .unwrap_or(4);
+                cycles[i][base].0 += 1;
+                cycles[i][base].1 += u64::from(q - 33);
+            }
         }
-        for sample in [&mut fast, &mut reference, &mut merged] {
+        for sample in [&mut fast, &mut merged] {
             sample.finish_summary();
         }
+        assert_eq!(merged.details(), fast.details());
         for sample in [&fast, &merged] {
-            assert_eq!(sample.details(), reference.details());
-            assert_eq!(sample.cycles.len(), reference.cycles.len());
-            for (x, y) in sample.cycles.iter().zip(&reference.cycles) {
-                assert_eq!(
-                    (x.total_sum, x.total_cnt, x.base_sum, x.base_cnt),
-                    (y.total_sum, y.total_cnt, y.base_sum, y.base_cnt)
-                );
+            assert_eq!(sample.kmers, kmers);
+            for (i, expected) in cycles.iter().enumerate() {
+                let actual = sample
+                    .cycles
+                    .get(i)
+                    .map_or([(0, 0); 5], |cycle| cycle.map(|b| (b.count, b.quality_sum)));
+                assert_eq!(actual, *expected, "cycle {i}");
             }
-            assert_eq!(sample.kmers, reference.kmers);
-            assert_eq!(sample.simple.gc_bases, reference.simple.gc_bases);
+        }
+    }
+
+    #[test]
+    fn shared_prefix_and_removed_tail_reconstruct_full_read_statistics() {
+        let seq: Vec<_> = b"gggACGTcacgtNXaTACGA"
+            .iter()
+            .copied()
+            .cycle()
+            .take(105)
+            .collect();
+        let qual: Vec<_> = (33..=126).cycle().take(seq.len()).collect();
+        for no_kmer in [false, true] {
+            for kept in 0..=seq.len() {
+                let mut expected = Sample::default();
+                expected.add_parts(&seq, &qual, no_kmer, 0);
+                let mut prefix = Sample::default();
+                prefix.add_parts(&seq[..kept], &qual[..kept], no_kmer, 0);
+                let mut before = Sample::default();
+                before.add_removed_tail(&seq, &qual, kept, no_kmer);
+                before.merge(prefix);
+                assert_eq!(before.simple.total_reads, expected.simple.total_reads);
+                assert_eq!(before.simple.total_bases, expected.simple.total_bases);
+                assert_eq!(before.max_len, expected.max_len);
+                assert_eq!(before.kmers, expected.kmers);
+                assert_eq!(before.qual_hist, expected.qual_hist);
+                for (actual, expected) in before.cycles.iter().zip(&expected.cycles) {
+                    assert_eq!(
+                        actual.map(|b| (b.count, b.quality_sum)),
+                        expected.map(|b| (b.count, b.quality_sum))
+                    );
+                }
+            }
         }
     }
 
@@ -3730,6 +4453,7 @@ mod tests {
         let mut simple = stats::SimpleStats::default();
         let mut kmers = [0; 1024];
         let mut qualities = [0; 94];
+        let mut cycles = vec![[(0u64, 0u64); 5]; 256];
         let mut state = 140u64;
         for ordinal in 0..1000 {
             let mut read = Read::default();
@@ -3750,8 +4474,14 @@ mod tests {
                 metrics.gc,
             );
             crate::kmer::count_k5_2bit(&read.seq, &mut kmers);
-            for &q in read.qual.iter() {
+            for (i, (&b, &q)) in read.seq.iter().zip(read.qual.iter()).enumerate() {
                 qualities[usize::from(q - 33)] += 1;
+                let base = b"ACGT"
+                    .iter()
+                    .position(|&c| c == b.to_ascii_uppercase())
+                    .unwrap_or(4);
+                cycles[i][base].0 += 1;
+                cycles[i][base].1 += u64::from(q - 33);
             }
         }
         sample.finish_summary();
@@ -3760,6 +4490,9 @@ mod tests {
             serde_json::to_value(simple.to_read_stats()).unwrap()
         );
         assert_eq!(sample.kmers, kmers);
+        for (cycle, expected) in sample.cycles.iter().zip(cycles) {
+            assert_eq!(cycle.map(|base| (base.count, base.quality_sum)), expected);
+        }
         for (q, expected) in qualities.into_iter().enumerate() {
             assert_eq!(
                 sample.qual_hist.iter().map(|h| h[q]).sum::<usize>(),
@@ -3779,7 +4512,13 @@ mod tests {
             ] {
                 let alphabet = b"ATCGNnatcg\0\xff";
                 let seq: Vec<_> = (0..length)
-                    .map(|i| alphabet[(i * 17 + length) % alphabet.len()])
+                    .map(|i| {
+                        if length == 512 {
+                            i as u8
+                        } else {
+                            alphabet[(i * 17 + length) % alphabet.len()]
+                        }
+                    })
                     .collect();
                 for split in [
                     length,
@@ -3788,14 +4527,7 @@ mod tests {
                     length.min(15),
                     length.min(17),
                 ] {
-                    let first = Read {
-                        seq: seq[..split].to_vec().into(),
-                        ..Read::default()
-                    };
-                    let second = Read {
-                        seq: seq[split..].to_vec().into(),
-                        ..Read::default()
-                    };
+                    let (first, second) = seq.split_at(split);
                     let mut expected = [0u64; 8];
                     let n = duplication.buffers.len();
                     for (p, &b) in seq.iter().enumerate() {
@@ -3814,12 +4546,19 @@ mod tests {
                         }
                     }
                     assert_eq!(
-                        hash.positions(&first, Some(&second)),
+                        hash.positions(first, Some(second)),
                         expected,
                         "level={level}, length={length}, split={split}"
                     );
+                    #[cfg(target_arch = "aarch64")]
+                    if let Some(table) = hash.pair.as_deref().filter(|_| length <= 512) {
+                        assert_eq!(
+                            table.positions_neon(first, Some(second), &hash.primes),
+                            expected
+                        );
+                    }
                     if split == length {
-                        assert_eq!(hash.positions(&first, None), expected);
+                        assert_eq!(hash.positions(first, None), expected);
                     }
                 }
             }
@@ -3917,13 +4656,54 @@ mod tests {
     }
 
     #[test]
+    fn packed_offsets_match_each_lane_and_spill_in_input_order() {
+        for stored in [[1, 2, 3, 4, 5], [2047, 1024, 1023, 16, 15]] {
+            let mut bucket = Bucket::<11>::default();
+            for used in 0..=stored.len() {
+                for offset in 0..2048 {
+                    let mut probe = Bucket::<11>(bucket.0);
+                    let expected = if stored[..used].contains(&offset) {
+                        Some(true)
+                    } else if used < stored.len() || offset == 0 {
+                        Some(false)
+                    } else {
+                        None
+                    };
+                    assert_eq!(probe.check_and_set(offset), expected);
+                }
+                if let Some(&next) = stored.get(used) {
+                    assert_eq!(bucket.check_and_set(next), Some(false));
+                }
+            }
+            assert_eq!(bucket.check_and_set(0), Some(false));
+            assert_eq!(bucket.check_and_set(0), Some(true));
+        }
+
+        let mut table = BucketTable::new(2);
+        let mut reference = [0u8; 8192];
+        for i in 0..200_000u64 {
+            let bit = ((i * 40503) ^ (i / 7)) as usize & 65535;
+            let mask = 1 << (bit % 8);
+            let byte = &mut reference[bit / 8];
+            assert_eq!(table.check_and_set(bit as u64), *byte & mask != 0);
+            *byte |= mask;
+        }
+        for bit in 0..65536 {
+            assert_eq!(
+                table.check_and_set(bit as u64),
+                reference[bit / 8] & (1 << (bit % 8)) != 0
+            );
+        }
+    }
+
+    #[test]
     fn adaptive_bloom_page_preserves_every_bit_through_promotion() {
         let mut page = BloomPage::default();
         let mut reference = [0u8; 4096];
         let mut state = 140u64;
         for index in 0..100_000 {
             state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
-            let bit = if index < 33 {
+            let bit = if index < 66 {
                 index * 991 % 32768
             } else {
                 (state >> 32) as usize % 32768
@@ -3935,18 +4715,126 @@ mod tests {
                 "insertion {index}, bit {bit}"
             );
             reference[bit / 8] |= 1 << (bit % 8);
-            if index == 31 {
-                assert!(matches!(page, BloomPage::Small { len: 32, .. }));
+            if index == 23 {
+                assert!(matches!(page, BloomPage::Small { len: 24, .. }));
             }
-            if index == 32 {
-                assert!(matches!(page, BloomPage::Bitmap(_)));
+            if index == 24 {
+                assert!(matches!(page, BloomPage::Sparse { len: 25, .. }));
+            }
+            if let BloomPage::Sparse { slots, len } = &page {
+                assert!(usize::from(*len) * 4 <= slots.len() * 3, "table too full");
             }
         }
+        assert!(matches!(page, BloomPage::Bitmap(_)));
         for bit in 0..32768 {
             assert_eq!(
                 page.check_and_set(bit as u16),
                 reference[bit / 8] & (1 << (bit % 8)) != 0
             );
+        }
+    }
+
+    #[test]
+    fn packed_duplicate_counts_match_ordered_bit_sets_across_chunks() {
+        for level in 1..=6 {
+            let mut duplication = Duplication::new(level);
+            let width = duplication.buffers.len();
+            let mut seen = vec![FxHashSet::default(); width];
+            let mut start: usize = 0;
+            for n in [0, 1, 15, 16, 17, 33, 257, 4096, 3 * LANE_PAIRS + 5] {
+                let mut packed = Vec::new();
+                let mut expected = 0;
+                for i in start..start + n {
+                    let mut duplicate = true;
+                    for (j, set) in seen.iter_mut().enumerate() {
+                        // Independent repeats, collisions between the filters,
+                        // and high address bits that wrap at lower accuracies.
+                        let k = (i / (j + 1)) % (53 + j);
+                        let pos = ((k as u64) << 32) | ((k as u64 & 15) << 24);
+                        duplicate &= !set.insert(pos & (duplication.bits - 1));
+                        packed.push(pos);
+                    }
+                    expected += usize::from(duplicate);
+                }
+                // In two chunks, as a batch arrives: large batches of the
+                // default level are checked by two threads.
+                let cut = packed.len() / width / 3 * width;
+                let counts = duplication.count_chunks(&[&packed[..cut], &packed[cut..]]);
+                assert_eq!(
+                    counts.iter().sum::<usize>(),
+                    expected,
+                    "level {level}, batch {n}"
+                );
+                start += n;
+            }
+        }
+    }
+
+    /// Pairs checked per second once the tables are far larger than the
+    /// cache, as late in a large file:
+    /// cargo test --release duplicate_throughput -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn duplicate_throughput() {
+        let mut duplication = Duplication::new(1);
+        let mut state = 99u64;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            state >> 16
+        };
+        let millions: usize = std::env::var("PAIRS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(200);
+        let mut batch = |pairs: usize| -> Vec<Vec<u64>> {
+            (0..16)
+                .map(|_| (0..2 * pairs / 16).map(|_| next()).collect())
+                .collect()
+        };
+        let mut total = 0;
+        for round in 0..millions * 1_000_000 / (1 << 18) {
+            let chunks = batch(1 << 18);
+            let slices: Vec<&[u64]> = chunks.iter().map(Vec::as_slice).collect();
+            let start = std::time::Instant::now();
+            total += duplication.count_chunks(&slices).iter().sum::<usize>();
+            let lanes = start.elapsed();
+            if round % 100 == 99 {
+                let chunks = batch(1 << 18);
+                let start = std::time::Instant::now();
+                for chunk in &chunks {
+                    total += duplication.count_packed(chunk);
+                }
+                println!(
+                    "{:>4}M pairs: {:.1} ns per pair in lanes, {:.1} in turn",
+                    (round + 1) * (1 << 18) / 1_000_000,
+                    lanes.as_nanos() as f64 / (1 << 18) as f64,
+                    start.elapsed().as_nanos() as f64 / (1 << 18) as f64
+                );
+            }
+        }
+        println!("{total} duplicates");
+    }
+
+    #[test]
+    fn sparse_buckets_preserve_offsets_across_groups_and_overflow() {
+        let bits = 1u64 << 35;
+        let mut buckets = SparseBuckets::new(bits);
+        let mut seen = FxHashSet::default();
+        // The first four nonzero offsets stay inline. The rest spill into
+        // pages shared between buckets, including a dense bitmap in each group.
+        for &base in &[0, 1 << 18, 1 << 32, bits - (1 << 18)] {
+            for bucket in [0, 1, 3, 4, 31] {
+                let start = base + (bucket << 13);
+                for offset in (0..1024).chain((0..8192).rev()) {
+                    let bit = start + offset;
+                    assert_eq!(buckets.check_and_set(bit), !seen.insert(bit), "{bit}");
+                }
+            }
+        }
+        for bit in seen {
+            assert!(buckets.check_and_set(bit), "{bit}");
         }
     }
 
@@ -3957,13 +4845,13 @@ mod tests {
             for bit in [0, 1, 7, 8, 32767, 32768, duplication.bits - 1] {
                 let positions = [bit; 8];
                 assert!(
-                    !duplication.check_positions(positions),
+                    !duplication.check_positions(&positions),
                     "level={level}, bit={bit}"
                 );
-                assert!(duplication.check_positions(positions));
+                assert!(duplication.check_positions(&positions));
             }
             // Addresses wrap modulo the same upstream bit count.
-            assert!(duplication.check_positions([duplication.bits; 8]));
+            assert!(duplication.check_positions(&[duplication.bits; 8]));
         }
     }
 

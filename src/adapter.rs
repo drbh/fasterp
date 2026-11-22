@@ -1097,15 +1097,100 @@ pub struct AdapterMatch {
     pub is_atailing: bool,
 }
 
-/// Find adapter sequence in read allowing mismatches
-///
-/// Uses a three-stage matching approach (exact, insertion, deletion).
-/// Returns the first accepted match in upstream's stage and position order.
+/// Reuse the necessary four-base seeds when one adapter is tested against many reads.
+pub(crate) struct AdapterMatcher {
+    sequence: Vec<u8>,
+    seeds: Option<Box<SeedFilter>>,
+}
+
+struct SeedFilter {
+    offsets: [u32; 256],
+    last: usize,
+}
+
+impl SeedFilter {
+    // Two bits per byte distinguish A/C/G/T. Other bytes can collide. Every
+    // candidate still gets the full case-sensitive comparison.
+    fn key(bytes: &[u8]) -> usize {
+        let word = u32::from_le_bytes(bytes.try_into().unwrap());
+        (((word >> 1) & 0x0303_0303).wrapping_mul(0x0104_1040) >> 24) as usize
+    }
+
+    fn new(adapter: &[u8]) -> Option<Box<Self>> {
+        if !(4..64).contains(&adapter.len()) {
+            return None;
+        }
+        let last = (adapter.len() / 8) * 4;
+        let mut filter = Box::new(Self {
+            offsets: [0; 256],
+            last,
+        });
+        for pos in (0..=last).step_by(4) {
+            filter.offsets[Self::key(&adapter[pos..pos + 4])] |= 1 << (last - pos);
+        }
+        Some(filter)
+    }
+
+    fn find(
+        &self,
+        seq: &[u8],
+        end: usize,
+        mut check: impl FnMut(isize) -> Option<AdapterMatch>,
+    ) -> Option<AdapterMatch> {
+        // A tested overlap of length L >= 4 permits floor(L/8) mismatches.
+        // Its first floor(L/8)+1 disjoint four-base seeds fit in L, so at
+        // least one must match. This also covers partial adapters at the end.
+        let seeded = end.min(seq.len().saturating_sub(3));
+        let block = 64 - self.last;
+        for start in (0..seeded).step_by(block) {
+            let count = (seeded - start).min(block);
+            let stop = (start + count + self.last).min(seq.len() - 3);
+            let mut hits = 0u64;
+            for (i, word) in seq[start..stop + 3].windows(4).enumerate() {
+                hits |= u64::from(self.offsets[Self::key(word)]) << i;
+            }
+            hits >>= self.last;
+            if count < 64 {
+                hits &= (1u64 << count) - 1;
+            }
+            while hits != 0 {
+                let pos = start + hits.trailing_zeros() as usize;
+                if let Some(found) = check(pos as isize) {
+                    return Some(found);
+                }
+                hits &= hits - 1;
+            }
+        }
+        (seeded..end).find_map(|pos| check(pos as isize))
+    }
+}
+
+impl AdapterMatcher {
+    pub(crate) fn new(sequence: Vec<u8>) -> Self {
+        let seeds = SeedFilter::new(&sequence);
+        Self { sequence, seeds }
+    }
+
+    pub(crate) fn find(&self, seq: &[u8], min_overlap: usize) -> Option<AdapterMatch> {
+        find_with_seeds(seq, &self.sequence, min_overlap, self.seeds.as_deref())
+    }
+}
+
+/// Find the first accepted match in upstream's stage and position order.
 pub fn find_adapter(
     seq: &[u8],
     adapter: &[u8],
     min_overlap: usize,
     _max_mismatches: usize,
+) -> Option<AdapterMatch> {
+    find_with_seeds(seq, adapter, min_overlap, None)
+}
+
+fn find_with_seeds(
+    seq: &[u8],
+    adapter: &[u8],
+    min_overlap: usize,
+    seeds: Option<&SeedFilter>,
 ) -> Option<AdapterMatch> {
     if adapter.len() < min_overlap || seq.len() <= min_overlap {
         return None;
@@ -1119,7 +1204,7 @@ pub fn find_adapter(
     } else {
         0
     };
-    for pos in start..(seq.len() - min_overlap) as isize {
+    let exact = |pos: isize| {
         let len = ((seq.len() as isize - pos) as usize).min(adapter.len());
         let skip = (-pos).max(0) as usize;
         let begin = (pos + skip as isize) as usize;
@@ -1142,34 +1227,44 @@ pub fn find_adapter(
                 is_atailing: pos < 0,
             });
         }
+        None
+    };
+    let end = seq.len() - min_overlap;
+    let found = if let Some(seeds) = seeds {
+        (start..0)
+            .find_map(exact)
+            .or_else(|| seeds.find(seq, end, exact))
+    } else {
+        (start..end as isize).find_map(exact)
+    };
+    if found.is_some() {
+        return found;
     }
     for insertion in [true, false] {
         let bound = seq
             .len()
             .saturating_sub(min_overlap + usize::from(insertion));
-        let mut previous_len = None;
-        for pos in 0..bound {
-            let len = if insertion {
-                (seq.len() - pos - 1).min(adapter.len())
-            } else {
-                (seq.len() - pos).min(adapter.len().saturating_sub(1))
-            };
-            if len < 8 {
-                continue;
-            }
-            // fastp 1.4.0 passes the original read/adapter pointers to its gap
-            // matcher, without adding `pos`. Until the overlap length changes,
-            // these calls would repeat the same failed comparison.
-            if previous_len == Some(len) {
-                continue;
-            }
-            previous_len = Some(len);
-            let diff = if insertion {
-                one_gap_match(seq, adapter, len, len / 8 - 1, true)
-            } else {
-                one_gap_match(adapter, seq, len, len / 8 - 1, true)
-            };
-            if let Some(diff) = diff {
+        if bound == 0 {
+            continue;
+        }
+        let span = seq.len() - usize::from(insertion);
+        let cap = adapter.len().saturating_sub(usize::from(!insertion));
+        let longest = span.min(cap);
+        let shortest = (span - (bound - 1)).min(cap).max(8);
+        if shortest > longest {
+            continue;
+        }
+        let (ins, normal) = if insertion {
+            (seq, adapter)
+        } else {
+            (adapter, seq)
+        };
+        let possible = longest_possible_gap(ins, normal, longest);
+        // fastp compares the original read/adapter prefixes for every offset.
+        // Visit each distinct length once, at the first offset that uses it.
+        for len in (shortest..=possible).rev() {
+            let pos = if len == longest { 0 } else { span - len };
+            if let Some(diff) = one_gap_match(ins, normal, len, len / 8 - 1, true) {
                 return Some(AdapterMatch {
                     position: pos,
                     mismatches: diff,
@@ -1185,6 +1280,31 @@ pub fn find_adapter(
         }
     }
     None
+}
+
+// Lengths 8k..8k+7 all allow k-1 differences. Find the last length
+// that can still satisfy a mismatch budget before running the gap matcher.
+fn longest_possible_gap(ins: &[u8], normal: &[u8], longest: usize) -> usize {
+    let mut possible = 0;
+    let mut mismatches = 0;
+    for k in 1..=longest / 8 {
+        let start = 8 * (k - 1);
+        let word = |s: &[u8], off| u64::from_le_bytes(s[off..off + 8].try_into().unwrap());
+        let target = word(normal, start);
+        // Mark each nonzero byte without carries between adjacent lanes.
+        let nonzero = |x: u64| (x & 0x7f7f_7f7f_7f7f_7f7f).wrapping_add(0x7f7f_7f7f_7f7f_7f7f) | x;
+        let direct = nonzero(word(ins, start) ^ target);
+        let shifted = nonzero(word(ins, start + 1) ^ target);
+        mismatches += (direct & shifted & 0x8080_8080_8080_8080).count_ones() as usize;
+        // Wherever both alignments disagree, every internal gap must pay a
+        // mismatch, regardless of where the transition occurs.
+        if mismatches < k {
+            possible = longest.min(k * 8 + 7);
+        } else if mismatches >= longest / 8 {
+            break;
+        }
+    }
+    possible
 }
 
 /// Hamming distance with one internal insertion in `ins`, matching fastp's
@@ -1409,10 +1529,17 @@ mod tests {
             state as usize
         };
         for case in 0..6000 {
-            let len = 8 + random() % 193;
-            let adapter: Vec<u8> = (0..len).map(|_| b"ACGTN"[random() % 5]).collect();
+            let len = 4 + random() % 197;
+            let alphabet: &[u8] = if case % 7 == 0 {
+                b"AaCcxT?\xff"
+            } else {
+                b"ACGTN"
+            };
+            let adapter: Vec<u8> = (0..len)
+                .map(|_| alphabet[random() % alphabet.len()])
+                .collect();
             let mut seq: Vec<u8> = (0..random() % 200)
-                .map(|_| b"ACGTN"[random() % 5])
+                .map(|_| alphabet[random() % alphabet.len()])
                 .collect();
             match case % 5 {
                 0 => seq.extend_from_slice(&adapter),
@@ -1430,13 +1557,19 @@ mod tests {
             for _ in 0..random() % 8 {
                 if !seq.is_empty() {
                     let pos = random() % seq.len();
-                    seq[pos] = b"ACGTN"[random() % 5];
+                    seq[pos] = alphabet[random() % alphabet.len()];
                 }
             }
             let min_overlap = 1 + random() % 15;
+            let expected = match_fields(reference_find_adapter(&seq, &adapter, min_overlap, 0));
+            assert_eq!(
+                match_fields(AdapterMatcher::new(adapter.clone()).find(&seq, min_overlap)),
+                expected,
+                "prepared case={case} min_overlap={min_overlap}"
+            );
             assert_eq!(
                 match_fields(find_adapter(&seq, &adapter, min_overlap, 0)),
-                match_fields(reference_find_adapter(&seq, &adapter, min_overlap, 0)),
+                expected,
                 "case={case} min_overlap={min_overlap}"
             );
         }
