@@ -21,8 +21,10 @@ mod block;
 mod direct_writer;
 #[cfg(target_arch = "aarch64")]
 mod duplication_neon;
+pub(crate) mod library;
 #[cfg(feature = "native")]
 mod paired_gzip;
+pub(crate) use library::{InputError, OptionsError, UpstreamError};
 
 pub const FASTP_VERSION: &str = "1.4.0";
 
@@ -38,28 +40,26 @@ struct Read<'a> {
 
 impl<'a> Read<'a> {
     fn validate(&mut self, record: usize, phred64: bool) -> Result<()> {
-        let [name, seq, plus, qual] = [&self.name, &self.seq, &self.plus, &self.qual];
-        ensure!(
-            name.starts_with(b"@"),
-            "Invalid FASTQ header at record {}",
-            record
-        );
-        ensure!(
-            plus.starts_with(b"+"),
-            "Invalid FASTQ separator at record {}",
-            record
-        );
-        ensure!(
-            seq.len() == qual.len(),
-            "Sequence/quality length mismatch at record {}",
-            record
-        );
+        let fail = |what| Err(InputError::at(record, what).into());
+        if !self.name.starts_with(b"@") {
+            return fail("Invalid FASTQ header");
+        }
+        if !self.plus.starts_with(b"+") {
+            return fail("Invalid FASTQ separator");
+        }
+        if self.seq.len() != self.qual.len() {
+            return fail("Sequence/quality length mismatch");
+        }
+        self.check_quality(record, phred64)
+    }
+
+    /// The quality check of `validate`, for reads whose fields are already
+    /// separated (readkit batches); converts Phred+64 to Phred+33.
+    fn check_quality(&mut self, record: usize, phred64: bool) -> Result<()> {
         let offset = if phred64 { 64 } else { 33 };
-        ensure!(
-            valid_quality(&qual, offset),
-            "Invalid quality encoding at record {}",
-            record
-        );
+        if !valid_quality(&self.qual, offset) {
+            return Err(InputError::at(record, "Invalid quality encoding").into());
+        }
         if phred64 {
             self.verbatim = None;
             self.qual.to_mut().iter_mut().for_each(|q| *q -= 31);
@@ -153,11 +153,15 @@ struct Reader {
 
 impl Reader {
     fn open(path: &str, phred64: bool) -> Result<Self> {
-        Ok(Self {
-            inner: io::open_input(path)?,
+        Ok(Self::from_stream(io::open_input(path)?, phred64))
+    }
+
+    fn from_stream(inner: Box<dyn BufRead + Send>, phred64: bool) -> Self {
+        Self {
+            inner,
             record: 0,
             phred64,
-        })
+        }
     }
 
     fn next(&mut self) -> Result<Option<Read<'static>>> {
@@ -180,17 +184,17 @@ impl Reader {
             match buffer.iter().position(|&b| !is_space(b)) {
                 Some(i) if buffer[i] == b'\n' => self.inner.consume(i + 1),
                 Some(0) => return Ok(()),
-                Some(_) => anyhow::bail!("Invalid FASTQ header at record {}", self.record + 1),
+                Some(_) => {
+                    return Err(InputError::at(self.record + 1, "Invalid FASTQ header").into())
+                }
                 None => {
                     // A whitespace run reaching the buffer end: read the rest
                     // of the line to see whether it is blank.
                     let mut line = Vec::new();
                     self.inner.read_until(b'\n', &mut line)?;
-                    ensure!(
-                        line.iter().all(|&b| is_space(b) || b == b'\n'),
-                        "Invalid FASTQ header at record {}",
-                        self.record + 1
-                    );
+                    if !line.iter().all(|&b| is_space(b) || b == b'\n') {
+                        return Err(InputError::at(self.record + 1, "Invalid FASTQ header").into());
+                    }
                 }
             }
         }
@@ -231,7 +235,9 @@ impl Reader {
                 if n == 0 && i == 0 {
                     return Ok(false);
                 }
-                ensure!(n > 0, "Truncated FASTQ record {}", self.record + 1);
+                if n == 0 {
+                    return Err(InputError::truncated(self.record + 1).into());
+                }
                 if line.last() == Some(&b'\n') {
                     line.pop();
                 }
@@ -536,15 +542,15 @@ struct Overrep {
 }
 
 impl Overrep {
-    fn candidates(reads: &[&Read], len: usize) -> BTreeMap<Vec<u8>, usize> {
+    fn candidates(reads: &[&[u8]], len: usize) -> BTreeMap<Vec<u8>, usize> {
         let mut counts = BTreeMap::new();
         let mut bases = 0;
         let mut sampled = 0;
-        for r in reads {
+        for seq in reads {
             if bases >= 151 * 10000 {
                 break;
             }
-            bases += r.seq.len();
+            bases += seq.len();
             sampled += 1;
         }
         // The evaluation reads outlive this scan. Borrow each distinct window
@@ -565,11 +571,11 @@ impl Overrep {
             let windows = || {
                 reads[..sampled]
                     .iter()
-                    .flat_map(|read| read.seq[..read.seq.len().saturating_sub(1)].windows(step))
+                    .flat_map(|read| read[..read.len().saturating_sub(1)].windows(step))
             };
             let window_count: usize = reads[..sampled]
                 .iter()
-                .map(|read| read.seq.len().saturating_sub(step))
+                .map(|read| read.len().saturating_sub(step))
                 .sum();
             let mut frequencies = FxHashMap::default();
             if step >= 8 && window_count >= 4096 {
@@ -876,8 +882,9 @@ fn poly_x(r: &mut Read, min: usize) -> Option<(usize, usize)> {
     Some((base, n))
 }
 
-fn index(name: &[u8], last: bool) -> Vec<u8> {
-    if name.len() < 5 {
+/// `bare`: the name has no FASTQ `@` (readkit input), which fastp counts.
+fn index(name: &[u8], last: bool, bare: bool) -> Vec<u8> {
+    if name.len() + usize::from(bare) < 5 {
         return Vec::new();
     }
     let mut end = name.len();
@@ -910,17 +917,17 @@ fn add_umi(r: &mut Read, umi: &[u8], a: &Args) {
     r.name_mut().splice(pos..pos, tag);
 }
 
-fn umi(r1: &mut Read, r2: Option<&mut Read>, a: &Args) {
+fn umi(r1: &mut Read, r2: Option<&mut Read>, a: &Args, bare: bool) {
     if !a.umi {
         return;
     }
     let mut r2 = r2;
     let mut value = Vec::new();
     match a.umi_loc.as_str() {
-        "index1" => value = index(&r1.name, false),
+        "index1" => value = index(&r1.name, false, bare),
         "index2" => {
             if let Some(r2) = r2.as_ref() {
-                value = index(&r2.name, true);
+                value = index(&r2.name, true, bare);
             }
         }
         "read1" | "per_read" => {
@@ -955,10 +962,10 @@ fn umi(r1: &mut Read, r2: Option<&mut Read>, a: &Args) {
             }
         }
         "per_index" => {
-            value = index(&r1.name, false);
+            value = index(&r1.name, false, bare);
             if let Some(r2) = r2.as_ref() {
                 value.push(b'_');
-                value.extend(index(&r2.name, true));
+                value.extend(index(&r2.name, true, bare));
             }
         }
         _ => unreachable!(),
@@ -1564,6 +1571,10 @@ struct Config {
     fasta: Vec<adapter::AdapterMatcher>,
     blacklist: [Vec<Vec<u8>>; 2],
     poly_g: bool,
+    /// Names come from readkit batches, without FASTQ's `@`.
+    bare_names: bool,
+    /// Packed output goes to readkit batches instead of FASTQ text.
+    columns: Option<library::Columns>,
 }
 
 impl Config {
@@ -1580,7 +1591,7 @@ fn blacklisted(r: &Read, c: &Config, last: bool) -> bool {
     if c.blacklist[usize::from(last)].is_empty() {
         return false;
     }
-    let target = index(&r.name, last);
+    let target = index(&r.name, last, c.bare_names);
     c.blacklist[usize::from(last)].iter().any(|seq| {
         seq.iter().zip(&target).filter(|(a, b)| a != b).count() <= c.args.filter_by_index_threshold
     })
@@ -1691,6 +1702,11 @@ struct Chunk<'a> {
 
 struct PackedChunk {
     output: [Vec<u8>; 3],
+    /// Library mode: passing and merged reads as columns instead of text.
+    columns: Option<library::ChunkColumns>,
+    /// Library mode, first chunk of a batch: every chunk's columns, joined
+    /// on the worker pool.
+    joined: Option<library::StepColumns>,
     positions: Vec<u64>,
     duplicates: usize,
     recycled: ReadPool,
@@ -1738,9 +1754,20 @@ impl Drop for PackedChunk {
 }
 
 impl PackedChunk {
-    fn new(records: usize, recycle_limit: usize, hashes: usize) -> Self {
+    fn new(
+        records: usize,
+        recycle_limit: usize,
+        hashes: usize,
+        columns: Option<&library::Columns>,
+    ) -> Self {
         Self {
-            output: std::array::from_fn(|_| spare_output()),
+            output: if columns.is_some() {
+                Default::default()
+            } else {
+                std::array::from_fn(|_| spare_output())
+            },
+            columns: columns.map(|c| library::ChunkColumns::new(c, records)),
+            joined: None,
             positions: Vec::with_capacity(records * hashes),
             duplicates: 0,
             recycled: ReadPool {
@@ -1786,7 +1813,9 @@ impl PackedChunk {
                 self.failures[p.failures[0] as usize] += 2;
                 if p.failures[0] == Failure::Pass && !p.duplicate {
                     self.merged_pairs += 1;
-                    if a.stdout || a.merged_out.is_some() {
+                    if let Some(columns) = &mut self.columns {
+                        columns.merged(merged);
+                    } else if a.stdout || a.merged_out.is_some() {
                         merged
                             .write(&mut self.output[2], None)
                             .expect("writing to Vec cannot fail");
@@ -1796,10 +1825,12 @@ impl PackedChunk {
                 for (i, read) in p.reads.iter().enumerate() {
                     if let Some(read) = read {
                         self.failures[p.failures[i] as usize] += 1;
-                        if p.failures[i] == Failure::Pass
-                            && !p.duplicate
-                            && (a.stdout || a.merged_out.is_some())
-                        {
+                        if p.failures[i] != Failure::Pass || p.duplicate {
+                            continue;
+                        }
+                        if let Some(columns) = &mut self.columns {
+                            columns.merged(read);
+                        } else if a.stdout || a.merged_out.is_some() {
                             read.write(&mut self.output[2], None)
                                 .expect("writing to Vec cannot fail");
                         }
@@ -1812,7 +1843,11 @@ impl PackedChunk {
                     p.failures[0]
                 };
                 self.failures[failure as usize] += if paired { 2 } else { 1 };
-                if failure == Failure::Pass && !p.duplicate {
+                if let (Failure::Pass, false, Some(columns)) =
+                    (failure, p.duplicate, &mut self.columns)
+                {
+                    columns.main(&p.reads);
+                } else if failure == Failure::Pass && !p.duplicate {
                     for (i, read) in p.reads.iter().enumerate() {
                         if let Some(read) = read {
                             if (a.stdout && !a.merge)
@@ -1959,7 +1994,7 @@ fn process<'a>(
             }
         }
     }
-    umi(&mut r1, r2.as_mut(), a);
+    umi(&mut r1, r2.as_mut(), a, c.bare_names);
     let before_cut = if a.failed_out.is_some() {
         [Some(r1.clone()), r2.clone()]
     } else {
@@ -2203,10 +2238,15 @@ struct BatchReader {
     limit: usize,
     count: usize,
     eof: bool,
+    /// Library input from readkit batches instead of the readers.
+    columns: Option<library::ColumnInput>,
 }
 
 impl BatchReader {
     fn next_batch(&mut self) -> Result<Option<ReadBatch>> {
+        if self.columns.is_some() {
+            return self.next_column_batch();
+        }
         if self.eof || (self.limit != 0 && self.count >= self.limit) {
             return Ok(None);
         }
@@ -2278,25 +2318,24 @@ impl BatchReader {
                 let pair = &mut batch[records];
                 if !self.reader1.read_into(&mut pair.0)? {
                     if let Some(reader2) = self.reader2.as_mut() {
-                        ensure!(
-                            reader2.next()?.is_none(),
-                            "Paired input files have different read counts"
-                        );
+                        if reader2.next()?.is_some() {
+                            return Err(InputError::mate_counts().into());
+                        }
                     }
                     self.eof = true;
                     break;
                 }
                 if self.interleaved {
-                    ensure!(
-                        self.reader1
-                            .read_into(pair.1.get_or_insert_with(Read::default))?,
-                        "Odd read count in interleaved FASTQ"
-                    );
+                    if !self
+                        .reader1
+                        .read_into(pair.1.get_or_insert_with(Read::default))?
+                    {
+                        return Err(InputError::odd_interleaved().into());
+                    }
                 } else if let Some(reader2) = self.reader2.as_mut() {
-                    ensure!(
-                        reader2.read_into(pair.1.get_or_insert_with(Read::default))?,
-                        "Paired input files have different read counts"
-                    );
+                    if !reader2.read_into(pair.1.get_or_insert_with(Read::default))? {
+                        return Err(InputError::mate_counts().into());
+                    }
                 }
             }
             let (r1, r2) = &batch[records];
@@ -2318,6 +2357,82 @@ impl BatchReader {
             start,
         }))
     }
+}
+
+impl BatchReader {
+    /// One input batch from a column source as one engine batch: its
+    /// records borrowed in place, or copied into recycled owned reads when
+    /// processing needs owned reads.
+    fn next_column_batch(&mut self) -> Result<Option<ReadBatch>> {
+        let Some(input) = self.columns.as_mut() else {
+            return Ok(None);
+        };
+        if self.eof || (self.limit != 0 && self.count >= self.limit) {
+            return Ok(None);
+        }
+        let mut raw = match self.sampled_raw.pop_front() {
+            Some(batch) => batch.raw.expect("column batches are blocks"),
+            None => match input.next()? {
+                Some(batch) => library::records(&batch, 0, batch.len()),
+                None => {
+                    self.eof = true;
+                    return Ok(None);
+                }
+            },
+        };
+        if self.limit != 0 {
+            for mate in raw.iter_mut() {
+                mate.truncate(self.limit - self.count);
+            }
+        }
+        let start = self.count;
+        let records = raw[0].len();
+        self.count += records;
+        if self.raw {
+            return Ok(Some(ReadBatch {
+                duplicate_flags: None,
+                raw: Some(raw),
+                reads: Vec::new(),
+                start,
+            }));
+        }
+        let phred64 = self.reader1.phred64;
+        let mut batch = std::mem::take(&mut self.pool.reads);
+        self.pool.bytes = 0;
+        batch.resize_with(records, Default::default);
+        for (i, (r1, r2)) in batch.iter_mut().enumerate() {
+            copy_read(r1, &raw[0].read(i, start + i, phred64)?);
+            if raw[1].len() > 0 {
+                copy_read(
+                    r2.get_or_insert_with(Read::default),
+                    &raw[1].read(i, start + i, phred64)?,
+                );
+            } else {
+                *r2 = None;
+            }
+        }
+        Ok(Some(ReadBatch {
+            duplicate_flags: None,
+            raw: None,
+            reads: batch,
+            start,
+        }))
+    }
+}
+
+/// Copies `src` into `dst`, reusing `dst`'s buffers.
+fn copy_read(dst: &mut Read<'static>, src: &Read) {
+    for (d, s) in [
+        (&mut dst.name, &src.name),
+        (&mut dst.seq, &src.seq),
+        (&mut dst.plus, &src.plus),
+        (&mut dst.qual, &src.qual),
+    ] {
+        let d = d.to_mut();
+        d.clear();
+        d.extend_from_slice(s);
+    }
+    dst.verbatim = None;
 }
 
 fn process_chunk<'a>(
@@ -2342,7 +2457,12 @@ fn process_chunk<'a>(
         after_offset: [0; 2],
         processed: Vec::with_capacity(if packed_output { 0 } else { records }),
         packed: packed_output.then(|| {
-            PackedChunk::new(records, recycle_limit, duplication.map_or(0, |d| d.buffers))
+            PackedChunk::new(
+                records,
+                recycle_limit,
+                duplication.map_or(0, |d| d.buffers),
+                config.columns.as_ref(),
+            )
         }),
     };
     let mut overlap_scratch = Vec::new();
@@ -2509,7 +2629,20 @@ fn process_batch(
     });
     // Collect in input order so malformed input always reports the earliest
     // failing worker chunk, independent of scheduling.
-    results.into_iter().collect()
+    let mut chunks: Vec<Chunk<'static>> = results.into_iter().collect::<Result<_>>()?;
+    // Library mode: join the chunks' columns into the batch's here, on the
+    // workers, so the consumer thread only moves the result.
+    let columns: Vec<_> = chunks
+        .iter_mut()
+        .filter_map(|c| c.packed.as_mut()?.columns.take())
+        .collect();
+    if !columns.is_empty() {
+        let joined = pool.install(|| library::StepColumns::join(columns));
+        if let Some(packed) = chunks.first_mut().and_then(|c| c.packed.as_mut()) {
+            packed.joined = Some(joined);
+        }
+    }
+    Ok(chunks)
 }
 
 struct Output {
@@ -2521,6 +2654,8 @@ struct Output {
     writers: BTreeMap<String, split::SplitWriter>,
     scratch: Vec<u8>,
     compression_threads: usize,
+    /// Library mode: every output goes to readkit batches.
+    library: Option<library::Destination>,
 }
 
 impl Output {
@@ -2551,6 +2686,7 @@ impl Output {
             writers: BTreeMap::new(),
             scratch: Vec::new(),
             compression_threads: crate::io::threads_per_output(compressed_outputs),
+            library: None,
         }
     }
     fn open_main(&mut self, a: &Args, split: &split::SplitConfig) -> Result<()> {
@@ -2612,17 +2748,51 @@ impl Output {
         }
         Ok(())
     }
-    fn write(&mut self, path: Option<&str>, read: &Read, tag: Option<&str>) -> Result<()> {
+    /// Writes `read` to `path`; a failed read is tagged with its failure
+    /// and the segment it came from.
+    fn write(
+        &mut self,
+        path: Option<&str>,
+        read: &Read,
+        failure: Option<(Failure, usize)>,
+    ) -> Result<()> {
+        if let Some(destination) = &mut self.library {
+            if let Some(path) = path {
+                destination.write(path, read, failure);
+            }
+            return Ok(());
+        }
         #[cfg(feature = "native")]
         if let Some(writer) = path.and_then(|p| self.direct.get_mut(p)) {
             self.scratch.clear();
-            read.write(&mut self.scratch, tag)?;
+            read.write(&mut self.scratch, failure.map(|(f, _)| f.tag()))?;
             return writer.write(&self.scratch);
         }
         if let Some(writer) = path.and_then(|p| self.writers.get_mut(p)) {
             self.scratch.clear();
-            read.write(&mut self.scratch, tag)?;
+            read.write(&mut self.scratch, failure.map(|(f, _)| f.tag()))?;
             writer.write_all(&self.scratch)?;
+        }
+        Ok(())
+    }
+    /// Writes a passing read or pair to the main outputs.
+    fn write_main(
+        &mut self,
+        main1: Option<&str>,
+        main2: Option<&str>,
+        reads: &[Option<Read>; 2],
+    ) -> Result<()> {
+        if let Some(destination) = &mut self.library {
+            if main1 == Some(library::OUT1) {
+                destination.main(reads);
+            }
+            return Ok(());
+        }
+        if let Some(r) = &reads[0] {
+            self.write(main1, r, None)?;
+        }
+        if let Some(r) = &reads[1] {
+            self.write(main2, r, None)?;
         }
         Ok(())
     }
@@ -3047,7 +3217,9 @@ fn load_sequences(path: Option<&str>, fasta: bool) -> Result<Vec<Vec<u8>>> {
             continue;
         }
         if fasta {
-            ensure!(!seqs.is_empty(), "Adapter FASTA must start with a > header");
+            if seqs.is_empty() {
+                return Err(OptionsError::new("Adapter FASTA must start with a > header").into());
+            }
             seqs.last_mut()
                 .unwrap()
                 .extend(line.as_bytes().iter().map(u8::to_ascii_uppercase));
@@ -3056,13 +3228,21 @@ fn load_sequences(path: Option<&str>, fasta: bool) -> Result<Vec<Vec<u8>>> {
         }
     }
     if fasta {
-        ensure!(
-            seqs.iter()
-                .all(|s| s.len() >= 6 && s.iter().all(|b| b"ATCG".contains(b))),
-            "FASTA adapters must contain at least six A/T/C/G bases"
-        );
+        check_fasta_adapters(&seqs)?;
     }
     Ok(seqs)
+}
+
+fn check_fasta_adapters(seqs: &[Vec<u8>]) -> Result<()> {
+    if !seqs
+        .iter()
+        .all(|s| s.len() >= 6 && s.iter().all(|b| b"ATCG".contains(b)))
+    {
+        return Err(
+            OptionsError::new("FASTA adapters must contain at least six A/T/C/G bases").into(),
+        );
+    }
+    Ok(())
 }
 
 pub fn run(a: Args) -> Result<()> {
@@ -3080,9 +3260,9 @@ pub fn run(a: Args) -> Result<()> {
     Ok(())
 }
 
-struct Finished {
+pub(crate) struct Finished {
     args: Args,
-    report: Value,
+    pub(crate) report: Value,
     count: usize,
     passed: usize,
     pe: bool,
@@ -3190,6 +3370,9 @@ struct Pipeline {
 }
 
 impl Pipeline {
+    /// Batches from readers are read on a thread of their own. Readkit
+    /// sources already read ahead (`ReadAhead`), so the thread that takes
+    /// the batches pulls from them directly.
     fn start(
         mut reader: BatchReader,
         shared: &Arc<Shared>,
@@ -3197,28 +3380,54 @@ impl Pipeline {
     ) -> Self {
         // One queued batch per stage bounds both memory and reordering.
         let (recycle, recycle_rx) = crossbeam_channel::bounded::<Vec<ReadPool>>(2);
-        let (input_tx, input_rx) = crossbeam_channel::bounded(1);
         let (processed_tx, processed) = crossbeam_channel::bounded::<ProcessedBatch>(1);
-        let mut threads = vec![std::thread::spawn(move || loop {
-            while let Ok(recycled) = recycle_rx.try_recv() {
-                for recycled in recycled {
-                    reader.pool.absorb(recycled);
+        let absorb =
+            |reader: &mut BatchReader, recycle_rx: &crossbeam_channel::Receiver<Vec<ReadPool>>| {
+                while let Ok(recycled) = recycle_rx.try_recv() {
+                    for recycled in recycled {
+                        reader.pool.absorb(recycled);
+                    }
                 }
-            }
-            match reader.next_batch() {
-                Ok(Some(batch)) => {
-                    if input_tx.send(Ok(batch)).is_err() {
+            };
+        /// Batches in input order, wherever they come from.
+        type Batches = Box<dyn Iterator<Item = Result<ReadBatch>> + Send>;
+        let mut threads = Vec::new();
+        let input: Batches = if reader.columns.is_some() {
+            let mut failed = false;
+            Box::new(std::iter::from_fn(move || {
+                if failed {
+                    return None;
+                }
+                absorb(&mut reader, &recycle_rx);
+                match reader.next_batch() {
+                    Ok(Some(batch)) => Some(Ok(batch)),
+                    Ok(None) => None,
+                    Err(error) => {
+                        failed = true;
+                        Some(Err(error))
+                    }
+                }
+            }))
+        } else {
+            let (input_tx, input_rx) = crossbeam_channel::bounded(1);
+            threads.push(std::thread::spawn(move || loop {
+                absorb(&mut reader, &recycle_rx);
+                match reader.next_batch() {
+                    Ok(Some(batch)) => {
+                        if input_tx.send(Ok(batch)).is_err() {
+                            break;
+                        }
+                    }
+                    Ok(None) => break,
+                    Err(error) => {
+                        let _ = input_tx.send(Err(error));
                         break;
                     }
                 }
-                Ok(None) => break,
-                Err(error) => {
-                    let _ = input_tx.send(Err(error));
-                    break;
-                }
-            }
-        })];
-        let input_rx = if shared.config.dedup_before_filtering() {
+            }));
+            Box::new(input_rx.into_iter())
+        };
+        let input: Batches = if shared.config.dedup_before_filtering() {
             let mut filter = duplication.take().expect("deduplication requires a filter");
             let shared = Arc::clone(shared);
             let (ready, prepared) = crossbeam_channel::bounded(1);
@@ -3236,7 +3445,7 @@ impl Pipeline {
                 type Hashed = Result<(ReadBatch, Vec<[u64; 8]>)>;
                 type Running = crossbeam_channel::Receiver<std::thread::Result<Hashed>>;
                 let mut running: VecDeque<Running> = VecDeque::with_capacity(in_flight);
-                let mut input = input_rx.into_iter();
+                let mut input = input;
                 let mut reading = true;
                 loop {
                     while reading && running.len() < in_flight {
@@ -3287,9 +3496,9 @@ impl Pipeline {
                     let _ = next.recv();
                 }
             }));
-            prepared
+            Box::new(prepared.into_iter())
         } else {
-            input_rx
+            input
         };
         let processed_tx = if duplication.is_some() {
             let (duplicate_tx, duplicate_rx) = crossbeam_channel::bounded::<ProcessedBatch>(1);
@@ -3322,7 +3531,7 @@ impl Pipeline {
             };
             type Running = crossbeam_channel::Receiver<std::thread::Result<ProcessedBatch>>;
             let mut running: VecDeque<Running> = VecDeque::with_capacity(in_flight);
-            let mut input = input_rx.into_iter();
+            let mut input = input;
             let mut reading = true;
             loop {
                 while reading && running.len() < in_flight {
@@ -3402,7 +3611,7 @@ impl Drop for Pipeline {
 
 /// The processing engine: set up by `new`, advanced one batch at a time by
 /// `step`, and turned into the report by `finish`.
-struct Engine {
+pub(crate) struct Engine {
     shared: Arc<Shared>,
     source: Source,
     /// Duplicate marking on this thread when not pipelined.
@@ -3417,8 +3626,29 @@ struct Engine {
     failed: bool,
 }
 
+/// Where the engine reads from.
+pub(crate) enum Input {
+    /// `--in1` and `--in2`.
+    Files,
+    /// Readers in place of `--in1` and `--in2`.
+    Streams(Box<dyn BufRead + Send>, Option<Box<dyn BufRead + Send>>),
+    /// Readkit batches in place of the inputs.
+    Columns(library::ColumnInput),
+}
+
 impl Engine {
-    fn new(mut a: Args) -> Result<Self> {
+    fn new(a: Args) -> Result<Self> {
+        Self::open(a, Input::Files, None)
+    }
+
+    /// An engine on `input`. With `library`, the main and side outputs named
+    /// by `library::OUT1` and friends go to readkit batches and no file is
+    /// written.
+    pub(crate) fn open(
+        mut a: Args,
+        input: Input,
+        mut library: Option<library::Library>,
+    ) -> Result<Self> {
         if a.stdin || a.input == "/dev/stdin" {
             a.input = "-".into();
         }
@@ -3461,10 +3691,12 @@ impl Engine {
         if !a.merge {
             a.merged_out = None;
         }
-        validate(&a)?;
+        validate(&a).map_err(OptionsError::wrap)?;
         // The in-memory file system has no symlinks or directories to check.
         #[cfg(feature = "native")]
-        validate_paths(&a)?;
+        if library.is_none() {
+            validate_paths(&a)?;
+        }
         let pe = a.input2.is_some() || a.interleaved_in;
         let total_for_split = if a.split.is_some() {
             let mut reader = Reader::open(&a.input, a.phred64)?;
@@ -3473,7 +3705,9 @@ impl Engine {
                 n += 1;
             }
             if a.interleaved_in {
-                ensure!(n % 2 == 0, "Odd read count in interleaved FASTQ");
+                if n % 2 != 0 {
+                    return Err(InputError::odd_interleaved().into());
+                }
                 n /= 2;
             }
             if a.reads_to_process > 0 {
@@ -3492,13 +3726,14 @@ impl Engine {
         // threads and need uncompressed output: with two decoders already
         // running, compression limits the run first.
         let output = io::CompressionFormat::from_path(&a.output);
-        let split = if a.input2.is_none() {
-            output != io::CompressionFormat::Gzip
-                || num_cpus::get() >= 12
-                || io::binned_gzip_input(&a.input)
-        } else {
-            output == io::CompressionFormat::None
-        };
+        let split = matches!(input, Input::Files)
+            && if a.input2.is_none() {
+                output != io::CompressionFormat::Gzip
+                    || num_cpus::get() >= 12
+                    || io::binned_gzip_input(&a.input)
+            } else {
+                output == io::CompressionFormat::None
+            };
         io::set_split_decoding(
             if split {
                 1 + usize::from(a.input2.is_some())
@@ -3507,22 +3742,39 @@ impl Engine {
             },
             output != io::CompressionFormat::None,
         );
-        let mut reader1 = Reader::open(&a.input, a.phred64)?;
-        let mut reader2 = a
-            .input2
-            .as_ref()
-            .map(|s| Reader::open(s, a.phred64))
-            .transpose()?;
+        let (mut reader1, mut reader2, mut columns) = match input {
+            Input::Files => (
+                Reader::open(&a.input, a.phred64)?,
+                a.input2
+                    .as_ref()
+                    .map(|s| Reader::open(s, a.phred64))
+                    .transpose()?,
+                None,
+            ),
+            Input::Streams(in1, in2) => (
+                Reader::from_stream(in1, a.phred64),
+                in2.map(|r| Reader::from_stream(r, a.phred64)),
+                None,
+            ),
+            Input::Columns(columns) => (
+                Reader::from_stream(Box::new(std::io::empty()), a.phred64),
+                None,
+                Some(columns),
+            ),
+        };
         let mut sampled = Vec::new();
         let mut sampled_raw = VecDeque::new();
         // Compact-output jobs retain evaluation data in the same blocks used
         // by processing. The sample is read once without allocating four fields per
         // record, and each block is released as soon as processing consumes it.
+        // Library inputs are read ahead too: the caller owns them and can
+        // end them.
         let pipelined = cfg!(feature = "native")
             && a.max_backlog != Some(1)
-            && std::iter::once(a.input.as_str())
-                .chain(a.input2.as_deref())
-                .all(|path| std::fs::metadata(path).is_ok_and(|m| m.is_file()));
+            && (library.is_some()
+                || std::iter::once(a.input.as_str())
+                    .chain(a.input2.as_deref())
+                    .all(|path| std::fs::metadata(path).is_ok_and(|m| m.is_file())));
         // Borrowed parsing also works synchronously. Only reading ahead requires
         // regular files; pipes must stay on this thread for prompt cancellation.
         let raw_input = pack_main_output(&a);
@@ -3546,7 +3798,47 @@ impl Engine {
         };
         let mut sample_bases = 0;
         let mut sample_count = 0;
-        if raw_input {
+        // Records of the last sampled column batch after the sample.
+        let mut column_rest = None;
+        if let Some(input) = columns.as_mut() {
+            // The same sample as from FASTQ text: whole batches up to the
+            // record or base limit, then the batch that reaches it is split.
+            while sample_count < sample_limit && sample_bases < 151 * 256 * 1024 {
+                let Some(batch) = input.next()? else {
+                    break;
+                };
+                let blocks = library::records(&batch, 0, batch.len());
+                let mut n = 0;
+                while n < batch.len()
+                    && sample_count + n < sample_limit
+                    && sample_bases < 151 * 256 * 1024
+                {
+                    for mate in &blocks {
+                        if mate.len() > 0 {
+                            mate.read(n, sample_count + n, a.phred64)?;
+                        }
+                    }
+                    sample_bases += blocks[0].sequence(n).len();
+                    n += 1;
+                }
+                sampled_raw.push_back(ReadBatch {
+                    duplicate_flags: None,
+                    raw: Some(library::records(&batch, 0, n)),
+                    reads: Vec::new(),
+                    start: 0,
+                });
+                sample_count += n;
+                if n < batch.len() {
+                    column_rest = Some(ReadBatch {
+                        duplicate_flags: None,
+                        raw: Some(library::records(&batch, n, batch.len())),
+                        reads: Vec::new(),
+                        start: 0,
+                    });
+                    break;
+                }
+            }
+        } else if raw_input {
             while sample_count < sample_limit && sample_bases < 151 * 256 * 1024 {
                 let budget = a.batch_bytes.min(2 * 1024 * 1024);
                 let remaining = sample_limit - sample_count;
@@ -3595,17 +3887,9 @@ impl Engine {
                     break;
                 };
                 let r2 = if a.interleaved_in {
-                    Some(
-                        reader1
-                            .next()?
-                            .context("Odd read count in interleaved FASTQ")?,
-                    )
+                    Some(reader1.next()?.ok_or_else(InputError::odd_interleaved)?)
                 } else if let Some(reader2) = reader2.as_mut() {
-                    Some(
-                        reader2
-                            .next()?
-                            .context("Paired input files have different read counts")?,
-                    )
+                    Some(reader2.next()?.ok_or_else(InputError::mate_counts)?)
                 } else {
                     None
                 };
@@ -3627,18 +3911,21 @@ impl Engine {
         };
         let mut adapters = [manual(&a.adapter_sequence), manual(&a.adapter_sequence_r2)];
         for seq in adapters.iter().flatten() {
-            ensure!(
-                seq.len() >= 4 && seq.iter().all(|b| b"ATCG".contains(b)),
-                "Adapter sequences must contain at least four A/T/C/G bases"
-            );
+            if seq.len() < 4 || !seq.iter().all(|b| b"ATCG".contains(b)) {
+                return Err(OptionsError::new(
+                    "Adapter sequences must contain at least four A/T/C/G bases",
+                )
+                .into());
+            }
         }
+        let interleaved_in = a.interleaved_in;
         let sample_sequences = |mate: usize| -> Vec<&[u8]> {
-            if raw_input {
+            if !sampled_raw.is_empty() {
                 sampled_raw
                     .par_iter()
                     .flat_map_iter(|b| {
                         let blocks = b.raw.as_ref().unwrap();
-                        let (records, start, stride) = if a.interleaved_in {
+                        let (records, start, stride) = if interleaved_in {
                             (&blocks[0], mate, 2)
                         } else {
                             (&blocks[mate], 0, 1)
@@ -3694,6 +3981,7 @@ impl Engine {
                 .front()
                 .map(|batch| batch.raw.as_ref().unwrap()[0].name(0))
         });
+        let bare_names = columns.is_some();
         let poly_g = !a.disable_trim_poly_g
             && (a.trim_poly_g
                 || first_name.is_some_and(|name| {
@@ -3701,21 +3989,42 @@ impl Engine {
                         "@FS", "@MN", "@SH", "@NS", "@NB", "@NDX", "@VL", "@VH", "@A", "@NA", "@LH",
                     ]
                     .iter()
-                    .any(|s| name.starts_with(s.as_bytes()))
+                    .any(|s| name.starts_with(&s.as_bytes()[usize::from(bare_names)..]))
                 }));
-        let fasta = load_sequences(a.adapter_fasta.as_deref(), true)?;
+        let fasta = match library.as_mut().and_then(|l| l.adapters.take()) {
+            Some(seqs) => {
+                check_fasta_adapters(&seqs)?;
+                seqs
+            }
+            None => load_sequences(a.adapter_fasta.as_deref(), true)?,
+        };
+        let [index1, index2] = library
+            .as_mut()
+            .map_or([None, None], |l| std::mem::take(&mut l.index));
         let blacklist = [
-            load_sequences(a.filter_by_index1.as_deref(), false)?,
-            load_sequences(a.filter_by_index2.as_deref(), false)?,
+            index1.map_or_else(|| load_sequences(a.filter_by_index1.as_deref(), false), Ok)?,
+            index2.map_or_else(|| load_sequences(a.filter_by_index2.as_deref(), false), Ok)?,
         ];
         let max_bytes = if let Some(mb) = a.max_memory {
-            ensure!(mb >= 16, "--max_memory must be at least 16 MB");
+            if mb < 16 {
+                return Err(OptionsError::new("--max_memory must be at least 16 MB").into());
+            }
             a.batch_bytes.min(mb.saturating_mul(1024 * 1024) / 8).max(1)
         } else {
             a.batch_bytes
         };
+        let columns_config = library.as_ref().map(|l| library::Columns {
+            pool: l.pool.clone(),
+            // Up to 4 chunks per worker, each with a few buffers per segment.
+            scratch: readkit_batch::Pool::with_max_idle(1024),
+            segments: l.segments,
+            names: l.names,
+            strip_at: !bare_names,
+            merge: a.merge,
+        });
         let config = Config {
             packed_output: raw_input,
+            columns: columns_config.clone(),
             args: a,
             adapters: adapters.map(|a| a.map(adapter::AdapterMatcher::new)),
             fasta: fasta
@@ -3724,6 +4033,7 @@ impl Engine {
                 .collect(),
             blacklist,
             poly_g,
+            bare_names,
         };
         let a = &config.args;
         let split = split::SplitConfig {
@@ -3737,21 +4047,29 @@ impl Engine {
             prefix_digits: a.split_prefix_digits,
         };
         let mut out = Output::new(a);
-        out.open_main(a, &split)?;
-        for path in [
-            a.merged_out.as_deref(),
-            a.unpaired1.as_deref(),
-            a.unpaired2.as_deref(),
-            a.failed_out.as_deref(),
-            a.overlapped_out.as_deref(),
-        ]
-        .into_iter()
-        .flatten()
-        {
-            out.open(path, a, split::SplitConfig::default())?;
-        }
-        if a.stdout || a.output == "-" {
-            out.open("-", a, split::SplitConfig::default())?;
+        if let Some(columns) = columns_config {
+            out.library = Some(library::Destination::new(
+                columns,
+                a.failed_out.is_some(),
+                a.unpaired1.is_some(),
+            ));
+        } else {
+            out.open_main(a, &split)?;
+            for path in [
+                a.merged_out.as_deref(),
+                a.unpaired1.as_deref(),
+                a.unpaired2.as_deref(),
+                a.failed_out.as_deref(),
+                a.overlapped_out.as_deref(),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                out.open(path, a, split::SplitConfig::default())?;
+            }
+            if a.stdout || a.output == "-" {
+                out.open("-", a, split::SplitConfig::default())?;
+            }
         }
         if let Some(total) = total_for_split {
             for w in out.writers.values_mut() {
@@ -3790,16 +4108,8 @@ impl Engine {
         };
         if a.overrepresentation_analysis {
             for i in 0..if pe { 2 } else { 1 } {
-                let reads: Vec<_> = sampled
-                    .iter()
-                    .filter_map(|(r1, r2)| if i == 0 { Some(r1) } else { r2.as_ref() })
-                    .collect();
-                let len = reads
-                    .iter()
-                    .take(1000)
-                    .map(|r| r.seq.len())
-                    .max()
-                    .unwrap_or(0);
+                let reads = sample_sequences(i);
+                let len = reads.iter().take(1000).map(|r| r.len()).max().unwrap_or(0);
                 let candidates = Overrep::candidates(&reads, len);
                 stats.before[i].overrep = Some(Overrep::new(
                     &candidates,
@@ -3826,6 +4136,7 @@ impl Engine {
         };
         // Capacity includes separators and modest Vec growth beyond FASTQ payload.
         let recycle_limit = max_bytes.saturating_add(max_bytes / 4);
+        sampled_raw.extend(column_rest);
         let batch_reader = BatchReader {
             raw: raw_input,
             reader1,
@@ -3841,6 +4152,7 @@ impl Engine {
             limit: a.reads_to_process,
             count: 0,
             eof: false,
+            columns,
         };
         let templates = [
             std::array::from_fn(|i| stats.before[i].empty_like()),
@@ -3873,9 +4185,19 @@ impl Engine {
         })
     }
 
+    /// Library mode: the batches the last step filled.
+    pub(crate) fn take_output(&mut self) -> Option<library::Collected> {
+        self.out.library.as_mut().map(library::Destination::take)
+    }
+
+    /// Records (pairs for paired input) processed so far, and reads passed.
+    pub(crate) fn progress(&self) -> (usize, usize) {
+        (self.stats.count, self.stats.failures[0])
+    }
+
     /// Process the next batch. Returns `false` once the input is exhausted;
     /// after an error it returns the error once and then `false`.
-    fn step(&mut self) -> Result<bool> {
+    pub(crate) fn step(&mut self) -> Result<bool> {
         if self.done {
             return Ok(false);
         }
@@ -3964,9 +4286,17 @@ impl Engine {
                 dst.merge(src);
             }
             if let Some(mut packed) = chunk.packed {
-                let [first, second, third] = &mut packed.output;
-                out.write_packed_mates([main1, main2], [first, second])?;
-                out.write_packed(merged, third)?;
+                if shared.config.columns.is_some() {
+                    if let (Some(joined), Some(destination)) =
+                        (packed.joined.take(), &mut out.library)
+                    {
+                        destination.put(joined);
+                    }
+                } else {
+                    let [first, second, third] = &mut packed.output;
+                    out.write_packed_mates([main1, main2], [first, second])?;
+                    out.write_packed(merged, third)?;
+                }
                 stats.count += packed.count;
                 stats.merged_pairs += packed.merged_pairs;
                 stats.duplicates += packed.duplicates;
@@ -4047,12 +4377,7 @@ impl Engine {
                     continue;
                 }
                 if f == Failure::Pass {
-                    if let Some(r) = &p.reads[0] {
-                        out.write(main1, r, None)?;
-                    }
-                    if let Some(r) = &p.reads[1] {
-                        out.write(main2, r, None)?;
-                    }
+                    out.write_main(main1, main2, &p.reads)?;
                 } else {
                     // fastp writes failed paired reads only when the mate passes.
                     if pe && p.failures.iter().all(|f| *f != Failure::Pass) {
@@ -4073,7 +4398,7 @@ impl Engine {
                             out.write(
                                 a.failed_out.as_deref(),
                                 p.failed_reads[i].as_ref().unwrap_or(r),
-                                Some(p.failures[i].tag()),
+                                Some((p.failures[i], i)),
                             )?;
                         }
                     }
@@ -4103,7 +4428,7 @@ impl Engine {
 
     /// Process any remaining input, close the outputs and build the report.
     /// Fails if a step failed: the report would cover only part of the input.
-    fn finish(mut self) -> Result<Finished> {
+    pub(crate) fn finish(mut self) -> Result<Finished> {
         while self.step()? {}
         ensure!(!self.failed, "Processing stopped after an error");
         drop(self.source);
@@ -4312,7 +4637,7 @@ mod tests {
             seq: Cow::Borrowed(b"AAAAAAAAAACC"),
             ..Read::default()
         };
-        let reads = vec![&read; 250];
+        let reads = vec![&read.seq[..]; 250];
         // For twelve cycles the length-dependent step and fixed ten-base
         // step are equal. Both contribute toward the discovery threshold.
         assert_eq!(
@@ -4341,7 +4666,7 @@ mod tests {
                 }
             })
             .collect();
-        let found = Overrep::candidates(&reads.iter().collect::<Vec<_>>(), 24);
+        let found = Overrep::candidates(&reads.iter().map(|r| &r.seq[..]).collect::<Vec<_>>(), 24);
         let exact: Vec<_> = found.iter().filter(|(seq, _)| seq.len() == 20).collect();
         assert_eq!(exact, vec![(&reads[0].seq[..20].to_vec(), &100)]);
     }

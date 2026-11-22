@@ -33,6 +33,8 @@ native = [
   "dep:mimalloc",
 ]
 wasm = ["dep:wasm-bindgen", "dep:js-sys", "flate2/rust_backend"]
+# Zero-copy export of batches to arrow-rs (readkit's `arrow` feature).
+arrow = ["readkit-batch/arrow"]
 
 [dependencies]
 anyhow = "1.0"
@@ -41,6 +43,9 @@ flate2 = {version = "1.0", default-features = false}
 indexmap = {version = "2.0", features = ["serde"]}
 memchr = "2.7"
 once_cell = "1.20"
+# readkit is not on crates.io yet: the v0.1.0 tag of its repository.
+readkit-batch = {git = "https://github.com/drbh/readkit", tag = "v0.1.0"}
+readkit-io = {git = "https://github.com/drbh/readkit", tag = "v0.1.0"}
 rustc-hash = "2.0"
 serde = {version = "1.0", features = ["derive"]}
 serde_json = "1.0"
@@ -78,6 +83,10 @@ flate2 = {version = "1.0", default-features = false, features = ["zlib-ng"]}
 
 [lib]
 crate-type = ["rlib"]
+
+[[example]]
+name = "arrow_export"
+required-features = ["arrow"]
 
 [dev-dependencies]
 assert_cmd = "2.0"
