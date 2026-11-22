@@ -1001,6 +1001,10 @@ enum BloomPage {
     Bitmap(Box<[u8; 4096]>),
 }
 
+/// The largest table of a sparse page. When it is three quarters full the
+/// page becomes a bitmap.
+const SPARSE_SLOTS: usize = 512;
+
 /// A free slot of a sparse page: offsets are below 32768.
 const NO_OFFSET: u16 = u16::MAX;
 
@@ -1099,16 +1103,24 @@ impl BloomPage {
                     return true;
                 }
                 *len += 1;
+                if usize::from(*len) * 4 <= slots.len() * 3 {
+                    return false;
+                }
                 let held = slots.iter().copied().filter(|&o| o != NO_OFFSET);
-                if *len == 896 {
-                    // The next table would be as large as the whole bitmap.
+                if slots.len() < SPARSE_SLOTS {
+                    *slots = Self::sparse(held, slots.len() * 2);
+                } else {
+                    // The next table would be half the size of the bitmap,
+                    // and the one after as large. Every growth reads the
+                    // whole table from memory, and in a large file all the
+                    // pages grow at about the same time: going on to the
+                    // largest tables made checks seven times slower while
+                    // they did.
                     let mut bitmap = Box::new([0; 4096]);
                     for offset in held {
                         bitmap[usize::from(offset) / 8] |= 1 << (offset % 8);
                     }
                     *self = Self::Bitmap(bitmap);
-                } else if usize::from(*len) * 4 > slots.len() * 3 {
-                    *slots = Self::sparse(held, slots.len() * 2);
                 }
                 false
             }
@@ -1153,6 +1165,13 @@ impl<const WIDTH: u32> Bucket<WIDTH> {
         self.0 = (self.0 & ZERO) | (self.0 << WIDTH) | value;
         Some(false)
     }
+
+    /// Every offset the bucket holds.
+    fn offsets(&self) -> impl Iterator<Item = u16> + '_ {
+        let zero = (self.0 >> 63 != 0).then_some(0);
+        let lanes = (0..Self::LANES).map(|lane| ((self.0 >> (WIDTH * lane)) & Self::MASK) as u16);
+        zero.into_iter().chain(lanes.filter(|&offset| offset != 0))
+    }
 }
 
 /// Reads in a batch below which the two directories are checked in turn: a
@@ -1170,6 +1189,10 @@ fn lanes_available() -> bool {
 struct BucketTable {
     buckets: Vec<Bucket>,
     overflow: Vec<Option<Box<BloomPage>>>,
+    /// Pages that hold all of their bits as a bitmap. A page that grows into
+    /// a bitmap takes in what its sixteen buckets held, so a check there
+    /// reads the bitmap alone: late in a large file, that is every check.
+    bitmaps: Vec<Option<Box<[u8; 4096]>>>,
 }
 
 impl BucketTable {
@@ -1186,21 +1209,27 @@ impl BucketTable {
                 .take(pages * 16)
                 .collect(),
             overflow: std::iter::repeat_with(|| None).take(pages).collect(),
+            bitmaps: std::iter::repeat_with(|| None).take(pages).collect(),
         }
     }
 
-    /// The three reads a check may make depend on one another: the bucket
-    /// and the overflow directory, then the page the directory points at,
-    /// then the page's own storage. Each is requested a few checks before
-    /// the one that needs it, so a check rarely waits for memory itself.
+    /// The reads a check may make depend on one another: the directories,
+    /// then the bitmap, or else the bucket and the page the directory points
+    /// at, then the page's own storage. Each is requested a few checks
+    /// before the one that needs it, so a check rarely waits for memory.
     #[inline(always)]
     fn prefetch(&self, bit: u64) {
-        prefetch(self.buckets.as_ptr().wrapping_add((bit >> 11) as usize));
+        prefetch(self.bitmaps.as_ptr().wrapping_add((bit >> 15) as usize));
         prefetch(self.overflow.as_ptr().wrapping_add((bit >> 15) as usize));
     }
 
     #[inline(always)]
     fn prefetch_page(&self, bit: u64) {
+        if let Some(bitmap) = &self.bitmaps[(bit >> 15) as usize] {
+            prefetch(bitmap.as_ptr().wrapping_add((bit & 32767) as usize / 8));
+            return;
+        }
+        prefetch(self.buckets.as_ptr().wrapping_add((bit >> 11) as usize));
         if let Some(page) = &self.overflow[(bit >> 15) as usize] {
             prefetch::<BloomPage>(&**page);
         }
@@ -1241,12 +1270,43 @@ impl BucketTable {
     }
 
     fn check_and_set(&mut self, bit: u64) -> bool {
+        let page = (bit >> 15) as usize;
+        if let Some(bitmap) = &mut self.bitmaps[page] {
+            let byte = &mut bitmap[(bit & 32767) as usize / 8];
+            let mask = 1 << (bit % 8);
+            let seen = *byte & mask != 0;
+            *byte |= mask;
+            return seen;
+        }
         if let Some(seen) = self.buckets[(bit >> 11) as usize].check_and_set((bit & 2047) as u16) {
             return seen;
         }
-        self.overflow[(bit >> 15) as usize]
-            .get_or_insert_with(Default::default)
-            .check_and_set((bit & 32767) as u16)
+        let slot = self.overflow[page].get_or_insert_with(Default::default);
+        let seen = slot.check_and_set((bit & 32767) as u16);
+        if matches!(**slot, BloomPage::Bitmap(_)) {
+            self.settle(page);
+        }
+        seen
+    }
+
+    /// Move what the buckets of `page` hold into its bitmap, and keep the
+    /// bitmap where checks find it first.
+    fn settle(&mut self, page: usize) {
+        let Some(BloomPage::Bitmap(mut bitmap)) = self.overflow[page].take().map(|page| *page)
+        else {
+            unreachable!("only a bitmap page settles");
+        };
+        for (index, bucket) in self.buckets[page * 16..(page + 1) * 16]
+            .iter_mut()
+            .enumerate()
+        {
+            for offset in bucket.offsets() {
+                let bit = index << 11 | usize::from(offset);
+                bitmap[bit / 8] |= 1 << (bit % 8);
+            }
+            *bucket = Bucket::default();
+        }
+        self.bitmaps[page] = Some(bitmap);
     }
 }
 
