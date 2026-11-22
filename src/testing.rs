@@ -6,13 +6,14 @@ use std::io::{self, BufReader, Read};
 /// not the output path would choose it for this block.
 pub fn fq_gzip_member(input: &[u8]) -> Vec<u8> {
     let mut out = Vec::new();
-    crate::fqdeflate::gzip_member(input, crate::fqdeflate::binned(input), &mut out);
+    let kind = crate::fqdeflate::kind(input).unwrap_or(crate::fqdeflate::Kind::PLAIN);
+    crate::fqdeflate::gzip_member(input, kind, &mut out);
     out
 }
 
 /// Whether gzip output uses the FASTQ-aware encoder for this block.
 pub fn fq_suits(input: &[u8]) -> bool {
-    crate::fqdeflate::suits(input)
+    crate::fqdeflate::kind(input).is_some()
 }
 
 /// Decompress `gz` with the parallel single-member decoder, in regions of
